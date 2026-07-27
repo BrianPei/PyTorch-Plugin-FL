@@ -299,13 +299,30 @@ def build_deps():
 
     cmake_args.append(f"-DACCELERATOR={ACCELERATOR}")
     if ACCELERATOR == "metax":
+        # Boxing mode reuses the generated CUDA boxing kernels (host g++) instead
+        # of hand-written mxcc .cu kernels; leave METAX_KERNEL off so CMake picks
+        # it up from the FLAGOS_METAX_BOXING env branch in CMakeLists.txt.
+        metax_boxing = os.environ.get("FLAGOS_METAX_BOXING", "0") not in (
+            "0",
+            "OFF",
+            "off",
+            "false",
+            "FALSE",
+        )
         cmake_args.extend(
             [
-                "-DMETAX_KERNEL=ON",
+                "-DMETAX_KERNEL=" + ("OFF" if metax_boxing else "ON"),
                 "-DCUDA_KERNEL=OFF",
                 "-DFLAGGEMS_KERNEL=OFF",
             ]
         )
+        # FLAGGEMS_PYTHON defaults ON, same as CUDA: the boxing wheel also compiles
+        # the FlagGems Python-path kernels (flagos_python backend) so FlagGems can
+        # be toggled at runtime via FLAGOS_USE_FLAGGEMS, exactly like CUDA. Only the
+        # C++ FlagGems path (FLAGGEMS_KERNEL, liboperators.so) stays off. python_op_
+        # caller links torch_python_library (already in the metax link set) and adds
+        # nothing to the bundled wheel size. Set FLAGGEMS_PYTHON=0 for a slim
+        # pure-boxing build; the generic pass-through below honors an explicit value.
     elif ACCELERATOR == "tsingmicro":
         cmake_args.extend(
             [
@@ -376,6 +393,51 @@ def build_deps():
 
     subprocess.check_call([cmake] + build_args, cwd=build_dir, env=build_env)
     _verify_built_native_libs()
+    _bundle_cuda_assets()
+
+
+def _bundle_cuda_assets() -> None:
+    """Copy the external CUDA .so assets into torch_fl/lib so the wheel is
+    self-contained.
+
+    torch_fl's CUDA backend reuses PyTorch's registered CUDA kernels via an
+    externally-supplied libtorch_cuda.so (CPU-only pip torch does not ship it).
+    Historically this was LD_PRELOAD-ed by scripts/with_cuda_libtorch.sh; for a
+    single self-contained wheel we bundle the assets and preload them from
+    torch_fl/__init__.py before `import torch` (see docs §约束1). CUDA only.
+
+    Set FLAGOS_SKIP_CUDA_ASSETS=1 to skip (e.g. a slim build for a machine that
+    supplies libtorch_cuda.so out-of-band).
+    """
+    if ACCELERATOR != "cuda":
+        return
+    if os.environ.get("FLAGOS_SKIP_CUDA_ASSETS", "0") == "1":
+        return
+    assets_dir = os.environ.get(
+        "FLAGOS_CUDA_ASSETS_DIR",
+        os.path.join(BASE_DIR, ".libtorch_cuda_assets"),
+    )
+    if not os.path.isdir(assets_dir):
+        print(
+            f"[setup] warning: CUDA assets dir {assets_dir} not found; wheel "
+            "will require an externally-supplied libtorch_cuda.so at runtime."
+        )
+        return
+    dst_dir = os.path.join(BASE_DIR, "torch_fl", "lib")
+    os.makedirs(dst_dir, exist_ok=True)
+    import glob
+
+    copied = []
+    for src in sorted(glob.glob(os.path.join(assets_dir, "*.so*"))):
+        dst = os.path.join(dst_dir, os.path.basename(src))
+        # Skip if already present and identical size (avoid re-copying ~1GB).
+        if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+            copied.append(os.path.basename(src))
+            continue
+        shutil.copy2(src, dst)
+        copied.append(os.path.basename(src))
+    if copied:
+        print(f"[setup] bundled CUDA assets into torch_fl/lib: {', '.join(copied)}")
 
 
 def _verify_built_native_libs() -> None:
@@ -474,13 +536,30 @@ def _get_setup_kwargs():
             "lib/*.dylib*",
             "lib/*.dll",
             "lib/*.lib",
-            "backends.conf",
+            # MetaX self-contained wheel: forked libtorch C++ .so bundled here so
+            # the process loads the MetaX C++ runtime without a separate metax
+            # torch wheel (see scripts/bundle_maca_libtorch.sh).
+            "lib_maca/*.so*",
+            # All backend configs, not just the default: runtime op-routing
+            # configs selected via FLAGOS_USE_FLAGGEMS (backends_flaggems.conf)
+            # and boxing modes via FLAGOS_BACKEND_CONFIG (backends_cuda.conf /
+            # backends_metax.conf). Now consolidated under configs/.
+            "configs/backends*.conf",
+            "codegen_skip_ops.txt",
         ]
     }
 
+    version = "0.1.0"
+    if ACCELERATOR == "metax":
+        # Local version segment tags the wheel as a MetaX build (self-contained
+        # forked libtorch). Overridable via FLAGOS_WHEEL_LOCAL for a concrete
+        # MACA/driver version, e.g. FLAGOS_WHEEL_LOCAL=metax3.8.1.
+        local = os.environ.get("FLAGOS_WHEEL_LOCAL", "metax")
+        version = f"{version}+{local}"
+
     return dict(
         name="torch_fl",
-        version="0.1.0",
+        version=version,
         description="FlagGems operators as a custom PyTorch device (flagos)",
         author="FlagGems Team",
         packages=find_packages(
@@ -496,10 +575,53 @@ def _get_setup_kwargs():
         },
         include_package_data=False,
         python_requires=">=3.8",
-        install_requires=[
-            "torch",
-        ],
+        install_requires=_install_requires(),
+        extras_require={"cuda": _cuda_runtime_requires()},
     )
+
+
+# NVIDIA CUDA runtime libs that the bundled libtorch_cuda.so (cu12.x) links
+# against. Pinned to the cu12 major sonames it needs (libcudart.so.12,
+# libcublas.so.12, libcudnn.so.9, libnvshmem_host.so.3, ...). Lower bounds keep
+# pip free to resolve a compatible patch; the bundled .so was built against the
+# cu12.8 wheels present in the build env.
+_CUDA_RUNTIME_DEPS = [
+    "nvidia-cuda-runtime-cu12>=12.8",
+    "nvidia-cublas-cu12>=12.8",
+    "nvidia-cudnn-cu12>=9.0",
+    "nvidia-cuda-nvrtc-cu12>=12.8",
+    "nvidia-cufft-cu12>=11.0",
+    "nvidia-curand-cu12>=10.0",
+    "nvidia-cusolver-cu12>=11.0",
+    "nvidia-cusparse-cu12>=12.0",
+    "nvidia-cusparselt-cu12>=0.7",
+    "nvidia-nccl-cu12>=2.20",
+    "nvidia-nvtx-cu12>=12.8",
+    "nvidia-cuda-cupti-cu12>=12.8",
+    "nvidia-nvjitlink-cu12>=12.8",
+    "nvidia-nvshmem-cu12>=3.0",
+]
+
+
+def _cuda_runtime_requires():
+    return list(_CUDA_RUNTIME_DEPS)
+
+
+def _install_requires():
+    reqs = ["torch"]
+    # For a CUDA wheel we bundle libtorch_cuda.so and preload it at import; it
+    # needs the NVIDIA runtime libs present, so make them hard deps. Ascend/MetaX
+    # builds do not (they supply their own runtime), so keep it CUDA-only.
+    #
+    # FLAGOS_SKIP_CUDA_ASSETS=1 means we do NOT bundle libtorch_cuda.so (the same
+    # switch _bundle_cuda_assets() honors). That is the PPU case: the active torch
+    # is already a CUDA-enabled build (CUDA 13, PPU_SDK/CUDA_SDK supplies the
+    # runtime), so the pinned nvidia-*-cu12 wheels are both mismatched and
+    # unnecessary. Skip them so `pip install` does not drag in cu12 packages.
+    skip_assets = os.environ.get("FLAGOS_SKIP_CUDA_ASSETS", "0") == "1"
+    if ACCELERATOR == "cuda" and not skip_assets:
+        reqs += _CUDA_RUNTIME_DEPS
+    return reqs
 
 
 # PEP 517 / pip install -e loads setup.py as a script; setup() must run at import time

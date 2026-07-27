@@ -25,7 +25,7 @@ A custom PyTorch device plugin based on the PrivateUse1 extension mechanism, reg
 
 - Hardware Runtime Dependencies:
     - CUDA toolkit 12.8 (required only on CUDA platform)
-    - MetaX cu-bridge library (required only on MetaX platform)
+    - MetaX cu-bridge library (required only on MetaX platform; from the [MetaX developer portal](https://developer.metax-tech.com/softnova))
     - CANN toolkit (required only on Ascend platform)
 - PyTorch 2.11.0
 - FlagGems (version 5.0.2 or higher, requires DFLAGGEMS_BUILD_C_EXTENSIONS enabled). For source installation, refer to: [FlagGems Installation](https://flagos-ai.github.io/FlagGems/getting-started/install/)
@@ -43,27 +43,72 @@ ACCELERATOR=cuda FLAGGEMS_DIR=/path/to/FlagGems/build/cpython-312/ \
 
 ### Build from Source (MetaX Platform)
 
-MetaX builds compile device kernels with `mxcc`/`cucc` from `csrc/aten/backends/metax/*.cu` and link them into `libtorch_fl.so`. Runtime goes through MetaX cu-bridge (`runtime/accelerator/metax`); it does **not** use PyTorch's `at::cuda` path.
+MetaX ships a **self-contained boxing wheel**: it reuses PyTorch's generated CUDA boxing kernels (host `g++`, no `mxcc`) and bundles the forked libtorch C++ runtime inside the wheel. The target machine then needs only:
 
-**Prerequisites**
+- The official `torch==2.10.0+cpu` wheel (from PyPI, no CUDA)
+- This `torch_fl` wheel
+- The `/opt/maca` driver runtime (present on any machine with a MetaX card)
 
-- MetaX MACA SDK (default `/opt/maca`), with cu-bridge and `mxcc`/`cucc` available
-- PyTorch wheel compatible with your MetaX stack (see [Runtime notes](#metax-runtime-notes) below)
-- FlagGems 5.0.2+ (optional; required only when routing ops to `flagos_python`)
+No separate `torch+metax` wheel and no manual `LD_LIBRARY_PATH` are required — `import torch_fl` symlinks the stock wheel's `torch/lib` to the bundled forked libtorch, whose RPATH resolves the MetaX runtime under `/opt/maca`.
+
+> **Getting the MetaX MACA SDK and `torch+metax` wheel** (needed only to *build* the wheel, not to run it)
+> Both are distributed through the MetaX developer portal (SoftNova): <https://developer.metax-tech.com/softnova>. Registration/login is required. Download the MACA SDK (driver + cu-bridge) matching your card and driver version, and the `torch+metax` (`maca-pytorch`) wheel built for the same MACA version and your Python version — it is the source of the forked libtorch bundled into the wheel. Install the SDK to `/opt/maca` (or point `METAX_PATH` at the install location).
+
+**Build the wheel** (on a machine with the MetaX SDK and a `torch+metax` wheel available as the libtorch source):
 
 ```bash
 git clone https://github.com/flagos-ai/PyTorch-Plugin-FL.git && cd PyTorch-Plugin-FL
 
-# MetaX SDK paths (adjust if MACA is installed elsewhere)
-export METAX_PATH=/opt/maca
-export PATH=/opt/maca/tools/cu-bridge/bin:/opt/maca/bin:/opt/maca/mxgpu_llvm/bin:$PATH
-export LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/tools/cu-bridge/lib:/opt/maca/mxgpu_llvm/lib:$LD_LIBRARY_PATH
+# 1. Build the boxing artifacts (METAX_KERNEL is forced OFF in boxing mode)
+ACCELERATOR=metax FLAGOS_METAX_BOXING=1 \
+  FLAGOS_MACA_TORCH_LIB=/path/to/torch+metax/torch/lib \
+  FLAGOS_WHEEL_LOCAL=metax3.8.1 \
+  python setup.py bdist_wheel
 
-ACCELERATOR=metax METAX_KERNEL=ON FLAGGEMS_PYTHON=1 FLAGGEMS_KERNEL=0 CUDA_KERNEL=0 \
-  pip install --no-build-isolation -vvv -e .
+# 2. Bundle the 8 forked libtorch .so into torch_fl/lib_maca/ and rewrite RPATH
+#    (requires patchelf: pip install patchelf)
+FLAGOS_MACA_TORCH_LIB=/path/to/torch+metax/torch/lib \
+  MACA_PATH=/opt/maca \
+  bash scripts/bundle_maca_libtorch.sh
+
+# 3. Repackage so the bundled libtorch is included (reuses the built artifacts)
+python setup.py build_py
+cp build/lib.*/torch_fl/_C.*.so build/lib.*/torch_fl/  # ensure the C ext is staged
+python setup.py bdist_wheel --skip-build --bdist-dir "$(mktemp -d)"
 ```
 
-> On MetaX, generic PyPI Triton (`nvidia` backend) cannot JIT kernels for MetaX hardware. Use `torch_fl/backends_metax.conf` or `torch_fl/backends_metax_flagos_py.conf` to route incompatible ops to metax C++ kernels (see [MetaX backend configs](#metax-backend-configs)).
+The result is `dist/torch_fl-0.1.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1.1 GB — it bundles the forked libtorch, so it exceeds the PyPI 100 MB limit and must be distributed via a private index or directly).
+
+`FLAGOS_WHEEL_LOCAL` sets the local version segment (e.g. `metax3.8.1` → `0.1.0+metax3.8.1`) to tag the wheel with the target MACA/driver version.
+
+**Install and run** on the target machine (clean env, MetaX card present):
+
+```bash
+pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip install torch_fl-0.1.0+metax3.8.1-cp312-cp312-linux_x86_64.whl
+
+export FLAGOS_METAX_BOXING=1
+python -c "
+import torch_fl, torch          # torch_fl must be imported first
+x = torch.randn(4, 4, device='flagos:0')
+print((x + x).sum().cpu())
+"
+```
+
+In boxing mode, `import torch_fl` auto-selects `backends_cuda.conf` (override with `FLAGOS_BACKEND_CONFIG`). If MACA is installed somewhere other than `/opt/maca`, pass `MACA_PATH` at bundle time (step 2) so the RPATH points there.
+
+**Optional: FlagGems on MetaX.** Like the CUDA wheel, the MetaX boxing wheel compiles the FlagGems Python-path kernels (`flagos_python` backend) by default, so FlagGems is a runtime switch — set `FLAGOS_USE_FLAGGEMS=1` to route ops to FlagGems' Triton kernels where available, or leave it unset for pure CUDA-kernel reuse (boxing). Enabling it needs two extra target-side pip installs (not bundled in the wheel):
+
+```bash
+# On the target MetaX machine, in addition to the wheel + torch+cpu above:
+pip install triton-metax flag_gems     # triton-metax emits mcfatbin for MetaX GPUs
+
+export FLAGOS_METAX_BOXING=1
+export FLAGOS_USE_FLAGGEMS=1            # opt into FlagGems; unset = pure boxing
+python -c "import torch_fl, torch; x=torch.randn(1024, device='flagos:0'); print(torch.nn.functional.silu(x).sum().cpu())"
+```
+
+`import torch_fl` then auto-selects `backends_metax_flaggems.conf` and sets `GEMS_VENDOR=metax` + the MetaX `torch.cuda` compat shim automatically. That conf mirrors the CUDA `backends_flaggems.conf` but routes the ops triton-metax cannot run (`mm`/`bmm`/`mean.dim` — FlagGems uses a SPLIT_K kwarg / CUDA-context path triton-metax rejects) back to the `cuda` boxing kernel (maca `libtorch_cuda`), not the mxcc backend (which is off in boxing mode). Without `triton-metax`/`flag_gems` installed, leave `FLAGOS_USE_FLAGGEMS` unset — the pure boxing path has no extra dependencies.
 
 ### Build from Source (Ascend Platform)
 
@@ -150,6 +195,43 @@ pytest tests/integration/test_qwen3_train.py -v -s --model /path/to/Qwen3-0.6B
 > 2. FlagGems was installed from `https://github.com/Hchnr/FlagGems` branch `torch_fl`
 > 3. It was built with `FLAGGEMS_BACKEND=FLAGOS`
 > 4. The triton kernel cache was cleared (`rm -rf ~/.triton/cache/`)
+
+### Build from Source (PPU Platform)
+
+PPU (`PPU_SDK`) presents itself as a **CUDA-compatible** device, so it reuses the
+CUDA build directly — no dedicated `ACCELERATOR=ppu` branch is needed. The PPU
+`torch` wheel is already a full CUDA-enabled build (`torch.version.cuda == '13.0'`,
+`torch.cuda.is_available() == True`), and `PPU_SDK/CUDA_SDK` is a complete CUDA 13
+toolkit (nvcc, headers, `libcudart.so.13`). This makes PPU the simplest case of the
+boxing route:
+
+- **No stock `+cpu` wheel and no external `libtorch_cuda.so`** are required — the
+  PPU torch wheel ships its own CUDA runtime, loaded normally by `import torch`.
+- PPU registers ops under the independent `CUDA` dispatch key (not `PrivateUse1`),
+  so the generated CUDA boxing kernels (`csrc/aten/generated/cuda_kernels.cc`,
+  PrivateUse1 → CUDA) are reused unchanged.
+
+```bash
+git clone https://github.com/flagos-ai/PyTorch-Plugin-FL.git && cd PyTorch-Plugin-FL
+
+# Pure CUDA-boxing build (no FlagGems). CUDA_HOME points at the PPU CUDA_SDK;
+# FLAGOS_SKIP_CUDA_ASSETS=1 skips bundling an external libtorch_cuda.so AND skips
+# the pinned nvidia-*-cu12 runtime deps (PPU supplies CUDA 13 via PPU_SDK/CUDA_SDK).
+ACCELERATOR=cuda \
+  CUDA_HOME=/usr/local/PPU_SDK/CUDA_SDK \
+  CUDA_KERNEL=ON FLAGGEMS_KERNEL=OFF FLAGGEMS_PYTHON=OFF \
+  FLAGOS_SKIP_CUDA_ASSETS=1 \
+  pip install --no-build-isolation -vvv -e .
+```
+
+At runtime, set `FLAGOS_DISABLE_CUDA_ASSETS=1` so the import-time preload of a
+bundled `libtorch_cuda.so` is a no-op (there is none — PPU torch provides it):
+
+```bash
+FLAGOS_DISABLE_CUDA_ASSETS=1 python -c "import torch_fl, torch; \
+  x = torch.randn(4, 4, device='flagos'); \
+  print((x @ x).cpu())"
+```
 
 ### Build Environment Variables
 
@@ -240,15 +322,14 @@ export LD_PRELOAD=/opt/maca/lib/libsymbol_cu.so
 export FLAGOS_METAX_CUDART_SHIM=1
 export FLAGOS_METAX_COMPAT=1
 export GEMS_VENDOR=metax
-export FLAGOS_BACKEND_CONFIG=torch_fl/backends_metax_flagos_py.conf
+export FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_metax_flagos_py.conf
 export FLAGGEMS_SOURCE_DIR=$(python -c "import os,flag_gems;print(os.path.dirname(flag_gems.__file__))")
 ```
 
 #### MetaX runtime notes
 
-- **PyTorch + Triton stack**: Official `maca-pytorch` images ship `torch+metax` and `triton+metax` (outputs `mcfatbin`). A generic PyTorch wheel plus PyPI Triton uses the NVIDIA backend and will fail with `PTX JIT compilation failed` on MetaX unless affected ops are routed to metax C++ kernels.
+- **Boxing wheel**: The [self-contained boxing wheel](#build-from-source-metax-platform) (`FLAGOS_METAX_BOXING=1`) reuses PyTorch's CUDA boxing kernels and bundles the forked libtorch, running on official `torch+cpu` with no `mxcc`. By default ops route to `cuda` via `backends_cuda.conf` (no Triton, no extra deps). Setting `FLAGOS_USE_FLAGGEMS=1` opts into the FlagGems `flagos_python` path (`backends_metax_flaggems.conf`), which requires target-side `triton-metax` + `flag_gems`; ops triton-metax cannot run fall back to the `cuda` boxing kernel.
 - **`flash_attn`**: Prebuilt MetaX `flash_attn` wheels may ABI-mismatch newer PyTorch versions. Disable or patch before loading Qwen3/transformers if import fails.
-- **`relu` / `sigmoid`**: Not registered via `m.impl` in the current tree; they fall back to CPU. Do not list them as `metax` in config unless GPU kernels are enabled in `MetaxKernels.cmake`.
 
 ### C++ Stub-Only Mode
 
@@ -280,7 +361,7 @@ You can configure whether to use FlagGems or CUDA backend at per-operator granul
 
 ### Configuration File
 
-Default path is `torch_fl/backends.conf`, can be overridden via `FLAGOS_BACKEND_CONFIG` environment variable:
+Default path is `torch_fl/configs/backends.conf`, can be overridden via `FLAGOS_BACKEND_CONFIG` environment variable:
 
 ```ini
 # Format: op_name = backend
@@ -306,8 +387,8 @@ export FLAGOS_OP_mm__out=cuda
 
 | File | Purpose |
 |------|---------|
-| `torch_fl/backends_metax.conf` | All listed ops → `metax` C++ kernels. Default when pytest detects MetaX (`/dev/mxcd`) and `FLAGOS_BACKEND_CONFIG` is unset. |
-| `torch_fl/backends_metax_flagos_py.conf` | **Recommended for integration tests.** Hybrid routing: most compute ops → `flagos_python`; keep Triton-incompatible ops (`mm`/`bmm`/`mean.dim`) and factory/allocation ops (`zeros`, `scalar_tensor`, `embedding`, …) on `metax`. |
+| `torch_fl/configs/backends_metax.conf` | All listed ops → `metax` C++ kernels. Default when pytest detects MetaX (`/dev/mxcd`) and `FLAGOS_BACKEND_CONFIG` is unset. |
+| `torch_fl/configs/backends_metax_flagos_py.conf` | **Recommended for integration tests.** Hybrid routing: most compute ops → `flagos_python`; keep Triton-incompatible ops (`mm`/`bmm`/`mean.dim`) and factory/allocation ops (`zeros`, `scalar_tensor`, `embedding`, …) on `metax`. |
 
 Example (`backends_metax_flagos_py.conf`):
 
@@ -369,7 +450,7 @@ pytest tests/integration/ops/ -v -m flaggems_python
 pytest tests/integration/ops/ -v -m anyplatform
 
 # FlagGems Python wrapper (flagos_python) end-to-end tests
-FLAGOS_BACKEND_CONFIG=torch_fl/backends_flagos_py.conf \
+FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_flagos_py.conf \
   pytest tests/integration/ops/ -v
 ```
 
@@ -384,7 +465,7 @@ export LD_PRELOAD=/opt/maca/lib/libsymbol_cu.so
 export FLAGOS_METAX_CUDART_SHIM=1
 export FLAGOS_METAX_COMPAT=1
 export GEMS_VENDOR=metax
-export FLAGOS_BACKEND_CONFIG=torch_fl/backends_metax_flagos_py.conf
+export FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_metax_flagos_py.conf
 export FLAGGEMS_SOURCE_DIR=$(python -c "import os,flag_gems;print(os.path.dirname(flag_gems.__file__))")
 
 # Basic op tests (includes Qwen3 inference-path ops: cos/sin/rsqrt/silu/...)
@@ -400,26 +481,26 @@ pytest tests/integration/test_qwen3_infer.py -v -s --model /path/to/Qwen3-0.6B
 pytest tests/integration/test_qwen3_train.py -v -s --steps 10
 
 # All-metax C++ kernel mode (no flagos_python)
-FLAGOS_BACKEND_CONFIG=torch_fl/backends_metax.conf \
+FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_metax.conf \
   FLAGOS_DISABLE_FLAGGEMS_PY=1 \
   pytest tests/integration/test_ops.py -v
 ```
 
-If `FLAGOS_BACKEND_CONFIG` is not set, `tests/integration/conftest.py` auto-selects `torch_fl/backends_metax.conf` on MetaX hardware.
+If `FLAGOS_BACKEND_CONFIG` is not set, `tests/integration/conftest.py` auto-selects `torch_fl/configs/backends_metax.conf` on MetaX hardware.
 
 ### Ascend Platform
 
 ```bash
 # Operator tests
-FLAGOS_BACKEND_CONFIG=torch_fl/backends_ascend.conf \
+FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_ascend.conf \
   pytest tests/integration/ops/ -v -m "anyplatform or ascend"
 
 # Qwen3 inference test
-FLAGOS_BACKEND_CONFIG=torch_fl/backends_ascend.conf \
+FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_ascend.conf \
   pytest tests/integration/test_qwen3_infer.py -v -s
 
 # Qwen3 training test (single GPU)
-FLAGOS_BACKEND_CONFIG=torch_fl/backends_ascend.conf \
+FLAGOS_BACKEND_CONFIG=torch_fl/configs/backends_ascend.conf \
   pytest tests/integration/test_qwen3_train.py -v -s --steps 10
 ```
 

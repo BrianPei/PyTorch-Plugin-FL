@@ -16,7 +16,7 @@ set(LIBRARY_NAME torch_fl)
 
 option(CUDA_KERNEL "Build CUDA kernel implementations" ON)
 option(FLAGGEMS_KERNEL "Build FlagGems C++ kernel wrappers (requires liboperators.so)" ON)
-option(FLAGGEMS_PYTHON "Build FlagGems Python kernel wrappers (calls via Python, no C++ linking)" OFF)
+option(FLAGGEMS_PYTHON "Build FlagGems Python kernel wrappers (calls via Python, no C++ linking)" ON)
 option(METAX_KERNEL "Build MetaX kernel implementations" OFF)
 option(ASCEND_KERNEL "Build Ascend kernel implementations" OFF)
 
@@ -36,11 +36,14 @@ if(NOT CUDA_KERNEL)
 endif()
 if(NOT FLAGGEMS_KERNEL AND NOT FLAGGEMS_PYTHON)
   # Neither C++ nor Python wrappers: exclude entire flagos backend
+  # (only python_op_caller.{h,cc} lives here now). The generated
+  # flaggems_python_kernels.cc stays but is a no-op without FLAGOS_FLAGGEMS_PYTHON.
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/flagos/.*")
-elseif(FLAGGEMS_PYTHON AND NOT FLAGGEMS_KERNEL)
-  # Python wrappers only: exclude C++ wrappers (bmm.cc, cat.cc, etc.) but keep python_op_caller and python_wrapper/
-  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/flagos/(bmm|cat|embedding|mm|softmax)\\.cc")
 endif()
+# FLAGGEMS_PYTHON path: keep csrc/aten/backends/flagos/python_op_caller.cc and
+# build csrc/aten/generated/flaggems_python_kernels.cc with FLAGOS_FLAGGEMS_PYTHON
+# defined (below). The stale C++/python_wrapper files were removed; nothing to
+# exclude here.
 if(NOT METAX_KERNEL)
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/metax/.*")
 endif()
@@ -83,6 +86,27 @@ endif()
 target_compile_definitions(${LIBRARY_NAME} PRIVATE
     FLAGOS_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
 )
+
+# Compile the generated FlagGems Python-path kernels (guarded by this macro) and
+# python_op_caller only when the Python FlagGems path is requested.
+if(FLAGGEMS_PYTHON)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_FLAGGEMS_PYTHON)
+endif()
+
+# The CPU-only torch wheel ships c10/cuda headers but not the CUDA-build-only
+# c10/cuda/impl/cuda_cmake_macros.h. cuda_memory.h includes CUDACachingAllocator.h
+# to delegate flagos allocation to the CUDA caching allocator; this macro tells
+# CUDAMacros.h to skip that generated configure file. Not needed for Ascend
+# (which does not include c10/cuda headers).
+if(NOT ACCELERATOR STREQUAL "ascend")
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE C10_CUDA_NO_CMAKE_CONFIGURE_FILE)
+endif()
+
+if(ACCELERATOR STREQUAL "metax")
+  # maca's torch headers are a hard fork gated on USE_MACA (e.g. C10_WARP_SIZE,
+  # Context.h allow_tf32_cudnn). Without it the headers hit static_assert(0).
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE USE_MACA=1)
+endif()
 
 set(_torch_fl_link_libs torch_cpu_library torch_python_library flagos ${CUDA_RUNTIME_LIB})
 if(FLAGGEMS_KERNEL)
@@ -134,6 +158,19 @@ if(ACCELERATOR STREQUAL "metax")
   else()
     message(WARNING "mcblas not found, MetaX mm will fallback to naive kernel")
   endif()
+
+  # Self-contained wheel: the installed libtorch_fl.so must NOT bake the build
+  # machine's absolute torch/lib path into its RUNPATH (that path does not exist
+  # on target machines). Resolve the forked libtorch bundled under
+  # torch_fl/lib_maca/ via $ORIGIN, and the maca runtime (mcblas/mcdnn/...) from
+  # the target's /opt/maca driver install. Disabling INSTALL_RPATH_USE_LINK_PATH
+  # stops CMake from appending the imported torch target's build-machine link
+  # dir. Mirrors scripts/bundle_maca_libtorch.sh's patchelf pass.
+  set_target_properties(${LIBRARY_NAME} PROPERTIES
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib_maca:${METAX_PATH}/lib:${METAX_PATH}/lib64:/opt/maca/lib:/opt/maca/lib64"
+    INSTALL_RPATH_USE_LINK_PATH OFF
+    BUILD_WITH_INSTALL_RPATH ON
+  )
 endif()
 
 install(TARGETS ${LIBRARY_NAME}

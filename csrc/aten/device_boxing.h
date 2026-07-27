@@ -16,6 +16,11 @@ namespace at::native::flagos {
 // Change a tensor's device type in-place (metadata only, no data copy).
 // Modifies dispatch key set, DataPtr device, and device_opt_.
 inline void SetTensorDevice(const at::Tensor& t, c10::DeviceType type) {
+  // Undefined tensors (e.g. an unrequested grad in a *_backward output tuple,
+  // like the bias grad of convolution_backward when output_mask[2]==false) have
+  // no TensorImpl; touching device() would dereference null -> "tensor does not
+  // have a device". Nothing to rebox, so skip.
+  if (!t.defined()) return;
   auto* impl = t.unsafeGetTensorImpl();
   auto idx = impl->device().index();
   auto new_device = c10::Device(type, idx);
@@ -83,6 +88,46 @@ inline void UnboxTensorListToFlagos(at::TensorList tensors) {
   }
 }
 
+// Materialize an ITensorListRef into a std::vector<at::Tensor>.
+// The Tensor handles share the same TensorImpl as the originals, so boxing
+// them (device metadata rewrite) affects the underlying tensors in place.
+// The returned vector converts implicitly to at::TensorList (ArrayRef) for
+// passing to PyTorch's public at:: API, which expects TensorList not IListRef.
+inline std::vector<at::Tensor> MaterializeToTensorVec(
+    const at::ITensorListRef& list) {
+  std::vector<at::Tensor> out;
+  out.reserve(list.size());
+  for (const auto& t : list) {
+    out.push_back(t);
+  }
+  return out;
+}
+
+// Drop "legacy empty" tensors (1-D with size 0) from a cat input list, matching
+// ATen's native cat `should_skip` rule. maca's forked libtorch_cuda cat kernel
+// takes a vectorized fast path when the non-empty tensor's numel is a multiple
+// of 128 that does not honor this legacy skip, so it applies the cat dim against
+// the empty tensor's 1-D rank and raises "Dimension out of range". Filtering
+// here reproduces stock PyTorch semantics (e.g. transformers' KV-cache
+// `torch.cat([torch.tensor([]), key_states], dim=-2)` on the first decode step).
+// If every tensor is legacy-empty the list is returned unchanged so at::cat
+// preserves its own empty-input behavior.
+inline std::vector<at::Tensor> DropLegacyEmptyForCat(
+    const std::vector<at::Tensor>& tensors) {
+  std::vector<at::Tensor> kept;
+  kept.reserve(tensors.size());
+  for (const auto& t : tensors) {
+    if (t.defined() && t.dim() == 1 && t.sym_size(0) == 0) {
+      continue;
+    }
+    kept.push_back(t);
+  }
+  if (kept.empty()) {
+    return tensors;
+  }
+  return kept;
+}
+
 // Box/unbox a vector of Tensors returned by non-inplace _foreach ops.
 inline void UnboxTensorVecToFlagos(std::vector<at::Tensor>& tensors) {
   for (auto& t : tensors) {
@@ -106,6 +151,11 @@ class TensorListBoxingGuard {
         boxed_.push_back(t);
       }
     }
+  }
+
+  // Track a tensor that was already boxed (for ITensorListRef iteration)
+  void track(const at::Tensor& t) {
+    boxed_.push_back(t);
   }
 
   ~TensorListBoxingGuard() {
