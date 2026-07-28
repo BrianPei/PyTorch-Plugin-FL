@@ -84,6 +84,7 @@ def _run_cat_subprocess(
         env=env,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     if check:
         assert result.returncode == 0, (
@@ -479,7 +480,8 @@ class TestCatDispatchLog:
     def test_dispatch_log_flagos_default(self):
         """Default config routes cat to flagos."""
         result = _run_cat_subprocess(
-            {"FLAGOS_LOG_DISPATCH": "1", "FLAGOS_OP_cat": "flaggems"}
+            {"FLAGOS_LOG_DISPATCH": "1", "FLAGOS_OP_cat": "flaggems"},
+            check=False,
         )
         assert "[flagos dispatch] cat -> flagos" in result.stderr, (
             f"Expected flagos dispatch log, got:\n{result.stderr}"
