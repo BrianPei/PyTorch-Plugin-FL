@@ -53,6 +53,13 @@ for _lib in ("libc10.so", "libtorch.so", "libtorch_cpu.so"):
     if _os.path.exists(_p):
         ctypes.CDLL(_p, mode=ctypes.RTLD_GLOBAL)
 
+# The accelerator-side PyTorch libraries are staged from the vendor image at
+# build time. Load them only after the common libraries from the upstream CPU
+# torch wheel, and before importing the torch_fl native extension.
+from ._torch_runtime import load_bundled_torch_runtime  # noqa: E402
+
+_bundled_torch_runtime_handles = load_bundled_torch_runtime()
+
 # Load libstream_api.so with RTLD_GLOBAL so that liboperators.so (FlagGems)
 # can resolve GetCurrentStream at runtime.
 _stream_api_path = _os.path.join(_os.path.dirname(__file__), "lib", "libstream_api.so")

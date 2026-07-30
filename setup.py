@@ -474,7 +474,10 @@ def _get_setup_kwargs():
             "lib/*.dylib*",
             "lib/*.dll",
             "lib/*.lib",
+            "lib/torch_runtime/*.so*",
+            "lib/torch_runtime/manifest.json",
             "backends.conf",
+            "backends_*.conf",
         ]
     }
 
@@ -497,7 +500,7 @@ def _get_setup_kwargs():
         include_package_data=False,
         python_requires=">=3.8",
         install_requires=[
-            "torch",
+            "torch==2.10.0",
         ],
     )
 

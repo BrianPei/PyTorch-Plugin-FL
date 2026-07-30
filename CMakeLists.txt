@@ -76,7 +76,11 @@ set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 if(APPLE)
   set(CMAKE_INSTALL_RPATH "@loader_path/lib;@loader_path")
 elseif(UNIX)
-  set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN")
+  # All CMake-installed libraries live under torch_fl/lib/. Keep their sibling
+  # dependencies and bundled accelerator runtime relocatable without embedding
+  # any build-container site-packages paths in the wheel. The Python extension
+  # adds its own $ORIGIN/lib RPATH in setup.py.
+  set(CMAKE_INSTALL_RPATH "$ORIGIN:$ORIGIN/torch_runtime")
 elseif(WIN32)
   set(CMAKE_INSTALL_RPATH "")
 endif()
@@ -233,7 +237,10 @@ if(FLAGGEMS_KERNEL)
   list(APPEND CMAKE_MODULE_PATH "${FLAGGEMS_DIR}")
   find_package(FlagGems REQUIRED PATHS "${FLAGGEMS_DIR}" NO_DEFAULT_PATH)
 
-  # Embed liboperators.so dir into RPATH so it's found at runtime without LD_LIBRARY_PATH
+  # Keep the wheel independent of the build image's FlagGems installation path.
+  # Platform setup scripts provide FLAGGEMS_DIR/LD_LIBRARY_PATH at build and
+  # integration time; an absolute site-packages path here would make the wheel
+  # non-relocatable and leak the vendor image layout into its ELF metadata.
   if(TARGET FlagGems::operators)
     set(_flaggems_operators_target FlagGems::operators)
   elseif(TARGET operators)
@@ -242,24 +249,7 @@ if(FLAGGEMS_KERNEL)
     message(FATAL_ERROR "FlagGems package does not export an operators target")
   endif()
 
-  get_filename_component(_flaggems_libdir "${FLAGGEMS_DIR}/../.." ABSOLUTE)
-  get_target_property(
-    _flaggems_lib_location
-    ${_flaggems_operators_target}
-    IMPORTED_LOCATION_RELEASE
-  )
-  if(NOT _flaggems_lib_location)
-    get_target_property(
-      _flaggems_lib_location
-      ${_flaggems_operators_target}
-      IMPORTED_LOCATION
-    )
-  endif()
-  if(_flaggems_lib_location)
-    get_filename_component(_flaggems_libdir "${_flaggems_lib_location}" DIRECTORY)
-  endif()
-  message(STATUS "FlagGems liboperators RPATH: ${_flaggems_libdir}")
-  list(APPEND CMAKE_INSTALL_RPATH "${_flaggems_libdir}")
+  message(STATUS "FlagGems operators runtime is supplied by LD_LIBRARY_PATH")
 elseif(ACCELERATOR STREQUAL "metax")
   message(STATUS "MetaX build: native runtime + mxcc kernels (no FlagGems)")
 endif()
@@ -268,10 +258,6 @@ if(DEFINED PYTHON_INCLUDE_DIR)
   include_directories(${PYTHON_INCLUDE_DIR})
 else()
   message(FATAL_ERROR "Cannot find Python directory")
-endif()
-
-if(PYTORCH_INSTALL_DIR)
-  list(APPEND CMAKE_INSTALL_RPATH "${PYTORCH_INSTALL_DIR}/lib")
 endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})

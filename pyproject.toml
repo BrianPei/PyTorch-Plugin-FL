@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools>=45", "wheel", "cmake>=3.18", "torch"]
+requires = ["setuptools>=45", "wheel", "cmake>=3.18", "torch==2.10.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -38,7 +38,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch",
+    "torch==2.10.0",
 ]
 
 [project.optional-dependencies]

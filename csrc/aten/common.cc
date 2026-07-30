@@ -33,6 +33,8 @@ std::string DefaultConfigPath() {
       platform = "tsingmicro";
 #elif defined(USE_ASCEND)
       platform = "ascend";
+#elif defined(USE_METAX)
+      platform = "metax";
 #endif
       if (platform) {
         // dir is <prefix>/torch_fl/lib, config is at <prefix>/torch_fl/

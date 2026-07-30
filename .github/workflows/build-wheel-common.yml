@@ -75,18 +75,11 @@ jobs:
 
       - name: Verify wheel
         run: |
-          python -m pip install dist/*.whl
-          python - <<'PY'
-          from importlib.metadata import files, metadata
-
-          package_metadata = metadata("torch_fl")
-          package_files = [str(path) for path in files("torch_fl")]
-          assert any("torch_fl" in path for path in package_files), (
-              "torch_fl module not found in wheel"
-          )
-          print(f"Package: {package_metadata['Name']} {package_metadata['Version']}")
-          print(f"Installed files: {len(package_files)}")
-          PY
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          VERIFY_SCRIPT="$GITHUB_WORKSPACE/.github/scripts/verify_installed_wheel.py"
+          VERIFY_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-wheel-verify.XXXXXX")
+          cd "$VERIFY_DIR"
+          python "$VERIFY_SCRIPT" --workspace "$GITHUB_WORKSPACE"
 
       - name: Upload wheel
         if: inputs.upload_artifact
@@ -94,3 +87,4 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}
           path: dist/*.whl
+          if-no-files-found: error

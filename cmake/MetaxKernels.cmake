@@ -2,7 +2,9 @@
 # Compile MetaX device kernels with mxcc/cucc (no CMake CUDA language).
 
 function(flagos_add_metax_kernel_objects out_var)
-  if(NOT METAX_PATH)
+  if(METAX_PATH)
+    set(_metax_path "${METAX_PATH}")
+  else()
     set(_metax_path "$ENV{METAX_PATH}")
   endif()
   if(NOT _metax_path)

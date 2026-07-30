@@ -12,36 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-display_name: CUDA
+display_name: MetaX
 
-# Platform-specific preparation is implemented outside the common workflows.
-setup_script: .github/scripts/set_env_cuda.sh
+setup_script: .github/scripts/set_env_metax.sh
 
-ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260728-cuda-dev
+ci_image: maca-pytorch:3.8.0.11-torch2.10-py312-ubuntu24.04-amd64
 
 runner_labels:
-  - nv-8g-cicd-pytorch
+  - mx-8g-cicd-pytorch
 
-container_volumes:
-  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
-
-integration_environment:
-  MODEL_PATH: /models/Qwen3-0.6B
+container_volumes: []
+integration_environment: {}
 
 container_options: >-
-  --gpus all
+  --privileged
   --ipc=host
   --shm-size=512g
   --ulimit memlock=-1
   --cap-add=SYS_PTRACE
 
 timeout_minutes: 60
-wheel_artifact_name: wheel-cuda
+wheel_artifact_name: wheel-metax
 
-# The common workflow only executes this platform-provided test manifest.
 integration_tests:
-  - name: Check model availability
-    command: test -d "$MODEL_PATH"
   - name: Check device availability
     command: |
       python - <<'PY'
@@ -56,18 +49,12 @@ integration_tests:
       print(f"CPU PyTorch: {torch.__version__}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
-  - name: Run operator tests
+  - name: Run MetaX operator tests
     command: >-
       python -m pytest tests/integration/ops/
-      -m "not metax and not ascend and not flaggems_python"
+      -m "not cuda and not ascend and not flaggems and not flaggems_python"
       -v -s --tb=short
-  - name: Run general tests
-    command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
-  - name: Run inference tests
+  - name: Run MetaX general tests
     command: >-
-      python -m pytest tests/integration/test_qwen3_infer.py
-      --model "$MODEL_PATH" -v -s --tb=short
-  - name: Run training tests
-    command: >-
-      python -m pytest tests/integration/test_qwen3_train.py
-      --model "$MODEL_PATH" -v -s --tb=short
+      python -m pytest tests/integration/test_factory_ops.py
+      -v -s --tb=short
