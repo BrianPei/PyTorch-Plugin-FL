@@ -20,9 +20,7 @@ setup_script: .github/scripts/set_env_cuda.sh
 ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260728-cuda-dev
 
 runner_labels:
-  - self-hosted
-  - nvidia
-  - gpu-8
+  - nv-8g-cicd-pytorch
 
 container_volumes:
   - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
