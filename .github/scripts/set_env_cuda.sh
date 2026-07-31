@@ -166,6 +166,9 @@ fi
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" -m pip install pytest transformers
+fi
 
 # Keep the vendor FlagGems/FlagCX Python packages available without copying the
 # vendor torch package. They are pure-Python/extension packages used by the
