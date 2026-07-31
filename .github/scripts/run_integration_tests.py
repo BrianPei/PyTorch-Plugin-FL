@@ -89,7 +89,7 @@ def main():
             flush=True,
         )
         result = subprocess.run(
-            ["bash", "-lc", f"set -euo pipefail\n{test['command']}"],
+            ["bash", "-c", f"set -euo pipefail\n{test['command']}"],
             check=False,
             env=command_environment,
         )
