@@ -93,6 +93,7 @@ if [[ -n "${GITHUB_PATH:-}" ]]; then
 fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
+  printf '%s=%s\n' PATH "$PATH" >> "$GITHUB_ENV"
   for name in \
     VIRTUAL_ENV PYTHONNOUSERSITE ACCELERATOR METAX_PATH MACA_PATH MACA_HOME \
     FLAGOS_METAX_BOXING FLAGOS_METAX_CUDART_SHIM \
