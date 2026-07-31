@@ -140,12 +140,18 @@ for pattern in \
 done
 shopt -u nullglob
 
-for required in libc10_cuda.so libtorch_cuda.so; do
-  if [[ ! -e "$CUDA_ASSETS_DIR/$required" ]]; then
-    echo "::error::Required CUDA asset was not found: $VENDOR_TORCH_LIB/$required"
-    exit 1
-  fi
-done
+# The CUDA dispatcher library is the only mandatory accelerator asset. Some
+# vendor Torch layouts (including cu130 images) do not ship a standalone
+# libc10_cuda.so; torch_fl treats that library as optional and loads it when
+# present. Keep the check layout-agnostic instead of requiring a fixed set of
+# files on every CUDA image.
+if [[ ! -e "$CUDA_ASSETS_DIR/libtorch_cuda.so" ]]; then
+  echo "::error::Required CUDA asset was not found: $VENDOR_TORCH_LIB/libtorch_cuda.so"
+  exit 1
+fi
+if [[ ! -e "$CUDA_ASSETS_DIR/libc10_cuda.so" ]]; then
+  echo "::notice::Optional CUDA asset not present: $VENDOR_TORCH_LIB/libc10_cuda.so"
+fi
 echo "CUDA assets staged: $(find "$CUDA_ASSETS_DIR" -maxdepth 1 -type f -name '*.so*' | wc -l)"
 
 VENV_ROOT="${TORCH_FL_VENV_ROOT:-${RUNNER_TEMP:-$REPO_ROOT/.ci}/torch-fl-cuda-${CI_STAGE}}"
