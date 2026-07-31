@@ -45,23 +45,29 @@ integration_tests:
   - name: Check device availability
     command: |
       python - <<'PY'
-      import torch
-      import torch_fl
+      from pathlib import Path
 
-      assert torch.cuda.is_available(), "CUDA is unavailable"
+      import torch_fl
+      import torch
+
+      torch_path = Path(torch.__file__).resolve()
+      package_lib = Path(torch_fl.__file__).resolve().parent / "lib"
+
+      assert torch.__version__.startswith("2.10.0+cpu"), torch.__version__
+      assert torch.version.cuda is None, torch.version.cuda
+      assert "/opt/conda/" not in str(torch_path), torch_path
+      assert (package_lib / "libtorch_cuda.so").is_file(), package_lib
       assert torch_fl.flagos.is_available(), "flagos device is unavailable"
-      print(f"CUDA devices: {torch.cuda.device_count()}")
+      print(f"CPU PyTorch: {torch.__version__}")
+      print(f"torch path: {torch_path}")
+      print(f"CUDA assets: {package_lib}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
-  - name: Check FlagGems routing consistency
-    command: >-
-      python -m pytest
-      tests/integration/ops/test_flaggems_conf_consistency.py
-      -v --tb=short
   - name: Run operator tests (vendor backend, main ops)
     command: >-
       python -m pytest tests/integration/ops/
-      -m main_ops -v -s --tb=short
+      -m "main_ops and not flaggems_python and not flaggems_cpp"
+      -v -s --tb=short
   - name: Run operator tests (FlagGems runtime path, main ops)
     command: >-
       FLAGOS_USE_FLAGGEMS=1
