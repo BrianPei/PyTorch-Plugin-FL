@@ -38,4 +38,4 @@ jobs:
       run_build: false
       run_integration_tests: true
       upload_artifact: false
-      timeout_minutes: ${{ inputs.timeout-minutes }}
+      timeout_minutes: ${{ inputs['timeout-minutes'] }}
