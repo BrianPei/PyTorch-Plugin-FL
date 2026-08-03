@@ -96,6 +96,10 @@ fi
 echo "Vendor Python: $VENDOR_PYTHON ($VENDOR_PYTHON_VERSION)"
 echo "Vendor PyTorch: $VENDOR_TORCH_VERSION"
 echo "Vendor torch root: $VENDOR_TORCH_ROOT"
+echo "Vendor torch lib: $VENDOR_TORCH_LIB"
+if [[ -d "$VENDOR_TORCH_LIB" ]]; then
+  ls -lah "$VENDOR_TORCH_LIB"/libtorch_cuda.so* "$VENDOR_TORCH_LIB"/libc10_cuda.so* 2>/dev/null || true
+fi
 
 VENDOR_FLAGGEMS_DIR="$("$VENDOR_PYTHON" - <<'PY'
 import importlib.util
@@ -146,6 +150,11 @@ shopt -u nullglob
 # present. Keep the check layout-agnostic instead of requiring a fixed set of
 # files on every CUDA image.
 if [[ ! -e "$CUDA_ASSETS_DIR/libtorch_cuda.so" ]]; then
+  echo "CUDA library candidates under vendor torch root:"
+  find "$VENDOR_TORCH_ROOT" -maxdepth 4 \
+    \( -type f -o -type l \) \
+    \( -name 'libtorch_cuda.so*' -o -name 'libc10_cuda.so*' \) \
+    -print 2>/dev/null || true
   echo "::error::Required CUDA asset was not found: $VENDOR_TORCH_LIB/libtorch_cuda.so"
   exit 1
 fi
