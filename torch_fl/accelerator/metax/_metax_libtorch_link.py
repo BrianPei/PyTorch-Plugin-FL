@@ -39,6 +39,7 @@ idempotent, gated on ``FLAGOS_METAX_BOXING=1``, and a no-op when the active torc
 already IS the MetaX wheel.
 """
 
+import ctypes
 import importlib.util
 import os
 
@@ -60,6 +61,7 @@ _CUDA_SO = (
 )
 
 _done = False
+_cuda_handle = None
 
 
 def _active_torch_lib():
@@ -160,7 +162,7 @@ def ensure_maca_libtorch_links():
     No-op unless FLAGOS_METAX_BOXING=1.  Idempotent; reversible via _orig_backup.
     Returns True if links are in place (or already were), False if skipped.
     """
-    global _done
+    global _cuda_handle, _done
     if _done:
         return True
     if os.environ.get("FLAGOS_METAX_BOXING", "0") != "1":
@@ -180,6 +182,18 @@ def ensure_maca_libtorch_links():
         _link_one(active, backup, name, os.path.join(maca, name), required=True)
     for name in _CUDA_SO:
         _link_one(active, backup, name, os.path.join(maca, name), required=False)
+
+    # A CPU-only torch wheel does not load libtorch_cuda.so itself. The boxing
+    # kernels in libtorch_fl.so still reference symbols exported by the MetaX
+    # CUDA runtime, so load the linked copy globally before torch_fl._C loads.
+    cuda = os.path.join(active, "libtorch_cuda.so")
+    if not os.path.exists(cuda):
+        raise FileNotFoundError(f"MetaX libtorch_cuda.so missing: {cuda}")
+    try:
+        _cuda_handle = ctypes.CDLL(cuda, mode=ctypes.RTLD_GLOBAL)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to load MetaX libtorch_cuda.so: {cuda}") from exc
+
     _done = True
     return True
 
