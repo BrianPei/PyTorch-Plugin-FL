@@ -133,11 +133,11 @@ rm -rf "$CUDA_ASSETS_DIR"
 mkdir -p "$CUDA_ASSETS_DIR"
 shopt -s nullglob
 for pattern in \
-  libc10_cuda.so* \
-  libtorch_cuda.so* \
-  libtorch_cuda_linalg.so* \
-  libtorch_nvshmem.so* \
-  libcaffe2_nvrtc.so*; do
+  'libc10_cuda.so*' \
+  'libtorch_cuda.so*' \
+  'libtorch_cuda_linalg.so*' \
+  'libtorch_nvshmem.so*' \
+  'libcaffe2_nvrtc.so*'; do
   for source in "$VENDOR_TORCH_LIB"/$pattern; do
     cp -a "$source" "$CUDA_ASSETS_DIR/"
   done

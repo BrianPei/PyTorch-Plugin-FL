@@ -106,10 +106,11 @@ fi
 
 cd "$REPO_ROOT"
 
-if [[ "$CI_STAGE" == "build" ]]; then
+if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   # setuptools collects package_data before build_ext on the first wheel build.
   # Prebuilding makes torch_fl/lib/*.so available when the common workflow
-  # packages the wheel. The following python -m build is incremental.
+  # packages the local wheel for either stage. The following python -m build
+  # is incremental.
   python setup.py build_ext --inplace
 fi
 
