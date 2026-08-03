@@ -94,8 +94,12 @@ jobs:
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
           INTEGRATION_TESTS=$(yq -o=json -I=0 '.integration_tests // []' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
+          CONFIG_WHEEL_SOURCE=$(yq -r '.integration_wheel_source // "auto"' "$CONFIG_FILE")
           INTEGRATION_WHEEL_SOURCE="${{ inputs.integration_wheel_source }}"
 
+          if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
+            INTEGRATION_WHEEL_SOURCE="$CONFIG_WHEEL_SOURCE"
+          fi
           if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
             if [[ "${{ inputs.run_build }}" == "true" ]]; then
               INTEGRATION_WHEEL_SOURCE="artifact"

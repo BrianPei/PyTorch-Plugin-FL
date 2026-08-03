@@ -34,6 +34,9 @@ container_options: >-
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-metax
+# Keep MetaX integration self-contained; transferring the ~670MB wheel through
+# the Actions artifact service can exceed the self-hosted runner job timeout.
+integration_wheel_source: local-build
 
 integration_tests:
   - name: Check isolated MetaX environment
