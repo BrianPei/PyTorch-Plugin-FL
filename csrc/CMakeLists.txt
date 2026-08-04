@@ -41,6 +41,11 @@ if(NOT FLAGGEMS_KERNEL AND NOT FLAGGEMS_PYTHON AND NOT CUDA_KERNEL)
   # (only python_op_caller.{h,cc} lives here now). The generated
   # flaggems_python_kernels.cc stays but is a no-op without FLAGOS_FLAGGEMS_PYTHON.
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/flagos/.*")
+  if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
+    # The MetaX vendor runtime calls this provider even when FlagGems is off.
+    list(APPEND SOURCE_FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/flagos/python_op_caller.cc")
+  endif()
 endif()
 # CUDA_KERNEL path: cuda_kernels.cc's native RNG kernels unconditionally call
 # GetFlagosDefaultCudaGenerator() (unified-RNG generator injection) regardless
@@ -149,6 +154,20 @@ if(FLAGGEMS_KERNEL)
     list(APPEND _torch_fl_link_libs FlagGems::operators)
   elseif(TARGET operators)
     list(APPEND _torch_fl_link_libs operators)
+  endif()
+endif()
+
+if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
+  # The CPU TorchConfig used for the isolated Python environment does not
+  # declare MetaX's forked CUDA runtime. Link it directly so vendor-only ATen
+  # symbols are resolved by ELF instead of being left to process-global lookup.
+  set(_metax_torch_lib "$ENV{FLAGOS_MACA_TORCH_LIB}")
+  if(IS_DIRECTORY "${_metax_torch_lib}")
+    if(EXISTS "${_metax_torch_lib}/libtorch_cuda.so")
+      list(APPEND _torch_fl_link_libs
+        "${_metax_torch_lib}/libtorch_cuda.so")
+      target_link_options(${LIBRARY_NAME} PRIVATE "-Wl,--no-as-needed")
+    endif()
   endif()
 endif()
 
