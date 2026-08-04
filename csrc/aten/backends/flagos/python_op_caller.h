@@ -137,9 +137,12 @@ at::Tensor CallPythonOp_LikeFactory(const char* func_name,
 at::Tensor CallPythonOp_RandomInplace(const char* func_name,
                                       const std::vector<c10::IValue>& args);
 
-// Fetch the vendor CUDA generator used by native CUDA-boxed RNG kernels.
-// This symbol is also consumed by the MetaX libtorch runtime when the
-// isolated CPU Python wheel is paired with the vendor native libraries.
+// Fetch the vendor compat shim's per-device CUDA generator
+// (torch.cuda.default_generators[device_index]) as an at::Generator. This is
+// the SAME object FlagGems reads via philox_backend_seed_offset, so injecting
+// it into native RNG kernels unifies both RNG worlds under torch.manual_seed.
+// Cached per device index (the shim object is stable; torch.cuda.manual_seed
+// mutates it in place, so a cached handle stays valid).
 at::Generator GetFlagosDefaultCudaGenerator(int64_t device_index);
 
 // Like CallPythonOp_Generic, but the Python op returns a tuple/list of N tensors
