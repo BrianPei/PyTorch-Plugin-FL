@@ -116,7 +116,7 @@ integration_tests:
       tests/integration/ops/test_sum_dispatch.py
       tests/integration/ops/test_where_dispatch.py
       -m "not flaggems and not flaggems_python and not flaggems_cpp"
-      -v -s --tb=short
+      --maxfail=1 -v -s --tb=long
 
   - name: Run general factory and autograd tests
     command: >-
