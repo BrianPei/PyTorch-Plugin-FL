@@ -186,7 +186,7 @@ fi
 # vendor torch package. They are pure-Python/extension packages used by the
 # CUDA runtime path; the active torch package remains the CPU wheel below.
 VENV_SITE="$("$VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-for package in flag_gems triton triton_kernels flagcx; do
+for package in flag_gems triton triton_kernels flagcx sqlalchemy; do
   if [[ -d "$VENDOR_SITE/$package" ]]; then
     cp -a "$VENDOR_SITE/$package" "$VENV_SITE/"
   fi
