@@ -63,6 +63,11 @@ integration_tests:
         echo "--- $lib"
         nm -D --defined-only "$lib" 2>/dev/null | grep "$SYM" || true
       done
+      for lib in "$ROOT/lib"/libflagos.so* "$ROOT/lib"/libtorch_bindings.so* \
+                 /opt/maca/lib/*.so* /opt/maca/tools/cu-bridge/lib/*.so*; do
+        [[ -f "$lib" ]] || continue
+        nm -D --defined-only "$lib" 2>/dev/null | grep "$SYM" && echo "provider=$lib" || true
+      done
       readelf -d "$ROOT/lib/libtorch_fl.so" | grep 'NEEDED\|RPATH\|RUNPATH' || true
 
   - name: Check isolated MetaX environment

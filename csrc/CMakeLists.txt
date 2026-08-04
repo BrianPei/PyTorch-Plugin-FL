@@ -144,6 +144,7 @@ if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
     if(EXISTS "${_metax_torch_lib}/libtorch_cuda.so")
       list(APPEND _torch_fl_link_libs
         "${_metax_torch_lib}/libtorch_cuda.so")
+      target_link_options(${LIBRARY_NAME} PRIVATE "-Wl,--no-as-needed")
     endif()
   endif()
 endif()
