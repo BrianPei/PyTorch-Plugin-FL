@@ -135,6 +135,19 @@ if(FLAGGEMS_KERNEL)
   endif()
 endif()
 
+if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
+  # The CPU TorchConfig used for the isolated Python environment does not
+  # declare MetaX's forked CUDA runtime. Link it directly so vendor-only ATen
+  # symbols are resolved by ELF instead of being left to process-global lookup.
+  set(_metax_torch_lib "$ENV{FLAGOS_MACA_TORCH_LIB}")
+  if(IS_DIRECTORY "${_metax_torch_lib}")
+    if(EXISTS "${_metax_torch_lib}/libtorch_cuda.so")
+      list(APPEND _torch_fl_link_libs
+        "${_metax_torch_lib}/libtorch_cuda.so")
+    endif()
+  endif()
+endif()
+
 if(ACCELERATOR STREQUAL "ascend")
   target_compile_definitions(${LIBRARY_NAME} PRIVATE USE_ASCEND=1)
   find_library(OPAPI_LIB opapi
