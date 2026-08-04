@@ -8,8 +8,6 @@
 
 #include "generator.h"
 
-#include <cstdint>
-
 // Default, global generators, one per device.
 static std::vector<at::Generator> default_generators;
 
@@ -36,18 +34,3 @@ const at::Generator& GetDefaultGenerator(c10::DeviceIndex device_index) {
 }
 
 } // namespace c10::flagos
-
-#if defined(USE_MACA)
-// MetaX's CUDA headers reference this generator entry point, but the isolated
-// CPU Torch runtime does not provide it. Keep the ABI-compatible symbol in the
-// plugin and route it to FlagOS's per-device generator.
-namespace at::native::flagos {
-
-__attribute__((visibility("default"))) const at::Generator&
-GetFlagosDefaultCudaGenerator(int64_t device_index) {
-  return c10::flagos::GetDefaultGenerator(
-      static_cast<c10::DeviceIndex>(device_index));
-}
-
-} // namespace at::native::flagos
-#endif

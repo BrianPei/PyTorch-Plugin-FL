@@ -40,6 +40,11 @@ if(NOT FLAGGEMS_KERNEL AND NOT FLAGGEMS_PYTHON)
   # (only python_op_caller.{h,cc} lives here now). The generated
   # flaggems_python_kernels.cc stays but is a no-op without FLAGOS_FLAGGEMS_PYTHON.
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/flagos/.*")
+  if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
+    # The MetaX vendor runtime calls this provider even when FlagGems is off.
+    list(APPEND SOURCE_FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/aten/backends/flagos/python_op_caller.cc")
+  endif()
 endif()
 # FLAGGEMS_PYTHON path: keep csrc/aten/backends/flagos/python_op_caller.cc and
 # build csrc/aten/generated/flaggems_python_kernels.cc with FLAGOS_FLAGGEMS_PYTHON

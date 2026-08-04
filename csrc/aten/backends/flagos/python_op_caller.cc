@@ -492,6 +492,30 @@ std::vector<at::Tensor> CallPythonOp_GenericKwTuple(
   return out;
 }
 
+at::Generator GetFlagosDefaultCudaGenerator(int64_t device_index) {
+  static std::mutex cache_mu;
+  static std::unordered_map<int64_t, at::Generator> gen_cache;
+  {
+    std::lock_guard<std::mutex> lock(cache_mu);
+    auto it = gen_cache.find(device_index);
+    if (it != gen_cache.end()) {
+      return it->second;
+    }
+  }
+
+  py::gil_scoped_acquire gil;
+  py::module_ torch_cuda = py::module_::import("torch.cuda");
+  py::object generators = torch_cuda.attr("default_generators");
+  at::Generator generator =
+      generators[py::cast(device_index)].cast<at::Generator>();
+
+  {
+    std::lock_guard<std::mutex> lock(cache_mu);
+    gen_cache[device_index] = generator;
+  }
+  return generator;
+}
+
 std::vector<at::Tensor> CallPythonOp_GenericTuple(
     const char* func_name, const std::vector<c10::IValue>& args, int64_t n) {
   auto& cache = GetCache();

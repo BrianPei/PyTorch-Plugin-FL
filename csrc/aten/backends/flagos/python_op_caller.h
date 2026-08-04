@@ -137,6 +137,11 @@ at::Tensor CallPythonOp_LikeFactory(const char* func_name,
 at::Tensor CallPythonOp_RandomInplace(const char* func_name,
                                       const std::vector<c10::IValue>& args);
 
+// Fetch the vendor CUDA generator used by native CUDA-boxed RNG kernels.
+// This symbol is also consumed by the MetaX libtorch runtime when the
+// isolated CPU Python wheel is paired with the vendor native libraries.
+at::Generator GetFlagosDefaultCudaGenerator(int64_t device_index);
+
 // Like CallPythonOp_Generic, but the Python op returns a tuple/list of N tensors
 // (e.g. sort -> (values, indices), var_mean -> (var, mean)). Returns the N
 // tensors in order. Used by the codegen tuple_return kernels.
