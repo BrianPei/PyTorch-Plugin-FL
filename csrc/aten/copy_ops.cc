@@ -13,6 +13,10 @@
 #include <ATen/ops/copy_native.h>
 #include <include/flagos.h>
 #include "device_boxing.h"
+// Included unconditionally: the #else branches below cover TsingMicro, GCU and
+// MUSA-without-mudnn as well as Ascend, and this header supplies inline no-op
+// fallbacks for those platforms.
+#include "backends/ascend/ascend_copy.h"
 
 #if defined(FLAGOS_MUSA_KERNEL)
 #include "backends/musa/mudnn_common.h"
@@ -84,49 +88,53 @@ at::Tensor _copy_from(
       DeviceBoxingGuard guard(self, dst);
       at::native::copy_(const_cast<at::Tensor&>(dst), self, false);
 #else
-      // Ascend: no CUDA runtime, fall back to CPU round-trip.
-      at::Tensor self_contig = self.is_contiguous()
-          ? self
-          : at::native::flagos::contiguous(self, c10::MemoryFormat::Contiguous);
-      size_t nbytes = self_contig.numel() * self_contig.element_size();
-      at::Tensor cpu_src =
-          at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
-      if (nbytes > 0) {
-        Memcpy(
-            cpu_src.data_ptr(),
-            self_contig.data_ptr(),
-            nbytes,
-            MemcpyDeviceToHost);
-      }
-      size_t dst_storage_nbytes = dst.storage().nbytes();
-      at::Tensor cpu_dst_storage = at::empty(
-          {static_cast<int64_t>(dst_storage_nbytes)},
-          dst.options().device(at::kCPU).dtype(at::kByte));
-      int64_t dst_storage_offset_bytes =
-          dst.storage_offset() * static_cast<int64_t>(dst.element_size());
-      char* dst_storage_base =
-          static_cast<char*>(dst.data_ptr()) - dst_storage_offset_bytes;
-      if (dst_storage_nbytes > 0) {
-        Memcpy(
-            cpu_dst_storage.data_ptr(),
-            dst_storage_base,
-            dst_storage_nbytes,
-            MemcpyDeviceToHost);
-      }
+      // Ascend: copy on-device via aclnnInplaceCopy, which honors both src and
+      // dst strides/offset and casts dtype. Avoids the CPU round-trip below.
+      if (!ascend::StridedCopy(dst, self)) {
+        // Fallback: CPU round-trip (device->host, strided copy on CPU, host->device).
+        at::Tensor self_contig = self.is_contiguous()
+            ? self
+            : at::native::flagos::contiguous(self, c10::MemoryFormat::Contiguous);
+        size_t nbytes = self_contig.numel() * self_contig.element_size();
+        at::Tensor cpu_src =
+            at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
+        if (nbytes > 0) {
+          Memcpy(
+              cpu_src.data_ptr(),
+              self_contig.data_ptr(),
+              nbytes,
+              MemcpyDeviceToHost);
+        }
+        size_t dst_storage_nbytes = dst.storage().nbytes();
+        at::Tensor cpu_dst_storage = at::empty(
+            {static_cast<int64_t>(dst_storage_nbytes)},
+            dst.options().device(at::kCPU).dtype(at::kByte));
+        int64_t dst_storage_offset_bytes =
+            dst.storage_offset() * static_cast<int64_t>(dst.element_size());
+        char* dst_storage_base =
+            static_cast<char*>(dst.data_ptr()) - dst_storage_offset_bytes;
+        if (dst_storage_nbytes > 0) {
+          Memcpy(
+              cpu_dst_storage.data_ptr(),
+              dst_storage_base,
+              dst_storage_nbytes,
+              MemcpyDeviceToHost);
+        }
 
-      at::Tensor cpu_dst = at::empty({0}, dst.options().device(at::kCPU));
-      cpu_dst.set_(
-          cpu_dst_storage.storage(),
-          dst.storage_offset(),
-          dst.sizes(),
-          dst.strides());
-      at::native::copy_(cpu_dst, cpu_src, false);
-      if (dst_storage_nbytes > 0) {
-        Memcpy(
-            dst_storage_base,
-            cpu_dst_storage.data_ptr(),
-            dst_storage_nbytes,
-            MemcpyHostToDevice);
+        at::Tensor cpu_dst = at::empty({0}, dst.options().device(at::kCPU));
+        cpu_dst.set_(
+            cpu_dst_storage.storage(),
+            dst.storage_offset(),
+            dst.sizes(),
+            dst.strides());
+        at::native::copy_(cpu_dst, cpu_src, false);
+        if (dst_storage_nbytes > 0) {
+          Memcpy(
+              dst_storage_base,
+              cpu_dst_storage.data_ptr(),
+              dst_storage_nbytes,
+              MemcpyHostToDevice);
+        }
       }
 #endif
     }
@@ -308,28 +316,38 @@ at::Tensor _to_copy(
       musa_ops::MudnnCopy(self_contig, result);
 #elif defined(USE_ASCEND) || defined(USE_TSINGMICRO) || defined(USE_GCU) || \
     defined(USE_MUSA)
-      // Ascend / TsingMicro: no CUDA runtime, fall back to CPU round-trip for dtype cast.
-      size_t nbytes = self_contig.numel() * self_contig.element_size();
-      at::Tensor cpu_tensor =
-          at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
-      if (nbytes > 0) {
-        Memcpy(
-            cpu_tensor.data_ptr(),
-            self_contig.data_ptr(),
-            nbytes,
-            MemcpyDeviceToHost);
-      }
-      cpu_tensor = cpu_tensor.to(dtype);
-      result = at::empty(
-          cpu_tensor.sizes(),
-          cpu_tensor.options().device(c10::Device(c10::kPrivateUse1, device_index)));
-      size_t result_nbytes = cpu_tensor.numel() * cpu_tensor.element_size();
-      if (result_nbytes > 0) {
-        Memcpy(
-            result.data_ptr(),
-            cpu_tensor.data_ptr(),
-            result_nbytes,
-            MemcpyHostToDevice);
+      // No CUDA runtime on these backends, so the CUDA TensorIterator cast
+      // below is unavailable.
+#ifdef USE_ASCEND
+      // Ascend casts on-device via aclnnCast, avoiding the D2H->CPU->H2D
+      // round-trip that dominated HF RMSNorm (two fp16<->fp32 casts per layer).
+      result = ascend::DtypeCast(self_contig, dtype);
+#endif
+      if (!result.defined()) {
+        // Fallback: CPU round-trip when no on-device cast is available
+        // (TsingMicro / GCU / MUSA, or an Ascend dtype pair aclnnCast rejects).
+        size_t nbytes = self_contig.numel() * self_contig.element_size();
+        at::Tensor cpu_tensor =
+            at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
+        if (nbytes > 0) {
+          Memcpy(
+              cpu_tensor.data_ptr(),
+              self_contig.data_ptr(),
+              nbytes,
+              MemcpyDeviceToHost);
+        }
+        cpu_tensor = cpu_tensor.to(dtype);
+        result = at::empty(
+            cpu_tensor.sizes(),
+            cpu_tensor.options().device(c10::Device(c10::kPrivateUse1, device_index)));
+        size_t result_nbytes = cpu_tensor.numel() * cpu_tensor.element_size();
+        if (result_nbytes > 0) {
+          Memcpy(
+              result.data_ptr(),
+              cpu_tensor.data_ptr(),
+              result_nbytes,
+              MemcpyHostToDevice);
+        }
       }
 #else
       // CUDA platform: use DeviceBoxingGuard + CUDA TensorIterator copy kernel

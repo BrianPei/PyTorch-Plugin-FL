@@ -16,12 +16,29 @@
 #include "generated/ops.h"
 
 #include <ATen/core/LegacyTypeDispatch.h>
+#include <ATen/core/grad_mode.h>
+#include <ATen/ops/matmul_native.h>
 #include <ATen/SDPBackend.h>
 #include <torch/library.h>
 #include <c10/core/ScalarType.h>
 #include <c10/util/Optional.h>
 #include "common.h"
 #include "runtime/allocator/caching_device_allocator.h"
+#include <c10/core/impl/LocalDispatchKeySet.h>
+
+// Forward declarations for the Ascend matmul kernels (csrc/aten/backends/ascend/matmul.cc).
+// That file is only compiled when USE_ASCEND is on, so BOTH declarations must be
+// guarded the same way: a .so links fine with an undefined symbol and only fails
+// at dlopen, so an unguarded reference here builds a CUDA wheel that dies on
+// `import torch_fl` with "undefined symbol: ...MatmulKernelAscend...".
+#if defined(USE_ASCEND)
+namespace at::native::flagos {
+  at::Tensor MatmulKernelAscend(const at::Tensor& self, const at::Tensor& other);
+  std::tuple<at::Tensor, at::Tensor> MatmulBackwardKernelAscend(
+      const at::Tensor& grad, const at::Tensor& self, const at::Tensor& other,
+      ::std::array<bool, 2> mask);
+}
+#endif
 
 namespace at::flagos {
 
@@ -216,6 +233,54 @@ int64_t WrapperFusedSdpChoice(
 #include "generated/register.inc"
 #undef FLAGOS_GEN_WRAPPERS
 
+// matmul: intercept aten::matmul at PrivateUse1 for the Ascend backend so it
+// matmul: intercept aten::matmul at PrivateUse1 for the Ascend backend so it
+// routes to aclnnMatmul directly instead of decomposing via
+// CompositeImplicitAutograd into mm + bmm + view. Non-Ascend backends (MetaX
+// etc.) call at::native::matmul directly so PyTorch's composite decomposition
+// runs and mm/bmm reach the appropriate backend kernels.
+static at::Tensor WrapperMatmul(
+    const at::Tensor& self, const at::Tensor& other) {
+#if defined(USE_ASCEND)
+  // aten::matmul is CompositeImplicitAutograd: normally it decomposes into
+  // mm/bmm/view, and autograd records the backward through those sub-ops. Taking
+  // the fused aclnnMatmul kernel stops that decomposition, so autograd binds the
+  // op's real derivative, aten::matmul_backward -- which is registered for
+  // PrivateUse1 below (WrapperMatmulBackward). The generated
+  // AutogradPrivateUse1 kernel (csrc/aten/generated/variable_type.cc) builds the
+  // MatmulBackward0 node and redispatches here, so the fused path is used for
+  // training as well as inference.
+  //
+  // The runtime GetBackendForOp check still matters on an Ascend build: the conf
+  // can route matmul elsewhere. But it must sit INSIDE the #if -- a runtime
+  // branch does not remove the link-time reference, and MatmulKernelAscend is
+  // only compiled when USE_ASCEND is on.
+  if (at::native::flagos::GetBackendForOp("matmul") ==
+      at::native::flagos::Backend::kAscend) {
+    return at::native::flagos::MatmulKernelAscend(self, other);
+  }
+#endif
+  // Fall through to the composite decomposition (mm/bmm/view) by calling the
+  // CompositeImplicitAutograd implementation directly. This avoids re-entering
+  // WrapperMatmul (no recursion) while letting the decomposed sub-ops dispatch
+  // normally to their PrivateUse1 kernels, which have working autograd. Used by
+  // non-Ascend backends, which have no fused matmul kernel.
+  return at::native::matmul(self, other);
+}
+
+// matmul_backward: the derivative aten::matmul binds to once a backend owns the
+// forward op (see WrapperMatmul). Only Ascend has a fused kernel; other backends
+// never reach here, since without a concrete matmul kernel autograd keeps
+// recording the mm/bmm decomposition instead.
+#if defined(USE_ASCEND)
+static std::tuple<at::Tensor, at::Tensor> WrapperMatmulBackward(
+    const at::Tensor& grad, const at::Tensor& self, const at::Tensor& other,
+    ::std::array<bool, 2> mask) {
+  return at::native::flagos::MatmulBackwardKernelAscend(
+      grad, self, other, mask);
+}
+#endif
+
 } // namespace
 
 // Register basic operators for PrivateUse1 dispatch key
@@ -243,6 +308,16 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("_index_put_impl_", WrapperIndexPutImpl_);
   m.impl("record_stream", WrapperRecordStream);
   m.impl("_fused_sdp_choice", WrapperFusedSdpChoice);
+  // matmul: on Ascend, claim the fused aclnnMatmul kernel here on plain
+  // PrivateUse1. The generated AutogradPrivateUse1 kernel
+  // (csrc/aten/generated/variable_type.cc) intercepts above this, builds the
+  // MatmulBackward0 node and redispatches down to us, so training and inference
+  // both take the fused path. Its derivative, matmul_backward, is a normal
+  // backend op and is registered right below.
+#if defined(USE_ASCEND)
+  m.impl("matmul", WrapperMatmul);
+  m.impl("matmul_backward", WrapperMatmulBackward);
+#endif
 
   // ============================================================
   // Generated m.impl registrations for the generated operators
@@ -309,6 +384,16 @@ TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
     // and autograd records CloneBackward0 for gradient propagation.
     return self.clone(memory_format);
   });
+
+  // matmul: on Ascend the fused aclnnMatmul kernel is claimed on plain
+  // PrivateUse1 (above), and the generated AutogradPrivateUse1 kernel
+  // (csrc/aten/generated/variable_type.cc) sits in front of it to build the
+  // autograd graph. Other backends have no fused kernel, so they keep PyTorch's
+  // composite decomposition; intercepting here lets them reach it without the
+  // autograd key binding aten::matmul_backward, which they cannot implement.
+#if !defined(USE_ASCEND)
+  m.impl("matmul", WrapperMatmul);
+#endif
 }
 
 } // namespace at::flagos

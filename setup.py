@@ -705,13 +705,17 @@ def _vendor_supplies_triton() -> bool:
     NVIDIA-targeted wheel must not be pulled in as a dependency.
 
     - ACCELERATOR=dcu: DTK ships its own Triton (and builds pure-boxing).
+    - ACCELERATOR=ascend: `triton` is provided by triton-ascend, installed out
+      of band (it has no PyPI release satisfying `triton>=3.5.1`). Declaring the
+      dep makes pip install stock triton over triton-ascend, after which any
+      Triton entry point dies with "0 active drivers".
     - PPU (PPU_SDK present): the vendor Triton lives on a private index and is
       versioned 3.x+<sdk> (e.g. 3.5.0+v0.2.0.ppu2.1.0), which does not satisfy
       a `triton>=3.5.1` pin; its sdist is also a download shim that pip cannot
       always build. Install it manually, then `pip install --no-deps` this
       package. See "Build from Source (PPU Platform)" in the README.
     """
-    if ACCELERATOR == "dcu":
+    if ACCELERATOR in ("dcu", "ascend"):
         return True
     return bool(os.environ.get("PPU_SDK") or os.environ.get("PPU_HOME"))
 
