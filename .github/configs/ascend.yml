@@ -16,13 +16,17 @@ display_name: Ascend
 
 setup_script: .github/scripts/set_env_ascend.sh
 
-# TODO(ascend): pin the canonical CI image once the CANN 9.0.0 aarch64 image is
-# published to the harbor registry. Until then the build runs on a hand-staged
-# CANN image; update this line (and runner_labels) when the image is finalized.
-ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:ascend-9.0.0-aarch64
+# The CI image is the canonical CANN 9.0.0 aarch64 base (the same one used for
+# hand-staged acceptance), retagged into the BAAI harbor flagos-dev project.
+# set_env_ascend.sh is self-contained: it installs standard CPU torch + build
+# deps into a fresh venv, so the image only needs python3.12 + CANN + a compiler
+# -- no vendor torch is baked in (torch_npu is explicitly forbidden).
+ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260807-ascend-dev
 
+# Self-hosted Huawei (Ascend) runner registered by the teacher. The job is
+# dispatched only to a runner carrying this label.
 runner_labels:
-  - ascend-8g-cicd-pytorch
+  - hw-8g-cicd-pytorch
 
 container_volumes: []
 
