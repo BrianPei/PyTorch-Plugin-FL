@@ -90,12 +90,36 @@ export FLAGGEMS_PYTHON=0
 unset CUDA_HOME 2>/dev/null || true
 unset CUDA_PATH 2>/dev/null || true
 
+# --- Ascend driver (HAL) -----------------------------------------------------
+# libascend_hal.so (the hardware abstraction layer) lives in the DRIVER layer,
+# which is host-side and bind-mounted into the container (see ascend.yml
+# container_options). The toolkit lib64 does NOT ship it, so without these
+# paths the built .so imports with "libascend_hal.so: cannot open shared object
+# file". Add every driver lib dir that actually exists.
+ASCEND_DRIVER_HOME="${ASCEND_DRIVER_HOME:-/usr/local/Ascend/driver}"
+DRIVER_LIBS=""
+if [[ -d "$ASCEND_DRIVER_HOME" ]]; then
+  for _d in \
+    "$ASCEND_DRIVER_HOME/lib64" \
+    "$ASCEND_DRIVER_HOME/lib64/driver" \
+    "$ASCEND_DRIVER_HOME/lib64/extra" \
+    "$ASCEND_DRIVER_HOME/lib64/common" \
+    "$ASCEND_DRIVER_HOME/lib64/fwcek"; do
+    [[ -d "$_d" ]] && DRIVER_LIBS="$DRIVER_LIBS:$_d"
+  done
+  DRIVER_LIBS="${DRIVER_LIBS#:}"
+  echo "ASCEND_DRIVER_HOME=$ASCEND_DRIVER_HOME"
+else
+  echo "::warning::Ascend driver dir not found at $ASCEND_DRIVER_HOME; libascend_hal.so may be missing at runtime"
+fi
+
 # ACLNN headers for the build (aclnnop/*.h, acl/*.h).
 export CPATH="$ASCEND_HOME/include${CPATH:+:$CPATH}"
 # Link-time and runtime library path. lib64 holds libascendcl/libopapi/libnnopbase;
-# acllib/lib64 is the legacy fallback on some CANN images.
-export LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# acllib/lib64 is the legacy fallback on some CANN images; DRIVER_LIBS adds the
+# HAL/runtime libs (libascend_hal.so) from the driver layer.
+export LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${DRIVER_LIBS:+:$DRIVER_LIBS}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${DRIVER_LIBS:+:$DRIVER_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # --- Build Python / CPU torch ------------------------------------------------
 # The CANN image's system Python is used only to bootstrap a venv; it does NOT

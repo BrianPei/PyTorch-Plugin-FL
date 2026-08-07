@@ -41,6 +41,7 @@ container_options: >-
   --device=/dev/davinci_manager
   --device=/dev/devmm_svm
   --device=/dev/hisi_hdc
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-ascend
