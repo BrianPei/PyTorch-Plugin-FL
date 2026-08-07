@@ -115,6 +115,10 @@ integration_tests:
   # When a previously-unregistered overload is implemented on Ascend, remove its
   # --deselect line here; do not leave it excluded.
   # ------------------------------------------------------------------------
+  # The TestRngMultiDevice nodes deselected below are the multi-device variants
+  # of the same A/B gaps above: test_each_device_has_its_own_generator is
+  # category A (CUDA generator contract), and test_reproducible_on_second_device
+  # [normal_/randperm] are category B (unregistered overloads).
   - name: Run operator tests (vendor backend, main ops)
     command: >-
       python -m pytest tests/integration/ops/
@@ -200,12 +204,6 @@ integration_tests:
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngDistribution::test_poisson_mean_equals_variance"
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngDistribution::test_bernoulli_probability"
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngDropout::test_dropout_masks_are_valid"
-      # TestRngMultiDevice variants of the same A/B scope gaps above:
-      #   - test_each_device_has_its_own_generator is category A (the CUDA
-      #     generator contract: Ascend has no ATen_cuda, so
-      #     torch.cuda.default_generators is empty).
-      #   - test_reproducible_on_second_device[normal_/randperm] drive the
-      #     unregistered normal_/randperm overloads (category B).
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngMultiDevice::test_each_device_has_its_own_generator"
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngMultiDevice::test_reproducible_on_second_device[normal_]"
       --deselect "tests/integration/ops/test_rng_dispatch.py::TestRngMultiDevice::test_reproducible_on_second_device[randperm]"
