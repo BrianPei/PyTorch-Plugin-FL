@@ -32,15 +32,31 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # --- CANN toolkit root -------------------------------------------------------
-# Both layouts seen in the field:
-#   /usr/local/Ascend/ascend-toolkit/latest   (symlink into the platform dir)
-#   /usr/local/Ascend/cann-<ver>/<arch>-linux
-# ASCEND_HOME must expose $ASCEND_HOME/include/aclnnop and $ASCEND_HOME/lib64.
-ASCEND_HOME="${ASCEND_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
-if [[ ! -d "$ASCEND_HOME/lib64" || ! -d "$ASCEND_HOME/include" ]]; then
-  echo "::error::CANN toolkit not found at $ASCEND_HOME (need lib64/ and include/)"
+# CANN images ship several layouts; pick the first candidate that actually has
+# both lib64/ and include/. A preset ASCEND_HOME wins, otherwise try the common
+# roots. ASCEND_HOME must expose $ASCEND_HOME/include and $ASCEND_HOME/lib64.
+_ascend_candidates=(
+  "${ASCEND_HOME:-}"
+  /usr/local/Ascend/ascend-toolkit/latest
+  /usr/local/ascend/ascend-toolkit/latest
+  /usr/local/Ascend/cann-9.0.0/aarch64-linux
+  /usr/local/Ascend/cann-9.0.0
+  /usr/local/Ascend/latest
+)
+ASCEND_HOME=""
+for _cand in "${_ascend_candidates[@]}"; do
+  [[ -z "$_cand" ]] && continue
+  if [[ -d "$_cand/lib64" && -d "$_cand/include" ]]; then
+    ASCEND_HOME="$_cand"
+    break
+  fi
+done
+if [[ -z "$ASCEND_HOME" ]]; then
+  echo "::error::CANN toolkit not found; none of the candidates had lib64/ + include/."
+  echo "::error::Tried: ${_ascend_candidates[*]}. Set ASCEND_HOME to the CANN root."
   exit 1
 fi
+echo "ASCEND_HOME=$ASCEND_HOME"
 
 # Runtime ACLNN libraries actually linked by libtorch_fl.so. Their presence is
 # the minimum proof that the image can drive an Ascend kernel.
@@ -82,17 +98,22 @@ export LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${LIBRARY_PATH:
 export LD_LIBRARY_PATH="$ASCEND_HOME/lib64:$ASCEND_HOME/acllib/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # --- Build Python / CPU torch ------------------------------------------------
-# The vendor Python in the CANN image already has a CPU torch (2.10.0+cpu). We
-# reuse it directly: ascend needs no accelerator-linked torch, only the CPU
-# dispatcher plus the ACLNN runtime libraries above. A fresh venv isolates the
-# install from whatever else the image carries.
-VENDOR_PYTHON="${TORCH_FL_VENDOR_PYTHON:-$(command -v python)}"
+# The CANN image's system Python is used only to bootstrap a venv; it does NOT
+# need torch pre-installed. CPU torch (2.10.0+cpu) is installed into the venv
+# below: ascend needs no accelerator-linked torch, only the CPU dispatcher plus
+# the ACLNN runtime libraries exported above. (The cuda script requires the
+# build python to import a vendor torch; that contract does not apply here.)
+VENDOR_PYTHON="${TORCH_FL_VENDOR_PYTHON:-}"
 if [[ -z "$VENDOR_PYTHON" || ! -x "$VENDOR_PYTHON" ]]; then
-  echo "::error::Unable to find the build Python interpreter"
-  exit 1
+  for _pyc in python python3 python3.12 python3.11; do
+    if command -v "$_pyc" >/dev/null 2>&1; then
+      VENDOR_PYTHON="$(command -v "$_pyc")"
+      break
+    fi
+  done
 fi
-if ! "$VENDOR_PYTHON" -c "import torch" >/dev/null 2>&1; then
-  echo "::error::Build Python cannot import torch: $VENDOR_PYTHON" >&2
+if [[ -z "$VENDOR_PYTHON" || ! -x "$VENDOR_PYTHON" ]]; then
+  echo "::error::Unable to find a Python interpreter to bootstrap the venv"
   exit 1
 fi
 
@@ -114,7 +135,11 @@ fi
 "$VENV_PYTHON" -m pip install --index-url "${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}" \
   "torch==${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 if [[ "$CI_STAGE" == "integration" ]]; then
-  "$VENV_PYTHON" -m pip install pytest transformers
+  # pytest is also installed by the common workflow; mirrored here so the
+  # venv is self-contained for local runs. transformers is NOT installed:
+  # the first-version ascend acceptance has no model-mounted test (Qwen3 is
+  # deferred), so pulling it would only widen the CI failure surface.
+  "$VENV_PYTHON" -m pip install pytest
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
