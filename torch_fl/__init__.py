@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import sys
 
 
@@ -165,27 +166,83 @@ if os.environ.get("FLAGOS_METAX_CUDART_SHIM", "0") == "1":
 
     ensure_cudart_shim()
 
-# When reusing PyTorch's CUDA boxing kernels on MetaX with a stock +cpu torch
-# wheel, the active wheel's torch/lib must point at the MetaX C++ runtime .so.
-# This MUST run before `import torch` (afterwards libc10 is already mapped and
-# relinking is too late).  Gated on FLAGOS_METAX_BOXING=1; idempotent; no-op when
-# torch already IS the MetaX wheel.
-if os.environ.get("FLAGOS_METAX_BOXING", "0") == "1":
-    from torch_fl.accelerator.metax._metax_libtorch_link import (
-        ensure_maca_libtorch_links,
-    )
 
-    ensure_maca_libtorch_links()
+def _relink_vendor_libtorch() -> None:
+    """Point the active torch wheel's torch/lib at this wheel's bundled libtorch.
+
+    MetaX, DCU and PPU all run on a *forked* libtorch whose core .so
+    (libc10/libtorch_cpu/libtorch_python/...) differ from the upstream ones a
+    stock ``torch==X.Y.Z+cpu`` wheel ships.  A self-contained wheel bundles them
+    under torch_fl/lib_{maca,dcu,ppu}/ and symlinks them over the stock files;
+    see torch_fl.accelerator._vendor_libtorch for why a ctypes preload alone is
+    not enough there.
+
+    This MUST run before `import torch` -- afterwards libc10 is already mapped
+    and relinking is too late.  Every backend's entry point is idempotent and a
+    no-op when its bundle dir is absent (a plain in-place build, where torch
+    already IS the vendor wheel), so this is safe to call unconditionally.
+
+    MetaX: FLAGOS_METAX_BOXING=1 triggers relink unconditionally (for in-place
+    MetaX builds that want to test boxing).  When accel=="metax" and the bundle
+    dir exists, relink regardless of the env var (self-contained wheel).  DCU
+    and PPU have no native-kernel mode, so bundle-dir presence alone decides.
+    The CUDA backend is not here: the official +cpu wheel's core .so ARE the
+    upstream ones, so only the extra CUDA libs are missing and
+    _preload_cuda_assets() below handles those with ctypes.
+    """
+    accel = _build_accelerator()
+
+    if os.environ.get("FLAGOS_METAX_BOXING", "0") == "1":
+        from torch_fl.accelerator.metax._metax_libtorch_link import (
+            ensure_maca_libtorch_links,
+        )
+
+        ensure_maca_libtorch_links()
+        return
+
+    if accel == "metax":
+        from torch_fl.accelerator._vendor_libtorch import bundled_lib_dir
+
+        if bundled_lib_dir("lib_maca", "libtorch_cuda.so"):
+            from torch_fl.accelerator.metax._metax_libtorch_link import (
+                ensure_maca_libtorch_links,
+            )
+
+            ensure_maca_libtorch_links()
+            return
+
+    if accel == "dcu":
+        from torch_fl.accelerator.dcu._dcu_libtorch_link import (
+            ensure_dcu_libtorch_links,
+        )
+
+        ensure_dcu_libtorch_links()
+        return
+
+    # PPU builds as ACCELERATOR=cuda (it targets PPU_SDK/CUDA_SDK), so the only
+    # distinguishing signal at import time is its own bundle dir.
+    if accel in ("cuda", ""):
+        from torch_fl.accelerator._vendor_libtorch import bundled_lib_dir
+
+        if bundled_lib_dir("lib_ppu", "libtorch_cuda.so"):
+            from torch_fl.accelerator.ppu._ppu_libtorch_link import (
+                ensure_ppu_libtorch_links,
+            )
+
+            ensure_ppu_libtorch_links()
+
+
+_relink_vendor_libtorch()
 
 
 def _preload_cuda_assets() -> None:
     """Load the bundled CUDA .so into this process BEFORE `import torch`.
 
-    Hard constraint (docs/cpu_torch_external_libtorch_cuda.md §约束1): PyTorch
-    caches its CUDAHooks on first `import torch`. If libtorch_cuda.so is loaded
-    afterwards, device init fails with "Cannot initialize CUDA without ATen_cuda
-    library" even though the kernels register. So we ctypes-dlopen it here, at
-    the very top of torch_fl, before torch is imported.
+    Hard constraint (docs/cpu_torch_external_libtorch_cuda.md, constraint 1):
+    PyTorch caches its CUDAHooks on first `import torch`. If libtorch_cuda.so is
+    loaded afterwards, device init fails with "Cannot initialize CUDA without
+    ATen_cuda library" even though the kernels register. So we ctypes-dlopen it
+    here, at the very top of torch_fl, before torch is imported.
 
     libtorch_cuda.so has unresolved deps on the NVIDIA runtime libs (libcudart,
     libcublas, libcudnn, libnvshmem_host, ...) shipped by the pip nvidia-*-cu12
@@ -322,7 +379,6 @@ _disable_vendor_backend_autoload()
 
 import torch  # noqa: E402
 
-
 if sys.platform == "win32":
     from ._utils import _load_dll_libraries
 
@@ -370,7 +426,6 @@ import torch_fl._C  # type: ignore[misc]  # noqa: E402, F401
 
 
 from . import flagos  # noqa: E402
-
 
 torch.utils.rename_privateuse1_backend("flagos")
 torch._register_device_module("flagos", flagos)
@@ -458,6 +513,43 @@ def _patch_flaggems_philox():
         pass
 
 
+def _restore_dcu_hip_version() -> None:
+    """Set torch.version.hip/rocm for a self-contained DCU wheel.
+
+    See the DCU branch of _patch_flaggems_codegen_config() for why this matters:
+    the bundled libtorch is DTK's HIP build, but torch/version.py comes from the
+    stock torch+cpu wheel in front and reports hip=None, which switches triton's
+    hcu backend off. scripts/bundle_dcu_libtorch.sh copies the vendor torch's own
+    version.py next to the bundled .so as vendor_version.py; read the strings
+    back from there. No-op when a real vendor torch is in front.
+    """
+    import torch
+
+    if getattr(torch.version, "hip", None):
+        return  # a real DTK torch is in front; leave its values alone.
+
+    hip_ver = os.environ.get("FLAGOS_DCU_HIP_VERSION", "").strip()
+    rocm_ver = ""
+    if not hip_ver:
+        ver_py = os.path.join(os.path.dirname(__file__), "lib_dcu", "vendor_version.py")
+        try:
+            with open(ver_py, encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"\s*hip\s*(?::[^=]*)?=\s*'([^']+)'", line)
+                    if m:
+                        hip_ver = m.group(1)
+                        continue
+                    m = re.match(r"\s*rocm\s*(?::[^=]*)?=\s*'([^']+)'", line)
+                    if m:
+                        rocm_ver = m.group(1)
+        except OSError:
+            return  # not a bundled build (source checkout); nothing to restore.
+    if hip_ver:
+        torch.version.hip = hip_ver
+        if rocm_ver:
+            torch.version.rocm = rocm_ver
+
+
 def _patch_flaggems_codegen_config():
     """
     Configure FlagGems' vendor + torch.cuda shim for the flagos device.
@@ -522,6 +614,33 @@ def _patch_flaggems_codegen_config():
     # fallback. setdefault so an explicit GEMS_VENDOR still wins.
     if _build_accelerator() == "dcu" and os.environ.get("GEMS_VENDOR") != "ascend":
         os.environ.setdefault("GEMS_VENDOR", "hygon")
+        # torch.version is pure Python (torch/version.py), generated when the
+        # wheel is built -- swapping the bundled DTK .so files cannot change it.
+        # A self-contained DCU wheel therefore front-ends a stock torch+cpu whose
+        # torch.version.hip is None, while the DTK torch it replaces reports
+        # e.g. "6.3.26113". triton's hcu backend gates on exactly that value
+        # (backends/hcu/driver.py is_active(): torch.cuda.is_available() and
+        # torch.version.hip is not None), so with None the driver never activates
+        # and any flag_gems op dies in triton's driver factory with
+        # "0 active drivers ([]). There should only be one." Restore the attribute
+        # from the bundled libtorch's own version so triton sees a HIP torch,
+        # matching what the vendor wheel reported.
+        _restore_dcu_hip_version()
+        return
+
+    # --- Enflame GCU branch ---
+    # Keyed on the build accelerator for the same reason as DCU: no runtime probe
+    # distinguishes GCU here, and the tops stack has no libcuda.so, so without
+    # this branch GCU would reach the ascend fallback and get GEMS_VENDOR=ascend
+    # (which also picks the wrong comm profile). FlagGems' Triton kernels need
+    # Enflame's triton_gcu plugin plus its /opt/triton_gcu compiler toolchain; if
+    # either is missing, patch_triton_gcu_for_flagos() returns False and we leave
+    # GEMS_VENDOR unset so the topsaten kernels and cpu_fallback stay in charge.
+    if _build_accelerator() == "gcu" and os.environ.get("GEMS_VENDOR") != "ascend":
+        from torch_fl.accelerator.gcu._gcu_compat import patch_triton_gcu_for_flagos
+
+        if patch_triton_gcu_for_flagos():
+            os.environ.setdefault("GEMS_VENDOR", "enflame")
         return
 
     # --- Generic NVIDIA CUDA branch (default) ---
@@ -625,8 +744,14 @@ def _patch_cuda_device_context():
 _patch_cuda_device_context()
 
 # Initialize CUDA runtime only when FlagGems Python path needs it (CUDA backend ops).
+# The check must be against the *build* backend, not torch.cuda.is_available():
+# a DCU/PPU self-contained wheel relinks a hipified/cuda libtorch into a stock
+# +cpu torch, which makes is_available() return True even though the CUDA runtime
+# libs are absent, and torch.cuda.init() would fail with "libcaffe2_nvrtc.so: not
+# found". Only actual CUDA-backend builds need this init.
 if (
     os.environ.get("FLAGOS_DISABLE_FLAGGEMS_PY", "0") != "1"
+    and _build_accelerator() in ("cuda", "")
     and torch.cuda.is_available()
 ):
     torch.cuda.init()
@@ -656,13 +781,47 @@ _EXCLUDED_OPS = {
     "randperm",
     "empty.memory_format",  # Already registered in C++
     "empty_strided",  # Already registered in C++
-    # Random ops that use device context
+    # FlagGems registers the *bare* aten name "empty" as well, implemented by a
+    # function also called "empty" -- so "empty.memory_format" above does not
+    # filter it (the registrar matches on the function name). Left registered, it
+    # is the one factory op FlagGems takes over, and it ignores the requested
+    # device: an `empty(..., device="flagos:1")` while flagos:0 is current
+    # allocates on 0, and the first write through that pointer faults the driver
+    # ("IoctlCmdWriteRead errno[14]. The device is out of service", then a SIP
+    # exception that aborts the process). The C++ empty is already correct here.
+    "empty",
+    # Random ops that use device context.
+    #
+    # These also cover FlagGems' philox path, which reads the generator state as
+    # exactly two int64s (the CUDA layout: seed + offset). torch_fl's flagos
+    # generators are CPU Mersenne-Twister generators whose state unpacks to 632
+    # int64s, so philox_backend_seed_offset raises "too many values to unpack".
+    # Every name FlagGems registers for an RNG op has to appear here or the op
+    # reaches that unpacking; the factory/RNG ops are correct on the topsaten and
+    # CPU paths anyway, so nothing is lost by keeping them off FlagGems.
     "uniform_",
+    "normal_",
     "normal.float_Tensor",
     "normal.Tensor_float",
     "normal.Tensor_tensor",
+    "normal.Tensor_Tensor",
+    "log_normal_",
+    "randint",
+    "randint_like",
     "exponential_",
     "multinomial",
+    # The rest of the philox users, found by running tests/integration/ops/
+    # test_rng_dispatch.py: each of these reaches philox_backend_seed_offset and
+    # fails the same way. cauchy_/dropout/poisson are the *vendor's* gcu300
+    # overrides, so they are not discoverable from flag_gems/ops/ alone.
+    "bernoulli",
+    "bernoulli.p",
+    "bernoulli_.float",
+    "bernoulli_.Tensor",
+    "cauchy_",
+    "dropout",
+    "native_dropout",
+    "poisson",
     # Copy ops - already registered in C++, skip to avoid duplicate registration
     "copy_",
     "_to_copy",
@@ -710,6 +869,109 @@ _EXCLUDED_OPS = {
 }
 
 
+# Ops excluded from FlagGems on Enflame GCU only, on top of _EXCLUDED_OPS.
+#
+# These have a FlagGems kernel that its Triton backend cannot compile for the
+# GCU, so they must stay unregistered to keep reaching the topsaten kernels or
+# cpu_fallback. Verified individually on hardware -- only the listed overload
+# fails, e.g. var.dim, std.correction and var_mean.correction all work.
+_GCU_EXCLUDED_OPS = {
+    # NOTE: FlagGems matches this list against the *implementing function* name
+    # (op_registrar.config_filter compares item[1].__name__), not the aten op
+    # name -- those merely coincide for most ops. aten::var.correction is
+    # implemented by var_correction, so that is the name to list.
+    #
+    # The full-reduction path (var_kernel_1, var.py:88) emits an int64 widening
+    # that the GCU backend marks illegal: "failed to legalize operation
+    # 'arith.extsi'" -- consistent with the tops stack having no int64 kernels.
+    "var",
+    "var_correction",
+    "var_dim",
+    "var_mean",
+    # Both are built on Triton's float `%`, which on the GCU returns x rather
+    # than 0 when y divides x exactly (the internal division lands just below
+    # the integer, so the floor is one too low). torch.remainder(2*y, y) then
+    # gives y instead of 0 -- for ~10% of random lanes, silently. Non-multiple
+    # operands are correct, which is why this needs an exact-multiple probe to
+    # see. Verified on gcu300 with the vendor rem_tt/fmod kernels.
+    "remainder",
+    "remainder_",
+    "fmod_scalar",
+    "fmod_tensor",
+    "fmod_scalar_",
+    "fmod_tensor_",
+    "fmod_",
+    # Same rounding defect seen through the quotient instead of the remainder:
+    # floor_divide(y, y) yields 0 rather than 1 on those same lanes.
+    "floor_divide",
+    "floor_divide_",
+    # No GCU kernel to link against: the vendor linker rejects the relocation
+    # for tops_nv_nextafterf_v4_fp32 ("R_DTU_ADDR16_LO_ICALL cannot be used
+    # against symbol"), so the op cannot be compiled at all.
+    "nextafter",
+    "nextafter_",
+    # The sort kernels emit the same illegal int64 widening as var_kernel_1
+    # ("failed to legalize operation 'arith.extsi'"). msort is sort's caller, so
+    # it fails identically, and sort.stable (function sort_stable) shares the
+    # kernel -- it fails as "Pipeline run failed: PassManager execution failed".
+    # topk/argmax use different kernels and are fine.
+    "sort",
+    "sort_stable",
+    "msort",
+    # stack.py:65 builds its offsets in int64 and hits that same legalization
+    # failure -- and the backend then core-dumps while reporting the error, so
+    # this one cannot be left to raise. cat/vstack/hstack are unaffected and
+    # verified correct.
+    "stack",
+    # The conv VJP (flag_gems/ops/conv2d.py, which conv1d unsqueezes into)
+    # passes a stride of 0 as a runtime argument, and the GCU asserts on that
+    # inside the kernel: "Not Support dynamic stride is 0, please add
+    # tl.constexpr to stride arg in kernel args list". That is a SIP assert, so
+    # it aborts the process instead of raising -- it cannot be caught and fallen
+    # back from, which is why the whole family stays off FlagGems even though
+    # every forward is numerically correct.
+    "conv1d",
+    "conv2d",
+    "conv3d",
+    "conv_transpose1d",
+    "conv_transpose2d",
+    "_conv_depthwise2d",
+    "cudnn_convolution",
+    # The vendor's own gcu300 layernorm.py:326 hits the int64 widening in its
+    # backward kernel, which breaks any .backward() through a LayerNorm. The
+    # forward (layer_norm) compiles and is verified correct, so only the backward
+    # is excluded -- the gradient falls back to the topsaten/CPU path.
+    "native_layer_norm_backward",
+    "layer_norm_backward",
+    # int64 again, from the other direction: these two are asked for int64
+    # *output* rather than int64 indices. `zeros(dtype=torch.int64)` goes through
+    # the vendor's gcu300 zeros.py zero_ and fails to compile; `scalar_tensor`
+    # with dtype=int64 compiles but returns garbage (42 came back as
+    # 4441830098096545884). Both are correct on the C++/topsaten path.
+    "zero_",
+    "scalar_tensor",
+    # flag_gems/ops/diff.py builds its offsets in int64 -- same legalization
+    # failure as stack. torch.diff decomposes to narrow+sub on the fallback path.
+    "diff",
+    # Same story as layernorm: the vendor's own gcu300 embedding.py:98 backward
+    # kernel does not legalize, while its forward (embedding) is correct and
+    # stays on FlagGems.
+    "embedding_dense_backward",
+    "embedding_backward",
+    # fill_ silently corrupts int64 tensors -- fill_(42) on an int64 tensor comes
+    # back as -4846589848703729622, at every rank, with no error. The int64
+    # diversion in device_guarded_config cannot rescue it: fill_ writes through
+    # its operand, so computing on a CPU copy would discard the result. Excluding
+    # it also fixes torch.scalar_tensor(dtype=torch.int64), which is an
+    # empty+fill_ underneath and returned garbage even though scalar_tensor
+    # itself was already excluded.
+    "fill_.Scalar",
+    "fill_.Tensor",
+    "fill.Scalar",
+    "fill.Tensor",
+}
+
+
 # Cache for CUDA runtime library
 _cudart_lib = None
 _cudaMemcpy = None
@@ -742,6 +1004,38 @@ def _get_cudaMemcpy():
     return _cudaMemcpy
 
 
+def _flaggems_exclusion_names(flag_gems, aten_names):
+    """Translate aten op names into the function names FlagGems excludes on.
+
+    ``flag_gems.enable(unused=...)`` looks like it takes aten op names, but its
+    registrar filters on the *implementing function* name
+    (``op_registrar.config_filter`` compares ``item[1].__name__``). Those
+    coincide for plain ops -- "randn", "mm" -- and diverge for overloads and
+    private ops: ``normal.Tensor_float`` is implemented by
+    ``normal_tensor_float``, ``_softmax`` by ``softmax``, ``div.Scalar`` by
+    ``true_divide``. Passing an aten name that diverges silently excludes
+    nothing, and the op gets registered after all.
+
+    Both spellings are returned: the function name is what actually filters,
+    while keeping the original is harmless and covers ops whose two names agree.
+    Names absent from FlagGems' config pass through unchanged.
+    """
+    op_to_func = {}
+    for item in getattr(flag_gems, "_FULL_CONFIG", ()):
+        if len(item) < 2:
+            continue
+        func_name = getattr(item[1], "__name__", None)
+        if func_name:
+            op_to_func.setdefault(item[0], func_name)
+
+    names = set(aten_names)
+    for aten_name in aten_names:
+        func_name = op_to_func.get(aten_name)
+        if func_name:
+            names.add(func_name)
+    return sorted(names)
+
+
 def _register_flaggems_operators():
     """
     Register FlagGems operators with the PrivateUse1 (flagos) dispatch key.
@@ -760,6 +1054,60 @@ def _register_flaggems_operators():
     if importlib.util.find_spec("flag_gems") is None:
         # flag_gems not installed, will use cpu_fallback
         return 0
+
+    # Enflame GCU has no C++ FlagGems path (FLAGGEMS_KERNEL is off -- there is no
+    # liboperators.so for the tops stack), so the Python registration is the only
+    # way its Triton kernels get used. Everything not registered here stays on
+    # the topsaten kernels or reaches cpu_fallback, as before.
+    if _build_accelerator() == "gcu":
+        from torch_fl.accelerator.gcu._gcu_compat import is_triton_gcu_available
+
+        if not is_triton_gcu_available():
+            return 0
+        try:
+            import flag_gems
+
+            from torch_fl.accelerator.gcu._gcu_compat import (
+                bind_vendor_ops_in_generic_modules,
+                device_guarded_config,
+                patch_flaggems_device_name,
+            )
+
+            patch_flaggems_device_name()
+            bind_vendor_ops_in_generic_modules(flag_gems)
+            excluded = _flaggems_exclusion_names(
+                flag_gems, _EXCLUDED_OPS | _GCU_EXCLUDED_OPS
+            )
+            _flaggems_lib = torch.library.Library("aten", "IMPL")
+            # enable() reads _FULL_CONFIG off the module, so the guarded table
+            # is swapped in for the call and restored right after -- anything
+            # else reading _FULL_CONFIG later sees the unwrapped functions.
+            original_config = flag_gems._FULL_CONFIG
+            flag_gems._FULL_CONFIG = device_guarded_config(flag_gems)
+            try:
+                flag_gems.enable(lib=_flaggems_lib, unused=excluded)
+            finally:
+                flag_gems._FULL_CONFIG = original_config
+            # What FlagGems actually took over, i.e. the same filter enable()
+            # applied: the aten names whose implementing function survived it.
+            skip = set(excluded)
+            _registered_ops = sorted(
+                entry[0]
+                for entry in flag_gems._FULL_CONFIG
+                if getattr(entry[1], "__name__", None) not in skip
+            )
+            return 1
+        except Exception as exc:
+            # A broken vendor Triton must not take down `import torch_fl`: the
+            # topsaten kernels and cpu_fallback are a complete, correct path.
+            import warnings
+
+            warnings.warn(
+                f"FlagGems registration for GCU failed ({type(exc).__name__}: "
+                f"{exc}); falling back to the topsaten kernels.",
+                stacklevel=2,
+            )
+            return 0
 
     _flaggems_lib = torch.library.Library("aten", "IMPL")
     _registered_ops = []
