@@ -35,7 +35,7 @@ jobs:
     uses: ./.github/workflows/all-tests-common.yml
     with:
       platform: ascend
-      run_build: false
+      run_build: true
       run_integration_tests: true
-      upload_artifact: false
+      upload_artifact: true
       timeout_minutes: ${{ inputs['timeout-minutes'] }}

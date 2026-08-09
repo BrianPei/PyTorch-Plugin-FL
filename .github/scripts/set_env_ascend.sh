@@ -201,15 +201,15 @@ fi
 
 cd "$REPO_ROOT"
 
-if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
+if [[ "$CI_STAGE" == "build" ]]; then
   # Prebuild so package_data sees libtorch_fl.so before the common workflow
-  # invokes python -m build. The following wheel build is incremental.
+  # invokes python -m build. The following wheel build is incremental. The
+  # integration job downloads this artifact and must not rebuild from source.
   python setup.py build_ext --inplace
-fi
 
-# Final availability check: the flagos device must come up on top of the CPU
-# torch and the ACLNN runtime. This mirrors the integration health check.
-python - <<'PY'
+  # Build-stage availability check. Integration repeats this after installing
+  # the artifact wheel from an isolated test workspace.
+  python - <<'PY'
 import torch_fl
 import torch
 
@@ -218,3 +218,4 @@ n = torch_fl.flagos.device_count()
 assert n >= 1, f"expected >=1 flagos device, got {n}"
 print(f"flagos devices: {n}")
 PY
+fi
