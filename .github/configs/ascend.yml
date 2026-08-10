@@ -26,7 +26,7 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260807-ascend-
 # Self-hosted Huawei (Ascend) runner registered by the teacher. The job is
 # dispatched only to a runner carrying this label.
 runner_labels:
-  - hw-8g-cicd-pytorch
+  - flagcicd-910c
 
 container_volumes: []
 
