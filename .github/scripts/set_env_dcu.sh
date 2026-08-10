@@ -190,7 +190,10 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   exit 1
 fi
 
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel cmake
+# patchelf is required by setup.py (rewrites _C.so RPATH to $ORIGIN/lib and
+# $ORIGIN/lib_dcu after copy) and by bundle_dcu_libtorch.sh (sets RPATH on the
+# bundled DTK .so). The flagos DCU image does not ship it, unlike the CUDA image.
+"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel cmake patchelf
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
