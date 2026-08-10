@@ -17,12 +17,23 @@ display_name: Hygon DCU
 # Platform-specific preparation is implemented outside the common workflows.
 setup_script: .github/scripts/set_env_dcu.sh
 
-ci_image: harbor.baai.ac.cn/flagos-dev/flagos:ubuntu22.04-dtk26.04-py3.10
+# Pinned CI image: the base flagos image plus python3.10-venv and patchelf
+# (set_env_dcu.sh needs both; the base image ships neither). Built locally on
+# a DCU host from Dockerfile.dcu-fix and pushed to harbor as manual-<date>-dcu.
+ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260810-dcu-dev
 
 runner_labels:
   - hg-8g-cicd-pytorch
 
-container_volumes: []
+# Bind-mount the host hyhal driver into the container. libhydmi.so (Hygon DMI
+# device management) and its sibling driver libs live here on the host, not in
+# the flagos image; set_env_dcu.sh probes /usr/local/hyhal/lib and prepends it
+# to LD_LIBRARY_PATH so flagos device init can dlopen libhydmi.so. Mount the
+# real path /usr/local/hyhal (not the /opt/hyhal symlink) -- docker does not
+# follow a symlink bind source. The runner host installs hyhal at the same
+# standard layout as any DCU box, so the source path is portable across hosts.
+container_volumes:
+  - /usr/local/hyhal:/usr/local/hyhal:ro
 
 integration_environment: {}
 

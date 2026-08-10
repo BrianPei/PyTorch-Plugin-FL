@@ -136,9 +136,10 @@ if [[ ! -f "$VENDOR_TORCH_LIB/libtorch_hip.so" ]]; then
 fi
 export FLAGOS_DCU_TORCH_LIB="$VENDOR_TORCH_LIB"
 
-# CPU torch base version must match the vendor's for ABI compatibility. DTK
-# 26.04 ships torch 2.9.0+das (unlike CUDA/MetaX images on 2.10.0), so derive
-# the target from the vendor wheel instead of hard-coding it.
+# CPU torch base version must match the vendor's for ABI compatibility. The
+# DTK wheel version (e.g. 2.10.0+das on the current CI image) may differ across
+# DTK releases and from the CUDA/MetaX images, so derive the target from the
+# vendor wheel instead of hard-coding it.
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-$VENDOR_TORCH_BASE_VERSION}"
 
 # FlagGems C++ package is optional for DCU (FLAGGEMS_KERNEL=OFF in setup.py);
@@ -192,7 +193,8 @@ fi
 
 # patchelf is required by setup.py (rewrites _C.so RPATH to $ORIGIN/lib and
 # $ORIGIN/lib_dcu after copy) and by bundle_dcu_libtorch.sh (sets RPATH on the
-# bundled DTK .so). The flagos DCU image does not ship it, unlike the CUDA image.
+# bundled DTK .so). The pinned CI image ships it at /usr/bin/patchelf; the pip
+# install here is a redundant fallback in case the image lacks it.
 "$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel cmake patchelf
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
@@ -252,15 +254,48 @@ export PATH="$VENV_ROOT/bin:$PATH"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
 export ACCELERATOR=dcu
+# DTK's Triton (hcu backend) is copied into the venv without its dist-info
+# (the vendor image ships none), so Triton's entry-point backend discovery
+# finds nothing and the hcu backend never loads. Force in-tree loading so the
+# backend under triton/backends is used -- required for the FlagGems runtime
+# path (integration [3/5]). See README "Enabling FlagGems on DCU".
+export TRITON_BACKENDS_IN_TREE=1
 export FLAGGEMS_DIR="$VENDOR_FLAGGEMS_DIR"
 export FLAGCX_PATH="${FLAGCX_PATH:-/opt/FlagCX}"
 
 CLEAN_CMAKE_PREFIX_PATH="$(strip_vendor_paths "${CMAKE_PREFIX_PATH:-}")"
 CLEAN_LIBRARY_PATH="$(strip_vendor_paths "${LIBRARY_PATH:-}")"
 CLEAN_LD_LIBRARY_PATH="$(strip_vendor_paths "${LD_LIBRARY_PATH:-}")"
+
+# libhydmi.so (Hygon DMI device management) ships in the host hyhal driver,
+# which dcu.yml bind-mounts into the container at the standard hyhal root.
+# DTK's env.sh does not add it to the search path, so flagos device init's
+# dlopen(libhydmi.so) fails with "cannot open shared object file". Probe the
+# standard roots (honoring an explicit HYHAL_ROOT) and prepend them so the
+# loader finds libhydmi.so plus its sibling driver libs (libhydrm, libamd_smi).
+HYHAL_LD_PATH=""
+for hyhal_root in "${HYHAL_ROOT:-}" /usr/local/hyhal /opt/hyhal; do
+  [[ -z "$hyhal_root" ]] && continue
+  [[ -d "$hyhal_root/lib" ]] || continue
+  HYHAL_LD_PATH="${HYHAL_LD_PATH:+$HYHAL_LD_PATH:}$hyhal_root/lib"
+done
+# Recreate the host's /opt/hyhal -> /usr/local/hyhal symlink inside the
+# container (the flagos image lacks it). dlopen(libhydmi.so) goes through
+# LD_LIBRARY_PATH above, but sibling hyhal libs or host code may resolve .so
+# by absolute /opt/hyhal/... paths; mirror the host layout so those resolve.
+if [[ -d /usr/local/hyhal && ! -e /opt/hyhal ]]; then
+  ln -sf /usr/local/hyhal /opt/hyhal 2>/dev/null || \
+    echo "::warning::failed to create /opt/hyhal -> /usr/local/hyhal symlink"
+fi
+if [[ -n "$HYHAL_LD_PATH" ]]; then
+  echo "hyhal lib path: $HYHAL_LD_PATH"
+else
+  echo "::warning::No hyhal/lib found; flagos device init may fail to dlopen libhydmi.so"
+fi
+
 export CMAKE_PREFIX_PATH="$CPU_TORCH_ROOT/share/cmake${VENDOR_FLAGGEMS_DIR:+:$VENDOR_FLAGGEMS_DIR}${CLEAN_CMAKE_PREFIX_PATH:+:$CLEAN_CMAKE_PREFIX_PATH}"
-export LIBRARY_PATH="$CPU_TORCH_ROOT/lib${VENDOR_FLAGGEMS_LIB:+:$VENDOR_FLAGGEMS_LIB}${CLEAN_LIBRARY_PATH:+:$CLEAN_LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$CPU_TORCH_ROOT/lib${VENDOR_FLAGGEMS_LIB:+:$VENDOR_FLAGGEMS_LIB}${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
+export LIBRARY_PATH="${HYHAL_LD_PATH:+$HYHAL_LD_PATH:}$CPU_TORCH_ROOT/lib${VENDOR_FLAGGEMS_LIB:+:$VENDOR_FLAGGEMS_LIB}${CLEAN_LIBRARY_PATH:+:$CLEAN_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${HYHAL_LD_PATH:+$HYHAL_LD_PATH:}$CPU_TORCH_ROOT/lib${VENDOR_FLAGGEMS_LIB:+:$VENDOR_FLAGGEMS_LIB}${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
 
 cd "$REPO_ROOT"
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
@@ -302,7 +337,7 @@ fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR DTK_ROOT ROCM_PATH \
-    FLAGOS_DCU_TORCH_LIB FLAGGEMS_DIR FLAGCX_PATH \
+    FLAGOS_DCU_TORCH_LIB FLAGGEMS_DIR FLAGCX_PATH TRITON_BACKENDS_IN_TREE \
     CMAKE_PREFIX_PATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
