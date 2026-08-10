@@ -26,14 +26,42 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
 
-# Source DTK's env.sh first. The DTK torch wheel imports librocm_smi64.so.2
-# and other DTK driver libs that live under $DTK_ROOT/.hyhal/rocm_smi/lib, so
-# the vendor torch can only be imported after env.sh extends LD_LIBRARY_PATH.
-DTK_ROOT="${DTK_ROOT:-/opt/dtk-26.04}"
-if [[ ! -f "$DTK_ROOT/env.sh" ]]; then
-  echo "::error::DTK env.sh not found at $DTK_ROOT/env.sh"
+# Locate the DTK install root. The image may ship DTK under /opt/dtk,
+# /opt/dtk-26.04, or a versioned directory; honor an explicit DTK_ROOT or
+# ROCM_PATH, then probe common roots, then fall back to a filesystem search.
+discover_dtk_root() {
+  local candidate
+  local -a candidates=(
+    "${DTK_ROOT:-}"
+    "${ROCM_PATH:-}"
+    "/opt/dtk"
+    "/opt/dtk-26.04"
+    "/opt/dtk26.04"
+    "/opt/dtk-26.04.4"
+    "/opt/dtk-25.04.4"
+  )
+  for candidate in "${candidates[@]}"; do
+    [[ -z "$candidate" ]] && continue
+    if [[ -f "$candidate/env.sh" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  local found
+  found="$(find /opt /usr/local -maxdepth 3 -type f -name env.sh \
+    \( -path '*dtk*' -o -path '*rocm*' \) -print -quit 2>/dev/null | head -n1)"
+  if [[ -n "$found" ]]; then
+    printf '%s' "$(dirname "$found")"
+    return 0
+  fi
+  return 1
+}
+
+if ! DTK_ROOT="$(discover_dtk_root)"; then
+  echo "::error::DTK env.sh not found under /opt or /usr/local; set DTK_ROOT explicitly"
   exit 1
 fi
+echo "DTK_ROOT discovered: $DTK_ROOT"
 set +u
 # shellcheck disable=SC1091
 source "$DTK_ROOT/env.sh"
