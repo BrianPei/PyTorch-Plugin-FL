@@ -198,7 +198,9 @@ fi
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
 if [[ "$CI_STAGE" == "integration" ]]; then
-  "$VENV_PYTHON" -m pip install pytest transformers
+  # Pin numpy<2: the CPU torch wheel is built against the NumPy 1.x ABI, and
+  # transformers pulls numpy 2.x which breaks torch's C extensions at import.
+  "$VENV_PYTHON" -m pip install pytest transformers "numpy<2"
 fi
 
 # Carry the vendor FlagGems/FlagCX Python packages into the venv so the DTK
