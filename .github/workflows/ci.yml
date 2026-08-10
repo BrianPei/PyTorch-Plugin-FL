@@ -16,7 +16,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, devops]
+    branches: [main, dev, devops, dev-hygon]
     paths-ignore:
       - "**.md"
       - "docs/**"
@@ -24,7 +24,7 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/PULL_REQUEST_TEMPLATE.md"
   pull_request:
-    branches: [main, dev, devops]
+    branches: [main, dev, devops, dev-hygon]
     paths-ignore:
       - "**.md"
       - "docs/**"
