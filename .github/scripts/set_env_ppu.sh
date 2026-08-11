@@ -42,6 +42,11 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
+# Default PyPI index for build deps (setuptools/cmake/patchelf/pytest/...).
+# The PPU image's pip.conf points at an internal mirror that returns 503; the
+# Tsinghua mirror is reachable through the pod proxy. torch itself still comes
+# from CPU_TORCH_INDEX_URL (download.pytorch.org), not this one.
+PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
 # PPU_SDK is pre-set in the vendor image env; fall back to the canonical path.
 PPU_SDK="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
@@ -193,12 +198,12 @@ fi
 # patchelf is missing by default on PPU nodes (bundle_common.sh notes it is
 # absent on all four vendor nodes). Install it into the venv so bundle_ppu's
 # bundle_require_patchelf check passes; mirrors the DCU line (commit 6568415).
-"$VENV_PYTHON" -m pip install --upgrade pip setuptools wheel cmake patchelf
+"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" --upgrade pip setuptools wheel cmake patchelf
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
 if [[ "$CI_STAGE" == "integration" ]]; then
-  "$VENV_PYTHON" -m pip install pytest transformers
+  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest transformers
 fi
 
 # Keep the vendor FlagGems/Triton Python packages available without copying the
