@@ -130,28 +130,14 @@ echo "Vendor Python: $VENDOR_PYTHON ($VENDOR_PYTHON_VERSION)"
 echo "Vendor PyTorch: $VENDOR_TORCH_VERSION"
 echo "Vendor torch root: $VENDOR_TORCH_ROOT"
 
-VENDOR_FLAGGEMS_DIR="$("$VENDOR_PYTHON" - <<'PY'
-import importlib.util
-from pathlib import Path
-
-spec = importlib.util.find_spec("flag_gems")
-if spec is None or not spec.submodule_search_locations:
-    print("")
-else:
-    root = Path(next(iter(spec.submodule_search_locations))).resolve()
-    candidate = root / "lib" / "cmake" / "FlagGems"
-    print(candidate if (candidate / "FlagGemsConfig.cmake").is_file() else "")
-PY
-)"
-if [[ -z "$VENDOR_FLAGGEMS_DIR" ]]; then
-  echo "::error::FlagGems C++ package was not found in the vendor image"
-  exit 1
-fi
-VENDOR_FLAGGEMS_LIB="$(cd "$VENDOR_FLAGGEMS_DIR/../.." && pwd)"
-if ! compgen -G "$VENDOR_FLAGGEMS_LIB/liboperators.so*" >/dev/null; then
-  echo "::error::FlagGems liboperators.so was not found under $VENDOR_FLAGGEMS_LIB"
-  exit 1
-fi
+# PPU build_ext runs with FLAGGEMS_KERNEL=OFF (setup.py cuda-branch default), so
+# the C++ FlagGems dispatch (which needs liboperators.so + FlagGemsConfig.cmake)
+# is never linked and find_package(FlagGems) is skipped. The PPU image ships
+# FlagGems as source only (/workspace/FlagGems has no build/ or lib/), and
+# FLAGGEMS_PYTHON=ON compiles the Python-path kernels without importing flag_gems
+# at build time. The cuda-style FlagGems C++ asset discovery is therefore omitted
+# here. Runtime flag_gems import for the FlagGems test step relies on the editable
+# .pth already on the container filesystem.
 
 # PPU core libs are a local USE_CUDA=1 build, not an upstream wheel. They carry
 # the undefined symbols libtorch_fl.so needs, so they must be bundled and later
@@ -271,16 +257,15 @@ export CUDA_PATH="$CUDA_HOME"
 export PPU_SDK="$PPU_SDK"
 export FLAGOS_PPU_TORCH_LIB="$VENDOR_TORCH_LIB"
 export FLAGOS_WHEEL_LOCAL="${FLAGOS_WHEEL_LOCAL:-ppu}"
-export FLAGGEMS_DIR="$VENDOR_FLAGGEMS_DIR"
 export FLAGCX_PATH="${FLAGCX_PATH:-/opt/FlagCX}"
 
 CLEAN_CMAKE_PREFIX_PATH="$(strip_vendor_paths "${CMAKE_PREFIX_PATH:-}")"
 CLEAN_LIBRARY_PATH="$(strip_vendor_paths "${LIBRARY_PATH:-}")"
 CLEAN_LD_LIBRARY_PATH="$(strip_vendor_paths "${LD_LIBRARY_PATH:-}")"
-export CMAKE_PREFIX_PATH="$CPU_TORCH_ROOT/share/cmake:$VENDOR_FLAGGEMS_DIR${CLEAN_CMAKE_PREFIX_PATH:+:$CLEAN_CMAKE_PREFIX_PATH}"
+export CMAKE_PREFIX_PATH="$CPU_TORCH_ROOT/share/cmake${CLEAN_CMAKE_PREFIX_PATH:+:$CLEAN_CMAKE_PREFIX_PATH}"
 export CPATH="$CUDA_HOME/include${CPATH:+:$CPATH}"
 export LIBRARY_PATH="$CUDA_HOME/lib64:$PPU_SDK/lib:$PPU_SDK/lib64${CLEAN_LIBRARY_PATH:+:$CLEAN_LIBRARY_PATH}"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$PPU_SDK/lib:$PPU_SDK/lib64${VENDOR_NVIDIA_LIBS:+:$VENDOR_NVIDIA_LIBS}:$CPU_TORCH_ROOT/lib:$VENDOR_FLAGGEMS_LIB${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$PPU_SDK/lib:$PPU_SDK/lib64${VENDOR_NVIDIA_LIBS:+:$VENDOR_NVIDIA_LIBS}:$CPU_TORCH_ROOT/lib${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
 
 cd "$REPO_ROOT"
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
@@ -324,7 +309,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
     PPU_SDK FLAGOS_PPU_TORCH_LIB FLAGOS_SKIP_CUDA_ASSETS FLAGOS_DISABLE_CUDA_ASSETS \
-    FLAGOS_WHEEL_LOCAL FLAGGEMS_DIR FLAGCX_PATH \
+    FLAGOS_WHEEL_LOCAL FLAGCX_PATH \
     CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
