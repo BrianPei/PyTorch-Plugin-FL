@@ -44,9 +44,10 @@ CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
 # Default PyPI index for build deps (setuptools/cmake/patchelf/pytest/...).
 # The PPU image's pip.conf points at an internal mirror that returns 503; the
-# Tsinghua mirror is reachable through the pod proxy. torch itself still comes
-# from CPU_TORCH_INDEX_URL (download.pytorch.org), not this one.
-PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+# Tsinghua mirror answers 200 to curl but 403 to pip (CDN rejects pip UA). PyPI
+# proper works through the pod proxy. torch itself still comes from
+# CPU_TORCH_INDEX_URL (download.pytorch.org), not this one.
+PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.org/simple}"
 
 # PPU_SDK is pre-set in the vendor image env; fall back to the canonical path.
 PPU_SDK="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
