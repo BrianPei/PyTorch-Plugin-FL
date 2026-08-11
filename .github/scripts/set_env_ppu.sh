@@ -209,9 +209,12 @@ fi
 
 # Keep the vendor FlagGems/Triton Python packages available without copying the
 # vendor torch package. They are used by the CUDA runtime path; the active torch
-# package remains the CPU wheel below. PPU flag_gems is an editable install
-# under /workspace/FlagGems; the copy below handles the site-packages layout,
-# and /workspace stays on the container filesystem for the editable .pth to find.
+# package remains the CPU wheel below. PPU flag_gems is a PEP 660 editable
+# install: site-packages has no flag_gems/ dir, only an
+# __editable__.flag_gems-<ver>.pth + __editable___flag_gems_<ver>_finder.py that
+# resolve the import to /workspace/FlagGems/src/flag_gems. dist-info alone is
+# not enough -- without the .pth + finder, venv python raises
+# ModuleNotFoundError on `import flag_gems` (step 4 FlagGems runtime path).
 VENV_SITE="$("$VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 for package in flag_gems triton triton_kernels flagcx sqlalchemy; do
   if [[ -d "$VENDOR_SITE/$package" ]]; then
@@ -220,6 +223,17 @@ for package in flag_gems triton triton_kernels flagcx sqlalchemy; do
   for metadata in "$VENDOR_SITE"/"$package"-*.dist-info; do
     [[ -e "$metadata" ]] || continue
     cp -a "$metadata" "$VENV_SITE/"
+  done
+  # PEP 660 editable installs: copy the .pth (import hook) + finder .py (resolves
+  # the package to its source dir, e.g. /workspace/FlagGems) so venv python can
+  # import the package. dist-info alone does not register the import hook.
+  for pth in "$VENDOR_SITE"/__editable__."$package"*.pth; do
+    [[ -e "$pth" ]] || continue
+    cp -a "$pth" "$VENV_SITE/"
+  done
+  for finder in "$VENDOR_SITE"/__editable___"$package"*_finder.py; do
+    [[ -e "$finder" ]] || continue
+    cp -a "$finder" "$VENV_SITE/"
   done
 done
 
