@@ -22,17 +22,41 @@ runner_labels:
   - pt-8g-cicd-pytorch
 
 container_volumes:
+  # PPU-SDK lives on the runner host (not in the image); mount read-only so
+  # set_env_ppu.sh can discover PPU_SDK + CUDA_SDK without bundling them.
+  - /usr/local/PPU-SDK:/usr/local/PPU-SDK:ro
   - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
 integration_environment:
   MODEL_PATH: /models/Qwen3-0.6B
 
+# K8s + authZ: --privileged is intercepted by the cluster authZ plugin. Mount
+# the AliXPU device nodes explicitly with --device instead. Three node classes:
+# /dev/alixpu (base), /dev/alixpu_ctl (control), /dev/alixpu_ppu0-15 (compute,
+# 16 on the probed pod -- adjust if the runner exposes a different count).
+# GitHub Actions container.options passes these verbatim to docker create, so
+# the list must be static (no shell $(ls ...) expansion).
 container_options: >-
-  --privileged
   --ipc=host
-  --shm-size=512g
-  --ulimit memlock=-1
-  --cap-add=SYS_PTRACE
+  --shm-size=4g
+  --device=/dev/alixpu
+  --device=/dev/alixpu_ctl
+  --device=/dev/alixpu_ppu0
+  --device=/dev/alixpu_ppu1
+  --device=/dev/alixpu_ppu2
+  --device=/dev/alixpu_ppu3
+  --device=/dev/alixpu_ppu4
+  --device=/dev/alixpu_ppu5
+  --device=/dev/alixpu_ppu6
+  --device=/dev/alixpu_ppu7
+  --device=/dev/alixpu_ppu8
+  --device=/dev/alixpu_ppu9
+  --device=/dev/alixpu_ppu10
+  --device=/dev/alixpu_ppu11
+  --device=/dev/alixpu_ppu12
+  --device=/dev/alixpu_ppu13
+  --device=/dev/alixpu_ppu14
+  --device=/dev/alixpu_ppu15
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-ppu

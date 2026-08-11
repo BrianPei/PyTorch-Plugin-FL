@@ -49,14 +49,29 @@ CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.or
 # CPU_TORCH_INDEX_URL (download.pytorch.org), not this one.
 PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.org/simple}"
 
-# PPU_SDK is pre-set in the vendor image env; fall back to the canonical path.
-PPU_SDK="${PPU_SDK:-${PPU_HOME:-/usr/local/PPU_SDK}}"
-if [[ ! -d "$PPU_SDK" ]]; then
-  echo "::error::PPU_SDK does not exist: $PPU_SDK"
-  exit 1
-fi
-if [[ ! -d "$PPU_SDK/CUDA_SDK" ]]; then
-  echo "::error::PPU_SDK/CUDA_SDK does not exist: $PPU_SDK/CUDA_SDK"
+# PPU SDK lives under either /usr/local/PPU-SDK (hyphen, host-mounted on the
+# CI runner via container_volumes) or /usr/local/PPU_SDK (underscore, in-image
+# on dev pods). A preset PPU_SDK / PPU_HOME env wins; otherwise scan candidates
+# and pick the first with CUDA_SDK/lib64/libcudart.so. Mirrors
+# set_env_ascend.sh's CANN toolkit scan so layout changes do not break the env.
+_ppu_candidates=(
+  "${PPU_SDK:-}"
+  "${PPU_HOME:-}"
+  /usr/local/PPU-SDK
+  /usr/local/PPU_SDK
+  /opt/PPU-SDK
+)
+PPU_SDK=""
+for _cand in "${_ppu_candidates[@]}"; do
+  [[ -z "$_cand" ]] && continue
+  if [[ -d "$_cand" && -e "$_cand/CUDA_SDK/lib64/libcudart.so" ]]; then
+    PPU_SDK="$_cand"
+    break
+  fi
+done
+if [[ -z "$PPU_SDK" ]]; then
+  echo "::error::PPU SDK not found; none of the candidates had CUDA_SDK/lib64/libcudart.so."
+  echo "::error::Tried: ${_ppu_candidates[*]}. Set PPU_SDK to the SDK root."
   exit 1
 fi
 
@@ -162,14 +177,10 @@ for path in \
   fi
 done
 
-# PPU SDK ships a full CUDA 13 toolkit under CUDA_SDK. Validate the runtime lib
-# is reachable through the lib64 symlink (-> targets/x86_64-linux/lib).
-if [[ ! -e "$PPU_SDK/CUDA_SDK/lib64/libcudart.so" ]]; then
-  echo "::error::PPU SDK CUDA runtime (libcudart.so) not found under $PPU_SDK/CUDA_SDK/lib64"
-  exit 1
-fi
-
-# Device nodes: 16 /dev/alixpu_ppu* entries on the probed Pod.
+# Device nodes: three classes on the runner -- /dev/alixpu (base),
+# /dev/alixpu_ctl (control), /dev/alixpu_ppu0-15 (compute). The CI container
+# mounts all of them via container_options --device=...; probe alixpu_ppu0 as
+# the "devices are visible" canary.
 if [[ ! -c /dev/alixpu_ppu0 ]]; then
   echo "::error::PPU device node /dev/alixpu_ppu0 is unavailable"
   exit 1
