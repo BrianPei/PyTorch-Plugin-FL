@@ -16,7 +16,7 @@ display_name: PPU
 
 setup_script: .github/scripts/set_env_ppu.sh
 
-ci_image: reg.docker.alibaba-inc.com/aisw/llm:v2.1.0-pytorch2.10.0-ubuntu24.04-cuda13.0-vllm0.19.0-py312
+ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260811-ppu-dev
 
 runner_labels:
   - pt-8g-cicd-pytorch
