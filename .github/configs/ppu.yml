@@ -34,14 +34,16 @@ container_volumes:
 integration_environment:
   MODEL_PATH: /models/Qwen3-0.6B
 
-# K8s + authZ: --privileged is intercepted by the cluster authZ plugin. Mount
-# the AliXPU device nodes explicitly with --device instead. Three node classes:
-# /dev/alixpu (base), /dev/alixpu_ctl (control), /dev/alixpu_ppu0-15 (compute,
-# 16 on the probed pod -- adjust if the runner exposes a different count).
-# GitHub Actions container.options passes these verbatim to docker create, so
-# the list must be static (no shell $(ls ...) expansion).
+# DSW authZ plugin denies --privileged / --ipc=host / --security-opt /
+# --cap-add (Aliyun DSW docs: "authorization denied by plugin authZ"). Mount
+# the AliXPU device nodes explicitly with --device instead (authZ allows it).
+# Three node classes: /dev/alixpu (base), /dev/alixpu_ctl (control),
+# /dev/alixpu_ppu0-15 (compute, 16 on the probed pod -- adjust if the runner
+# exposes a different count). Multi-card NCCL uses --shm-size shared memory,
+# not SysV IPC, so --ipc=host is not needed. GitHub Actions container.options
+# passes these verbatim to docker create, so the list must be static (no shell
+# $(ls ...) expansion).
 container_options: >-
-  --ipc=host
   --shm-size=4g
   --device=/dev/alixpu
   --device=/dev/alixpu_ctl
