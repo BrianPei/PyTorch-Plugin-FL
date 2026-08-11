@@ -216,6 +216,14 @@ fi
   "torch==$CPU_TORCH_VERSION"
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest transformers
+  # flag_gems runtime path (step 4) imports from the mounted source via the
+  # _flag_gems_mounted_source.pth above. The CI image lacks flag_gems' pure
+  # Python deps (sqlalchemy/PyYAML/packaging -- not in the image site-packages,
+  # verified by import failure). numpy ships with the stock +cpu torch wheel
+  # installed above, so it is not re-pinned here to avoid a numpy/torch version
+  # clash. Versions follow /workspace/FlagGems/pyproject.toml dependencies.
+  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" \
+    "packaging>=26.0" "PyYAML==6.0.1" "sqlalchemy==2.0.48"
 fi
 
 # Keep the vendor FlagGems/Triton Python packages available without copying the
@@ -247,6 +255,20 @@ for package in flag_gems triton triton_kernels flagcx sqlalchemy; do
     cp -a "$finder" "$VENV_SITE/"
   done
 done
+
+# CI image (harbor inference-xpu-pytorch) ships no flag_gems package -- the
+# site-packages has no .pth/finder/dist-info for it (verified: ls | grep is
+# empty). The source is mounted read-only at /workspace/FlagGems via
+# container_volumes (shared CPFS PV on the runner pod; verified: docker run -v
+# lists the tree). Dev pods have an editable .pth in their CPFS-backed
+# site-packages that resolves import to /workspace/FlagGems/src; the CI image
+# lacks it, so synthesize a plain path .pth in the venv site-packages. A
+# single path line in a .pth file is prepended to sys.path at Python startup,
+# letting `import flag_gems` resolve to /workspace/FlagGems/src/flag_gems with
+# no editable install (honours the "no editable install for acceptance" rule).
+if [[ -d /workspace/FlagGems/src/flag_gems ]]; then
+  printf '%s\n' "/workspace/FlagGems/src" > "$VENV_SITE/_flag_gems_mounted_source.pth"
+fi
 
 CPU_TORCH_ROOT="$("$VENV_PYTHON" - <<'PY'
 from pathlib import Path

@@ -22,9 +22,13 @@ runner_labels:
   - pt-8g-cicd-pytorch
 
 container_volumes:
-  # PPU-SDK lives on the runner host (not in the image); mount read-only so
-  # set_env_ppu.sh can discover PPU_SDK + CUDA_SDK without bundling them.
-  - /usr/local/PPU-SDK:/usr/local/PPU-SDK:ro
+  # PPU_SDK (underscore, /usr/local/PPU_SDK) is baked into the image with
+  # CUDA_SDK/lib64/libcudart.so; no host mount needed. FlagGems source is not
+  # in the image (find returns nothing); the runner pod mounts the shared CPFS
+  # PV at /workspace/FlagGems, and docker create -v bind-mounts it through to
+  # the job container (verified: ls lists the source tree). set_env then
+  # synthesizes a .pth so venv python can import flag_gems from this path.
+  - /workspace/FlagGems:/workspace/FlagGems:ro
   - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
 integration_environment:
