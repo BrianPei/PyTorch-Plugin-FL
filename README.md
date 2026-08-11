@@ -648,7 +648,7 @@ out = compiled(torch.randn(1, 3, 224, 224))
   Run `scripts/setup_bpu_hbdk4.sh` once, then export
   `FLAGOS_BPU_X86_PYTHON` and `FLAGOS_BPU_X86_EMULATOR`. Without a reachable
   hbdk4 the backend logs a warning and runs every partition on the CPU, so the
-  install is still usable. Details in [docs/bpu.md](docs/bpu.md).
+  install is still usable. Details in [docs/vendors/bpu/integration.md](docs/vendors/bpu/integration.md).
 - **Quantization is a precondition, not an optimization.** hbdk4 lowers float
   conv to the CPU, so int8 Q/DQ insertion is what puts work on the BPU at all.
   On by default; `FLAGOS_BPU_QUANTIZE=0` for bit-exact float artifacts.
@@ -656,9 +656,26 @@ out = compiled(torch.randn(1, 3, 224, 224))
   `PrivateUse1` to `convolution_overrideable`, whose only other kernel raises,
   so the boxed fallback cannot reach a CPU implementation. Two wrappers in
   `register.cc` call `at::convolution` on CPU tensors instead.
-- Measured on-board (torch 2.10): a 6-layer conv stack at 224x224 runs **3.75 ms
-  on the BPU vs 72.06 ms eager CPU — 19.2x**. Toy nets are a wash — submission
-  overhead dominates.
+- Measured on-board (torch 2.10): **ResNet-18 at 224x224 runs 1.356 ms on the
+  BPU vs 26.10 ms eager CPU — 19.2x**, which is 1.26x off D-Robotics' own
+  `resnet18_224x224_nv12.hbm` (1.075 ms) despite taking an 8x larger float32
+  input. Accuracy: cosine 0.990 vs eager, top-1 agreement 5/5. Run
+  `benchmarks/bpu_resnet18_bench.py`. Toy nets are a wash — submission overhead
+  dominates.
+- **LLM inference has its own runtime path.** `hbm_runtime` copies every input
+  per call, which for a decode step means copying the KV cache — 336 MiB per
+  token, 68.4 ms against the vendor's 11.4. `infer.py` binds `hbDNNInferV2`
+  directly with device-resident buffers and a sliding-window cache, reaching
+  **82.1 tok/s decode on Qwen3-0.6B against the vendor `llm` demo's 84.8–87.7**
+  on the same artifact. Run `benchmarks/bpu_qwen3_bench.py`. This drives a
+  prebuilt vendor `.hbm`, not a `torch.compile` graph.
+- **Stock transformers compile too, correctly but not yet quickly.** A
+  HuggingFace `Qwen3ForCausalLM` under `torch.compile(backend="bpu")` runs from
+  its traced graph at **cosine 0.9910 against eager float**, with its largest
+  partitions offloading whole (30/30 and 22/22 nodes). Coverage is capped by
+  Dynamo's symbolic shapes rather than by missing ops — hbdk4 cannot compile a
+  symbolic dim at all — so tracing at a fixed sequence length is what raises it.
+  See [docs/vendors/bpu/integration.md](docs/vendors/bpu/integration.md#stock-transformers-under-torchcompile).
 
 ### Build Environment Variables
 
@@ -680,7 +697,7 @@ out = compiled(torch.randn(1, 3, 224, 224))
 | `GCU_KERNEL` | Enable Enflame GCU topsaten kernel build (`ON`/`OFF`, auto-enabled when `ACCELERATOR=gcu`) |
 | `MUSA_HOME` | Moore Threads MUSA toolkit path (default `/usr/local/musa`; required for MUSA build) |
 | `MUSA_KERNEL` | Enable the MUSA mudnn kernel build (`ON`/`OFF`, auto-enabled when `ACCELERATOR=musa`); `OFF` falls back to CPU for all compute |
-| `FLAGOS_BPU_X86_PYTHON` | Path to an x86_64 python with `hbdk4-compiler`, run under box64 (BPU compile path; see [docs/bpu.md](docs/bpu.md)) |
+| `FLAGOS_BPU_X86_PYTHON` | Path to an x86_64 python with `hbdk4-compiler`, run under box64 (BPU compile path; see [docs/vendors/bpu/integration.md](docs/vendors/bpu/integration.md)) |
 | `FLAGOS_BPU_X86_EMULATOR` | Path to a box64 binary (0.4+); the packaged 0.2.6 cannot run on this board's 64 KB pages |
 | `FLAGOS_BPU_X86_STUBS` | numba/torch import stubs for the emulated interpreter (defaults next to the x86 python) |
 
