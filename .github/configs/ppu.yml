@@ -1,0 +1,109 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+display_name: PPU
+
+setup_script: .github/scripts/set_env_ppu.sh
+
+ci_image: reg.docker.alibaba-inc.com/aisw/llm:v2.1.0-pytorch2.10.0-ubuntu24.04-cuda13.0-vllm0.19.0-py312
+
+runner_labels:
+  - pt-8g-cicd-pytorch
+
+container_volumes:
+  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
+
+integration_environment:
+  MODEL_PATH: /models/Qwen3-0.6B
+
+container_options: >-
+  --privileged
+  --ipc=host
+  --shm-size=512g
+  --ulimit memlock=-1
+  --cap-add=SYS_PTRACE
+
+timeout_minutes: 60
+wheel_artifact_name: wheel-ppu
+# Keep PPU integration self-contained; the bundled lib_ppu wheel is large and
+# transferring it through the Actions artifact service can exceed the
+# self-hosted runner job timeout.
+integration_wheel_source: local-build
+
+# The common workflow only executes this platform-provided test manifest.
+integration_tests:
+  - name: Check model availability
+    command: test -d "$MODEL_PATH"
+
+  # PPU is a CUDA-ABI boxing backend, so the CUDA dispatch key carries vendor
+  # kernels and torch.cuda.is_available() reflects the real PPU devices.
+  # Pod probe found 16 /dev/alixcu_ppu nodes; CI runner device count may
+  # differ. Adjust the literal after the first green run.
+  - name: Check device availability
+    command: |
+      python - <<'PY'
+      from pathlib import Path
+
+      import torch_fl
+      import torch
+
+      torch_fl_path = Path(torch_fl.__file__).resolve()
+      torch_path = Path(torch.__file__).resolve()
+
+      assert torch.__version__.startswith("2.10.0+cpu"), torch.__version__
+      assert "/opt/conda/" not in str(torch_path), torch_path
+      assert torch.cuda.is_available(), "PPU devices are unavailable"
+      assert torch.cuda.device_count() > 0, torch.cuda.device_count()
+      assert torch_fl.flagos.is_available(), "flagos device is unavailable"
+      assert torch_fl.flagos.device_count() > 0, torch_fl.flagos.device_count()
+
+      print(f"PyTorch: {torch.__version__}")
+      print(f"torch: {torch_path}")
+      print(f"torch_fl: {torch_fl_path}")
+      print(f"PPU devices: {torch.cuda.device_count()}")
+      print(f"flagos devices: {torch_fl.flagos.device_count()}")
+      PY
+
+  - name: Run operator tests (vendor backend, main ops)
+    command: >-
+      python -m pytest tests/integration/ops/
+      -m "main_ops and not flaggems_python and not flaggems_cpp"
+      -v -s --tb=short
+
+  - name: Run operator tests (FlagGems runtime path, main ops)
+    command: >-
+      FLAGOS_USE_FLAGGEMS=1
+      python -m pytest tests/integration/ops/
+      -m "flaggems and main_ops" -v -s --tb=short
+
+  - name: Run general tests
+    command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+
+  # Needs its own entry: `-m main_ops` above is scoped to tests/integration/ops/,
+  # so a marked test outside that directory is silently collected as zero tests
+  # rather than erroring.
+  - name: Profiler parity test
+    command: >-
+      python -m pytest tests/integration/test_profiler_parity.py
+      -v -m main_ops --tb=short
+
+  - name: Run inference tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_infer.py
+      --model "$MODEL_PATH" -v -s --tb=short
+
+  - name: Run training tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_train.py
+      --model "$MODEL_PATH" -v -s --tb=short

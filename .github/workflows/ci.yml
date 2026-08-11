@@ -16,7 +16,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, devops]
+    branches: [main, dev, devops, dev-thead]
     paths-ignore:
       - "**.md"
       - "docs/**"
