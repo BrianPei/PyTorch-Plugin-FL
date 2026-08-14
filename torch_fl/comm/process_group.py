@@ -83,18 +83,24 @@ from torch._C import _distributed_c10d as _c10d
 # ---------------------------------------------------------------------------
 
 
-class _VendorProfile:
-    __slots__ = ("flagcx_dev", "view", "native", "direct")
+#   flagcx_native  True when this vendor's FlagCX adaptor consumes flagos
+#                (privateuseone) tensors directly, so no view is needed for the
+#                FlagCX path even when `view` is None. This capability is kept
+#                separate from `direct` because a native fallback may still need
+#                a typed vendor tensor.
 
-    def __init__(self, flagcx_dev, view, native, direct=False):
+
+class _VendorProfile:
+    __slots__ = ("flagcx_dev", "view", "native", "flagcx_native", "direct")
+
+    def __init__(self, flagcx_dev, view, native, flagcx_native=False, direct=False):
         self.flagcx_dev = flagcx_dev
         self.view = view  # attr name on torch_fl._C, or None
         self.native = native  # method name on ProcessGroupFlagOS, or None
-        # direct=True means the inner backend consumes privateuseone tensors as
-        # they are, so no view conversion is needed and none is missing. Only set
-        # it where that has been established from the backend's own source /
-        # measurement -- defaulting to False keeps an unverified vendor failing
-        # loudly instead of handing a flagos tensor to a lib that cannot read it.
+        # flagcx_native allows the FlagCX adaptor to consume privateuseone
+        # tensors directly. direct applies to all inner backend paths and is
+        # used only for vendors whose backend has been measured to support it.
+        self.flagcx_native = flagcx_native
         self.direct = direct
 
 
@@ -119,9 +125,12 @@ _VENDOR_PROFILES = {
     # -> (2, 22, 3)); measured working for all_reduce / broadcast / all_gather /
     # all_gather_into_tensor / reduce_scatter_tensor and DDP on 2 cards.
     "hygon": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
-    # Ascend: flagos is NOT a cuda alias; native fallback is HCCL. The flagos->
-    # npu view is not implemented yet, so only the FlagCX(cann) path is viable.
-    "ascend": _VendorProfile("cann", None, "_try_build_hccl"),
+    # Ascend: flagos is NOT a cuda alias; native fallback is HCCL. No flagos->npu
+    # view exists, so the HCCL fallback stays unreachable, but FlagCX's cann
+    # adaptor takes flagos tensors as-is (it only needs data_ptr(), and flagos
+    # memory here is plain aclrtMalloc device memory) -- measured working for
+    # allreduce/broadcast/all_gather/reduce_scatter/barrier on 2x910.
+    "ascend": _VendorProfile("cann", None, "_try_build_hccl", flagcx_native=True),
     # Enflame GCU: FlagCX registers for device "gcu" (USE_ENFLAME_ADAPTOR in
     # FlagCX backend_flagcx.hpp), and its torch plugin imports torch_gcu and
     # lists "gcu" in replace_prefix's device_list -- i.e. it addresses the GCU
@@ -158,8 +167,12 @@ def _get_profile(vendor: str) -> "_VendorProfile":
 
 
 def _to_comm(t: torch.Tensor, view_fn) -> torch.Tensor:
-    """Convert a single tensor for the comm backend if it is on flagos."""
-    if t.device.type in ("privateuseone", "flagos"):
+    """Convert a single tensor for the comm backend if it is on flagos.
+
+    view_fn is None when the inner backend consumes flagos tensors directly
+    (see _VendorProfile.flagcx_native), in which case there is nothing to do.
+    """
+    if view_fn is not None and t.device.type in ("privateuseone", "flagos"):
         return view_fn(t)
     return t
 
@@ -326,6 +339,9 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
         rather than corrupt memory.
         """
         if prof.view is None:
+            if backend == "flagcx" and prof.flagcx_native:
+                # FlagCX's adaptor for this vendor takes flagos tensors directly.
+                return None
             if prof.direct:
                 return lambda t: t
             raise NotImplementedError(
