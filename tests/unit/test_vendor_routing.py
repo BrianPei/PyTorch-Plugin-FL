@@ -42,13 +42,13 @@ def test_all_vendors_have_consistent_profiles():
     for name, prof in pg._VENDOR_PROFILES.items():
         assert prof.flagcx_dev, f"{name} missing flagcx_dev"
         # cuda-ABI vendors must expose the zero-copy cuda view + NCCL fallback;
-        # non-cuda vendors must NOT claim the cuda view (except enflame, which
-        # has view=None because FlagCX accepts PrivateUse1 directly).
+        # non-cuda vendors must NOT claim the cuda view. Enflame accepts
+        # PrivateUse1 directly; MUSA uses an explicit identity view.
         if prof.flagcx_dev == "cuda":
             assert prof.view == "_flagos_to_cuda_view", name
             assert prof.native == "_try_build_nccl", name
         else:
-            assert prof.view is None, (
+            assert prof.view in (None, "_flagos_identity_view"), (
                 f"{name} is not a cuda alias but claims view {prof.view!r}"
             )
 
@@ -175,9 +175,16 @@ def _make(monkeypatch, vendor, *, flagcx_ok, native_ok, view_present=True):
             self._inner = object()
         return native_ok
 
+    def fake_mccl(self, store, rank, ws, timeout):
+        calls["native"] = True
+        if native_ok:
+            self._inner = object()
+        return native_ok
+
     monkeypatch.setattr(pg.ProcessGroupFlagOS, "_try_build_flagcx", fake_flagcx)
     monkeypatch.setattr(pg.ProcessGroupFlagOS, "_try_build_nccl", fake_nccl)
     monkeypatch.setattr(pg.ProcessGroupFlagOS, "_try_build_hccl", fake_hccl)
+    monkeypatch.setattr(pg.ProcessGroupFlagOS, "_try_build_mccl", fake_mccl)
 
     # Fake torch_fl._C so _resolve_view finds (or misses) the view helper.
     # _resolve_view does `import torch_fl._C as _C`; when torch_fl is already
@@ -187,6 +194,7 @@ def _make(monkeypatch, vendor, *, flagcx_ok, native_ok, view_present=True):
     fake_c = types.ModuleType("torch_fl._C")
     if view_present:
         fake_c._flagos_to_cuda_view = sentinel_view
+        fake_c._flagos_identity_view = sentinel_view  # same marker for identity
     monkeypatch.setitem(sys.modules, "torch_fl._C", fake_c)
     torch_fl_pkg = sys.modules.get("torch_fl")
     if torch_fl_pkg is not None:
@@ -215,24 +223,57 @@ def test_no_backend_raises(monkeypatch):
         obj._build_inner(None, 0, 1, None)
 
 
-def test_musa_flagcx_only_no_native_fallback(monkeypatch):
-    # musa has native=None: if flagcx fails there is nothing to fall back to.
+def test_musa_flagcx_identity_view(monkeypatch):
+    """MUSA uses _flagos_identity_view: FlagCX's MUSA adaptor receives
+    privateuseone tensors as-is, no storage conversion needed."""
     obj, calls, _ = _make(
-        monkeypatch, "musa", flagcx_ok=False, native_ok=True, view_present=False
+        monkeypatch, "musa", flagcx_ok=True, native_ok=False, view_present=True
     )
-    with pytest.raises(RuntimeError, match="none wired"):
+    # Fake the identity view helper in torch_fl._C
+    identity_marker = object()
+    fake_c = sys.modules["torch_fl._C"]
+    fake_c._flagos_identity_view = identity_marker
+
+    view_fn = obj._build_inner(None, 0, 1, None)
+    assert calls["flagcx"] and not calls["native"]
+    assert view_fn is identity_marker  # identity view resolved
+
+
+def test_musa_uses_mccl_native_when_flagcx_unavailable(monkeypatch):
+    # musa has native=_try_build_mccl: if flagcx fails, MCCL is attempted.
+    obj, calls, _ = _make(
+        monkeypatch, "musa", flagcx_ok=False, native_ok=True, view_present=True
+    )
+    # Fake the identity view helper
+    identity_marker = object()
+    fake_c = sys.modules["torch_fl._C"]
+    fake_c._flagos_identity_view = identity_marker
+
+    view_fn = obj._build_inner(None, 0, 1, None)
+    assert calls["flagcx"] and calls["native"]  # flagcx tried first, mccl succeeded
+    assert obj._inner is not None
+    assert view_fn is identity_marker  # identity view for MCCL too
+
+
+def test_musa_no_backend_raises(monkeypatch):
+    # Neither FlagCX nor MCCL available -> must raise with clear error.
+    obj, calls, _ = _make(
+        monkeypatch, "musa", flagcx_ok=False, native_ok=False, view_present=True
+    )
+    with pytest.raises(RuntimeError, match="no suitable inner backend"):
         obj._build_inner(None, 0, 1, None)
-    assert not calls["native"]
+    assert calls["flagcx"] and calls["native"]  # both attempted
 
 
-def test_musa_flagcx_ok_but_no_view_raises(monkeypatch):
-    # musa flagcx path succeeds, but no flagos->musa view is implemented and musa
-    # is not marked direct=True -> must fail loudly rather than pass a raw flagos
-    # tensor to the backend.
+def test_musa_flagcx_ok_but_identity_view_missing_raises(monkeypatch):
+    # musa profile claims _flagos_identity_view, but the C++ binding wasn't
+    # compiled in -> must fail with a clear error pointing to the missing symbol.
     obj, calls, _ = _make(
         monkeypatch, "musa", flagcx_ok=True, native_ok=False, view_present=False
     )
-    with pytest.raises(NotImplementedError, match="no flagos->device view"):
+    with pytest.raises(
+        RuntimeError, match=r"torch_fl\._C\._flagos_identity_view not found"
+    ):
         obj._build_inner(None, 0, 1, None)
 
 
