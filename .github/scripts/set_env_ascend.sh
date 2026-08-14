@@ -34,6 +34,8 @@ CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.or
 # Default PyPI index for build deps (pip/setuptools/wheel/cmake/build/pytest).
 # CPU torch is installed from CPU_TORCH_INDEX_URL, not this generic PyPI mirror.
 export PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+export PIP_DEFAULT_TIMEOUT="${TORCH_FL_PIP_DEFAULT_TIMEOUT:-120}"
+export PIP_RETRIES="${TORCH_FL_PIP_RETRIES:-10}"
 
 # --- CANN toolkit root -------------------------------------------------------
 # CANN images ship several layouts; pick the first candidate that actually has
@@ -159,7 +161,7 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   exit 1
 fi
 
-"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" --upgrade pip setuptools wheel cmake
+"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" setuptools wheel cmake
 "$VENV_PYTHON" -m pip install --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 if [[ "$CI_STAGE" == "integration" ]]; then
@@ -198,7 +200,8 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR ASCEND_HOME \
     FLAGOS_DISABLE_CUDA_ASSETS FLAGOS_USE_FLAGGEMS FLAGOS_USE_FLAGGEMS_CPP \
-    FLAGGEMS_KERNEL FLAGGEMS_PYTHON PIP_INDEX_URL CPATH LIBRARY_PATH LD_LIBRARY_PATH; do
+    FLAGGEMS_KERNEL FLAGGEMS_PYTHON PIP_INDEX_URL PIP_DEFAULT_TIMEOUT PIP_RETRIES \
+    CPATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
