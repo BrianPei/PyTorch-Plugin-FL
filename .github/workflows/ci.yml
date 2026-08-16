@@ -62,8 +62,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       platforms: ${{ steps.detect.outputs.platforms }}
-      non_ascend_platforms: ${{ steps.detect.outputs.non_ascend_platforms }}
+      common_platforms: ${{ steps.detect.outputs.common_platforms }}
       has_ascend: ${{ steps.detect.outputs.has_ascend }}
+      has_dcu: ${{ steps.detect.outputs.has_dcu }}
     steps:
       - uses: actions/checkout@v4
 
@@ -76,20 +77,22 @@ jobs:
             echo "::error::No platform configs found"
             exit 1
           fi
-          non_ascend_platforms=$(jq -c 'map(select(. != "ascend"))' <<<"$platforms")
+          common_platforms=$(jq -c 'map(select(. != "ascend" and . != "dcu"))' <<<"$platforms")
           has_ascend=$(jq -r 'index("ascend") != null' <<<"$platforms")
+          has_dcu=$(jq -r 'index("dcu") != null' <<<"$platforms")
           echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
-          echo "non_ascend_platforms=$non_ascend_platforms" >> "$GITHUB_OUTPUT"
+          echo "common_platforms=$common_platforms" >> "$GITHUB_OUTPUT"
           echo "has_ascend=$has_ascend" >> "$GITHUB_OUTPUT"
+          echo "has_dcu=$has_dcu" >> "$GITHUB_OUTPUT"
 
   platform-pipeline:
     name: Platform pipeline (${{ matrix.platform }})
     needs: discover-platforms
-    if: needs.discover-platforms.outputs.non_ascend_platforms != '[]'
+    if: needs.discover-platforms.outputs.common_platforms != '[]'
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJson(needs.discover-platforms.outputs.non_ascend_platforms) }}
+        platform: ${{ fromJson(needs.discover-platforms.outputs.common_platforms) }}
     uses: ./.github/workflows/all-tests-common.yml
     with:
       platform: ${{ matrix.platform }}
@@ -99,3 +102,9 @@ jobs:
     needs: discover-platforms
     if: needs.discover-platforms.outputs.has_ascend == 'true'
     uses: ./.github/workflows/integration-test-ascend.yml
+
+  dcu-pipeline:
+    name: Platform pipeline (dcu)
+    needs: discover-platforms
+    if: needs.discover-platforms.outputs.has_dcu == 'true'
+    uses: ./.github/workflows/integration-test-dcu.yml
