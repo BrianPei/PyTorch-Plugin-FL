@@ -1310,16 +1310,25 @@ def optional_tensor_names(args: List[Tuple[str, str]]) -> List[str]:
 
 
 def _generator_inject_line(args, device_expr):
-    """If this op's schema carries a trailing `Generator?`, emit a line that
-    fills an absent generator with the flagos shared CUDA generator (the one
-    FlagGems reads), so torch.manual_seed unifies native + flaggems RNG.
-    Returns '' for non-RNG ops. `device_expr` is a C++ expr yielding int64
-    device index in the kernel body scope."""
+    """Emit the CUDA-boxing prelude for a schema carrying `Generator?`.
+
+    Reject a caller-supplied flagos generator before the inner ATen redispatch:
+    its PrivateUse1 key otherwise routes back to this same kernel after every
+    tensor has been boxed to CUDA, recursing until stack overflow. Its mt19937
+    state is not convertible to CUDA's philox state, so failing cleanly matches
+    native PyTorch's handling of incompatible generator devices. If no generator
+    was supplied, inject the shared CUDA generator so torch.manual_seed unifies
+    native and FlagGems RNG.
+
+    Returns '' for non-RNG ops. `device_expr` is a C++ expression yielding the
+    device index in the kernel body scope.
+    """
     has_gen = any("Generator" in t for t, _ in args)
     if not has_gen:
         return ""
     # The generator parameter is always named `generator` in the faithful sig.
     return (
+        "  ValidateGeneratorForCudaBoxing(generator);\n"
         f"  if (!generator.has_value()) generator = "
         f"at::native::flagos::GetFlagosDefaultCudaGenerator({device_expr});\n"
     )
@@ -1696,6 +1705,14 @@ def gen_foreach(op, fn_type, ret_type, args, func=None):
     # unbounded self-recursion ending in SIGSEGV.
     box_lines += _scalar_tensor_box_lines(args)
 
+    # _amp_foreach_non_finite_check_and_unscale_ mutates found_inf in place,
+    # even though it is not a TensorList output. It must be boxed alongside
+    # self_vec or the vendor CUDA kernel receives a mixed PrivateUse1/CUDA
+    # argument set and can crash while dispatching.
+    for t, n in args:
+        if "at::Tensor &" in t and "const" not in t:
+            box_lines += f"  guard.box({{{n}}});\n"
+
     if ret_type == "void":
         body = f"  {api}({call_args_str});"
         return f"""{ret_type} {kn}({args_decl(args)}) {{
@@ -1926,20 +1943,15 @@ def gen_optlist(op, fn_type, ret_type, args, func=None):
     list_name = args[1][1]
     api = f"at::{at_api_base(op)}"
     return f"""{ret_type} {kn}({args_decl(args)}) {{
-  BoxToCuda({self_name});
-  std::vector<at::Tensor> boxed_holders;
+  DeviceBoxingGuard self_guard({self_name});
+  TensorListBoxingGuard indices_guard;
   for (int64_t i = 0; i < static_cast<int64_t>({list_name}.size()); ++i) {{
     auto opt = {list_name}.get(i);
-    if (opt.has_value() && opt->defined()) {{
-      BoxToCuda(*opt);
-      boxed_holders.push_back(*opt);
+    if (opt.has_value()) {{
+      indices_guard.box({{*opt}});
     }}
   }}
   auto result = {api}({self_name}, {list_name});
-  UnboxToFlagos({self_name});
-  for (auto& t : boxed_holders) {{
-    UnboxToFlagos(t);
-  }}
   UnboxToFlagos(result);
   return result;
 }}"""
@@ -2174,6 +2186,15 @@ def main():
         "namespace at::native::flagos {",
         "namespace {",
         "",
+        "void ValidateGeneratorForCudaBoxing(",
+        "    const ::std::optional<at::Generator>& generator) {",
+        "  TORCH_CHECK(",
+        "      !generator.has_value() || !generator->defined() ||",
+        "          generator->device().type() != c10::DeviceType::PrivateUse1,",
+        "      \"Expected a 'cuda' device type for generator but found '\",",
+        '      generator->device().type(), "\'");',
+        "}",
+        "",
     ]
     for op in sorted(op_info):
         i = op_info[op]
@@ -2385,9 +2406,26 @@ def main():
             # (3) DTK triton cannot compile the gems kernel
             "gcd",
             "gcd.out",
-            # (4) wrong numerics on the gems path
+            # (4) wrong numerics or memory safety on the gems path
             "adaptive_max_pool3d_backward",
             "leaky_relu_",
+            # layer_norm_backward assumes a 2-D input and computes M from
+            # input.shape[0] instead of normalized_shape. For 3-D transformer
+            # inputs this makes the weight/bias gradient kernel write past its
+            # outputs; keep the operation on the CUDA boxing path until the
+            # upstream FlagGems fix lands.
+            "native_layer_norm_backward",
+            # The gems index_select triton launch is not stream-ordered against
+            # the flagos (PrivateUse1) stream that produced the index tensor.
+            # In HF cached beam search (DynamicCache.reorder_cache ->
+            # index_select(0, beam_idx)) the kernel can read a stale index
+            # entry, fail its indices < N validity mask, and leave the output
+            # column unwritten (recycled torch.empty bytes), poisoning the KV
+            # cache with garbage/NaN. The kernel math itself is correct
+            # standalone; the missing happens-before is in the flagos <->
+            # flag_gems launch integration. Keep on the CUDA boxing path until
+            # launches are ordered with the flagos current stream.
+            "index_select",
         }
 
         # backends_flaggems.conf: same cuda routes, but the auto-discovered

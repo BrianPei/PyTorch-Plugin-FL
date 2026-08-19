@@ -32,14 +32,60 @@ list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/runtime/accelerator/.*")
 # stream_api is built as a separate shared lib
 list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/runtime/accelerator/ascend/stream_api\\.cc")
 
-# Profiler device tracer selection: exclude the wrong tracer based on ACCELERATOR.
-# CUPTI tracer is for CUDA/NVIDIA; ROCtracer is for DCU/AMD; everything else gets
-# the stub (neither). Both tracer files implement the same MakeDeviceTracer() factory,
-# so only one can be in the build.
+# Profiler device tracer selection: exactly one vendor implementation may define
+# MakeDeviceTracer(). CUDA-compatible builds use CUPTI, DCU uses ROCtracer,
+# Ascend uses MSPTI, and MUSA uses MUPTI. Unsupported native platforms compile
+# the unavailable stub.
 if(ACCELERATOR STREQUAL "dcu")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+elseif(ACCELERATOR STREQUAL "ascend")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+elseif(ACCELERATOR STREQUAL "musa")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
 else()
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+endif()
+
+# CANN's public MSPTI headers are optional. The tracer is still compiled with a
+# small unavailable implementation when a CPU-only build has no toolkit, while
+# the Python import path likewise treats libmspti.so as optional.
+if(ACCELERATOR STREQUAL "ascend")
+  find_path(MSPTI_INCLUDE_DIR
+    NAMES mspti.h
+    PATHS
+      "$ENV{ASCEND_HOME}/tools/mspti/include"
+      "$ENV{ASCEND_HOME_PATH}/tools/mspti/include"
+      /usr/local/Ascend/ascend-toolkit/latest/tools/mspti/include
+      /usr/local/Ascend/cann-9.0.0/tools/mspti/include)
+  if(MSPTI_INCLUDE_DIR)
+    include_directories(${MSPTI_INCLUDE_DIR})
+    add_compile_definitions(FLAGOS_HAVE_MSPTI=1)
+    message(STATUS "mspti.h found: ${MSPTI_INCLUDE_DIR}")
+  else()
+    message(STATUS "mspti.h NOT found; Ascend profiler will be unavailable")
+  endif()
+elseif(ACCELERATOR STREQUAL "musa")
+  find_path(MUPTI_INCLUDE_DIR
+    NAMES mupti_activity.h
+    PATHS
+      "$ENV{MUSA_HOME}/include"
+      /usr/local/musa/include
+      /usr/local/musa-5.1.0/include)
+  if(MUPTI_INCLUDE_DIR)
+    include_directories(${MUPTI_INCLUDE_DIR})
+    add_compile_definitions(FLAGOS_HAVE_MUPTI=1)
+    message(STATUS "mupti_activity.h found: ${MUPTI_INCLUDE_DIR}")
+  else()
+    message(STATUS "mupti_activity.h NOT found; MUSA profiler will be unavailable")
+  endif()
 endif()
 
 # Exclude backend kernel directories based on options
@@ -113,6 +159,9 @@ if(FLAGGEMS_KERNEL OR FLAGGEMS_PYTHON)
   set(_needs_python_op_caller ON)
 endif()
 if(ACCELERATOR STREQUAL "metax" AND FLAGOS_METAX_BOXING)
+  set(_needs_python_op_caller ON)
+endif()
+if(ACCELERATOR STREQUAL "gcu")
   set(_needs_python_op_caller ON)
 endif()
 foreach(_src IN LISTS SOURCE_FILES)
@@ -354,7 +403,7 @@ elseif(ACCELERATOR STREQUAL "musa")
     # torch_musa tree, and so none of the header-shadowing hazards it brought
     # (it re-shipped ~1341 of torch's own ATen/ops/*_ops.h frozen at the
     # vendor's torch version).
-    target_link_libraries(${LIBRARY_NAME} PRIVATE ${MUDNN_LIB})
+    target_link_libraries(${LIBRARY_NAME} PRIVATE ${MUDNN_LIB} ${MURAND_LIB})
   endif()
 elseif(ACCELERATOR STREQUAL "bpu")
   # Selects backends/bpu_memory.h and, like tsingmicro, skips the generated

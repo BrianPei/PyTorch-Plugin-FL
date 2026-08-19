@@ -322,11 +322,6 @@ at::Tensor _to_copy(
       "but got destination device ",
       device);
 
-  // Ascend NPU does not support float64; clamp to float32.
-  if (dtype == at::kDouble && (device.is_privateuseone() || device.is_cuda())) {
-    dtype = at::kFloat;
-  }
-
   if ((device.is_privateuseone() || device.is_cuda()) && device.index() < 0) {
     const auto self_device = self.device();
     const auto device_index = self_device.type() == device.type() &&

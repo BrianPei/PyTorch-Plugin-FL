@@ -26,6 +26,11 @@
 #include "runtime/allocator/caching_device_allocator.h"
 #include <c10/core/impl/LocalDispatchKeySet.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
 // Forward declarations for the Ascend matmul kernels (csrc/aten/backends/ascend/matmul.cc).
 // That file is only compiled when USE_ASCEND is on, so BOTH declarations must be
 // guarded the same way: a .so links fine with an undefined symbol and only fails
@@ -365,7 +370,49 @@ static std::tuple<at::Tensor, at::Tensor> WrapperMatmulBackward(
 }
 #endif
 
+#if defined(USE_MUSA) && defined(FLAGOS_FLAGGEMS_PYTHON)
+bool MusaFlagGemsEnabled() {
+  const char* value = std::getenv("FLAGOS_USE_FLAGGEMS");
+  if (value != nullptr) {
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (normalized != "" && normalized != "0" && normalized != "off" &&
+        normalized != "false") {
+      return true;
+    }
+  }
+
+  // FLAGOS_BACKEND_CONFIG is an advanced override that wins over the convenience
+  // switch in Python. Register the narrow hybrid schema set when that config is
+  // selected explicitly too, otherwise its flagos_python routes have no kernel.
+  const char* config = std::getenv("FLAGOS_BACKEND_CONFIG");
+  if (config == nullptr) return false;
+  std::string path(config);
+  auto slash = path.find_last_of("/\\");
+  auto filename = slash == std::string::npos ? path : path.substr(slash + 1);
+  return filename == "backends_musa_flagos_py.conf";
+}
+#endif
+
+bool HasCompatibleShallowCopyType(
+    const at::Tensor& self, const at::Tensor& from) {
+  const auto self_keys = self.key_set();
+  const auto from_keys = from.key_set();
+  const auto is_dense = [](c10::DispatchKeySet keys) {
+    return keys.has(c10::DispatchKey::CPU) ||
+        keys.has(c10::DispatchKey::PrivateUse1);
+  };
+  return self_keys == from_keys || (is_dense(self_keys) && is_dense(from_keys));
+}
+
 } // namespace
+
+TORCH_LIBRARY_IMPL(aten, CatchAll, m) {
+  m.impl(
+      "_has_compatible_shallow_copy_type",
+      TORCH_FN(HasCompatibleShallowCopyType));
+}
 
 // Register basic operators for PrivateUse1 dispatch key
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -407,11 +454,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // ============================================================
   // Generated m.impl registrations for the generated operators
   // ============================================================
-  // GCU registers only its own coverage set. Claiming an op on PrivateUse1
+  // GCU registers only its topsaten coverage set. Claiming an op on PrivateUse1
   // without a kernel behind it turns into the dispatcher's "backend not
   // registered" error, whereas leaving it unregistered reaches the cpu_fallback
-  // below -- and on GCU neither the CUDA boxing kernels (no CUDA runtime) nor
-  // FlagGems are built, so the full list would break every uncovered op.
+  // below. FlagGems Python kernels are compiled alongside GCU, but only wrappers
+  // in this coverage set may select their kFlagOsPython dispatcher slot.
   //
   // MUSA is the same story: musa_register.inc lists exactly the ops with a mudnn
   // kernel behind them, and no CUDA boxing kernels are compiled in
@@ -426,6 +473,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   #elif defined(USE_MUSA)
     #if defined(FLAGOS_MUSA_KERNEL)
     #include "backends/musa/generated/musa_register.inc"
+    #endif
+    #if defined(FLAGOS_FLAGGEMS_PYTHON)
+    if (MusaFlagGemsEnabled()) {
+    #include "backends/musa/generated/musa_flaggems_register.inc"
+    }
     #endif
   #elif defined(USE_BPU)
     // BPU registers no compute ops. The BPU's unit of execution is a whole
@@ -458,6 +510,10 @@ TORCH_LIBRARY_IMPL(_, PrivateUse1, m) {
   m.fallback(
       torch::CppFunction::makeFromBoxedFunction<&at::native::flagos::cpu_fallback>());
 }
+
+// The AutocastPrivateUse1 policies and fallback live in aten/autocast.cc.
+// A dispatch key accepts only one backend fallback, so they must not be
+// registered here as well.
 
 // Register AutogradPrivateUse1 fallback to dispatch to PrivateUse1
 // This ensures operators like where.ScalarSelf work correctly through autograd dispatch

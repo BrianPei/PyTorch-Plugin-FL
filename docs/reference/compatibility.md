@@ -25,10 +25,10 @@
 | NVIDIA CUDA | `ACCELERATOR=cuda` (default) | CUDA boxing over an external `libtorch_cuda.so` | Stable | Experimental (inductor GPU device registered; no CI test step) | Beta (FlagCX + NCCL fallback, DDP live-verified) | Stable (CUPTI parity) | Beta (Python + C++ dispatch paths) | Stable |
 | MetaX | `ACCELERATOR=metax` | CUDA-boxing reuse via `cu-bridge`/mxcc, or native MetaX kernels | Stable | Not validated | Experimental (NCCL-shaped `mccl` fallback; not CI-covered) | Not validated on this vendor's tracer | Experimental (Python dispatch; not CI-tested on MetaX) | Stable |
 | Ascend | `ACCELERATOR=ascend` | Native ACLNN operator backend, optional FlagGems via triton-ascend | Stable (CI-covered ops, RNG suite) | Not validated | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Runtime only (device/runtime events not emitted; profiler parity suite excluded from CI) | Experimental (Python dispatch; not CI-tested on Ascend) | Beta |
-| PPU | `ACCELERATOR=cuda` + `PPU_SDK`/`PPU_HOME` detection | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK | Experimental | Not validated | Experimental (NCCL fallback via vendor-adapted `libnccl.so.2`; not CI-covered) | Not validated on this vendor's tracer | Experimental (vendor-index Triton required) | Experimental |
-| Hygon DCU | `ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | Beta | Not validated | Experimental (RCCL via DTK; all_reduce/DDP measured on 2 cards, not in CI) | Beta (parity suite runs in CI) | Beta (Python dispatch only) | Beta |
+| PPU | `ACCELERATOR=cuda` + `PPU_SDK`/`PPU_HOME` detection | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK | Experimental (FP16/BF16 autocast and GradScaler measured on PPU hardware, not in CI) | Not validated | Experimental (NCCL fallback via vendor-adapted `libnccl.so.2`; not CI-covered) | Not validated on this vendor's tracer | Experimental (vendor-index Triton required) | Experimental |
+| Hygon DCU | `ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | Beta (including FP16/BF16 autocast and GradScaler) | Experimental (FlagTree HCU validated on `gfx936`; not in CI) | Experimental (RCCL via DTK; all_reduce/DDP measured on 2 cards, not in CI) | Beta (parity suite runs in CI) | Beta (Python dispatch only) | Beta |
 | Enflame GCU | `ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64 ops | Experimental | Not validated | Not validated | Not validated | Experimental (Python dispatch, requires vendor Triton) | Experimental |
-| Moore Threads MUSA | `ACCELERATOR=musa` | Native `mudnn` operator backend, with CPU fallback for unrouted ops | Experimental | Not validated | Not validated | Not validated | Experimental (Python dispatch, requires vendor Triton) | Experimental |
+| Moore Threads MUSA | `ACCELERATOR=musa` | Native `mudnn` operator backend, with CPU fallback for unrouted ops | Experimental | Not validated | Not validated | Experimental (MUPTI device timeline measured on MTT S5000; CPU-Kineto linkage is environment-dependent) | Experimental (Python dispatch, requires vendor Triton) | Experimental |
 | D-Robotics BPU | `ACCELERATOR=bpu` | No eager kernel sets are built; eager ops run on CPU | Runtime only (CPU fallback for eager) | Experimental (`torch.compile(backend="bpu")` graph path via hbdk4) | Not applicable | Not validated | Not applicable (no per-op kernel build) | Runtime only |
 | TsingMicro | `ACCELERATOR=tsingmicro` | Runtime/build selector present; no per-op kernel set documented | Runtime only | Not validated | Not validated | Not validated | Not applicable | Runtime only |
 
@@ -86,6 +86,15 @@ detection (see [`setup.py`](../../setup.py), lines 43-46 and 732-736), reusing t
 build against the PPU's CUDA-13-compatible SDK. There is no CI manifest for this platform (no
 `ppu.yml` under `.github/configs/`), so all capabilities here rest on the
 [README](../../README.md)'s build-from-source instructions rather than automated tests.
+The shared `AutocastPrivateUse1` policies and CUDA-boxing AMP routes expose
+`torch.autocast("flagos")` and `torch.amp.GradScaler("flagos")`, with FP16 and
+BF16 as the advertised target dtypes. The AMP contract is covered by
+`tests/integration/test_amp.py`, but its runtime results are only PPU evidence
+when run with `PPU_SDK` or `PPU_HOME` against a real PPU device; ordinary NVIDIA
+CUDA and CPU runs do not validate this row. The current PPU validation covered
+both FP16 and BF16 autocast, the mutable `found_inf` unscale path, finite scale
+growth, overflow backoff, and an autocast training step. The result remains
+experimental because it is not covered by CI.
 FlagGems requires a vendor-index Triton build whose version string does not satisfy the
 project's `triton>=3.5.1` pin (see [`setup.py`](../../setup.py), lines 790-807). Distributed
 support is described as working via the NCCL fallback with a vendor-adapted `libnccl.so.2`, but
@@ -106,7 +115,19 @@ which is not built for DTK," and [`.github/configs/dcu.yml`](../../.github/confi
 broadcast, all_gather, all_gather_into_tensor, reduce_scatter_tensor) and DDP are measured
 working on 2 cards via RCCL (see
 [`torch_fl/comm/process_group.py`](../../torch_fl/comm/process_group.py), lines 103-107), but
-this measurement is not in CI.
+this measurement is not in CI. Mixed-precision training is validated on real DCU hardware with
+FP16 and BF16 autocast policies, nested autocast state, finite and overflowing GradScaler steps,
+and forward/backward optimizer execution. CPU-to-DCU copies and representative elementwise,
+reduction, matrix multiplication, and backward operations preserve all tested PyTorch dtypes from
+bool through complex128, including float64.
+
+`torch.compile(backend="flagos")` is experimentally validated on Hygon with a
+FlagTree 0.6.0 HCU build and PyTorch 2.10.0. The full compile integration suite
+passes on the `gfx936` target, including forward and backward execution, FP32
+and FP16 inputs, max-autotune, recompilation, FakeTensor tracing, and the
+FlagTree-specific result/device checks. The FlagTree wheel must replace the
+active `triton` installation before Python starts; the current DCU CI image
+uses DTK Triton and does not exercise this path.
 
 ### Enflame GCU
 
@@ -125,8 +146,11 @@ with a documented CPU fallback for ops the vendor kernel table does not cover (s
 [`setup.py`](../../setup.py), lines 440-457, and
 `tests/integration/ops/test_musa_dispatch.py`, lines 15-24). No CUDA boxing kernels or FlagGems
 C++ kernels are compiled for this platform; FlagGems Python dispatch is optional and needs the
-vendor Triton backend. Distributed and profiler support are not represented in tests or docs for
-this platform.
+vendor Triton backend. Distributed support remains unvalidated on hardware. The optional MUPTI
+tracer has been measured on the available MTT S5000 host and emits real positive-duration kernel,
+runtime, and memcpy activities with device, stream, name, and Chrome-trace metadata. CPU-to-device
+linkage depends on whether the installed PyTorch/Kineto build supplies the PrivateUse1 resolver;
+the CPU-only PyTorch 2.10 wheel used for this measurement does not justify a general parity claim.
 
 ### D-Robotics BPU
 

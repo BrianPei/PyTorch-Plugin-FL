@@ -93,6 +93,49 @@ Use standard templates:
 
 See `CONTRIBUTING.md` for detailed contribution guidelines.
 
+### Upstream branch policy
+
+The upstream repository may contain stable branches for supported PyTorch minor
+lines, such as `2.9`. These stable branches are part of the release/support
+contract and may be created or maintained on the upstream remote when explicitly
+requested by the project maintainer. A stable branch must be named for a PyTorch
+minor line and must not be used as a general-purpose development branch.
+
+All ordinary development branches remain fork-only. This includes `docs/*`,
+`feat/*`, `fix/*`, `perf/*`, `refactor/*`, `test/*`, `ci/*`, and experimental
+work, even when the change is intended to land on a stable branch. The required
+flow is:
+
+```text
+<contributor-fork>:<development-branch>
+        -> PR -> <upstream>:main or <upstream>:<torch-minor-stable-branch>
+```
+
+Before pushing a branch:
+
+1. Inspect `git remote -v` and classify the target as either an upstream stable
+   branch or a contributor development branch.
+2. For ordinary development, push only to the contributor fork (normally `origin`):
+   ```bash
+   git push origin <development-branch>
+   ```
+3. Create the pull request from `<fork-owner>:<development-branch>` into the
+   intended upstream target, either `main` or an existing stable PyTorch minor
+   branch:
+   ```bash
+   gh pr create \
+     --repo <upstream-owner>/<upstream-repo> \
+     --head <fork-owner>:<development-branch> \
+     --base <main-or-torch-minor-stable-branch>
+   ```
+4. Creating or updating an upstream stable branch requires explicit maintainer
+   authorization and must be limited to stable-branch setup or maintenance. Do not
+   push ordinary commits directly to that branch; submit them through a fork PR.
+
+Do **not** run `git push <upstream> <development-branch>` for ordinary development.
+A successful push is not evidence that the push was appropriate. If a branch is
+ambiguous, treat it as a development branch and use the contributor fork.
+
 ## Commit Message Format
 
 All commits should follow this format:
@@ -154,6 +197,27 @@ pytest tests/integration/ops/test_<relevant>.py -v
 - Reuse existing utilities instead of reinventing
 - Keep changes focused (avoid unnecessary refactoring)
 
+### Operator integration on non-CUDA-compatible platforms
+
+For accelerator platforms that are not CUDA-compatible, including Ascend and
+Enflame GCU, operator integration **must be implemented through the platform's
+code generator**. AI agents must extend the relevant operator registry,
+category/template, and generated configuration instead of adding handwritten
+per-operator kernels.
+
+- Do not add a new handwritten operator implementation under
+  `csrc/aten/backends/<platform>/` merely because it is faster to author.
+- Regenerate the platform outputs and commit both the generator change and its
+  generated artifacts.
+- Run the generator a second time and require an empty diff to prove
+  idempotency.
+- A handwritten kernel is allowed only when the platform codegen cannot express
+  the required runtime behavior. The PR must document that concrete limitation
+  and receive explicit human approval before the handwritten implementation is
+  added.
+- CUDA-compatible platforms may follow their existing CUDA boxing/codegen path;
+  this rule does not require vendor-specific native kernels for them.
+
 ## Testing Requirements
 
 ### Test Organization
@@ -194,6 +258,19 @@ Update documentation when:
 - New conventions → Update this file (CLAUDE.md)
 
 All documentation must be in English.
+
+### Operator support records
+
+Any change that adds, enables, removes, disables, or reroutes an operator through
+a vendor-native backend or FlagGems must update
+`docs/reference/operator-support.md` for every affected hardware platform in the
+same change. Rerun `tests/manual/flaggems_overload_survey.py` on the affected
+hardware and update the summary, raw evidence, provenance, and update history
+from measured results. Do not infer support from routing configuration alone.
+
+If affected hardware is unavailable, mark its data as **not revalidated** and
+record the evidence gap in both the support report and the PR. Do not silently
+retain old results as though they were measured against the new cohort.
 
 ## Related Documentation
 
