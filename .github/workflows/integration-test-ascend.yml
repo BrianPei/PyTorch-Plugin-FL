@@ -34,7 +34,7 @@ jobs:
   integration-tests:
     name: Build and test (Ascend)
     runs-on:
-      - flagcicd-910c
+      - flagcicd-810e
     timeout-minutes: ${{ inputs['timeout-minutes'] }}
     container:
       image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260816-ascend-ci
