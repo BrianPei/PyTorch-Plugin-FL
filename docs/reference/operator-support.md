@@ -234,10 +234,59 @@ The target cohort is the available MTT S5000 host; no S6000 claim is made.
 
 The MUSA hybrid config adds seven non-overlapping FlagGems Python routes (`all`, `all.dims`, `any`, `any.dims`, `index_add`, `index_add_`, and `repeat_interleave.Tensor`) while retaining native RNG precedence. They were execution-validated with FlagGems 5.0.2 and the vendor `flagtree-0.5.0+mthreads3.1` wheel (Triton 3.1.0, backend `mthreads`; SHA-256 `197b0c6954ad8b3edef51138311a8c4f3aea75b90ba0f69d3c2fda95a76b6b1b`). `tests/integration/ops/test_musa_flaggems.py` passed **2 tests in 5.33 seconds** on `flagos:0`: instrumentation observed every configured wrapper, it compares selected route outputs against CPU, includes duplicate-index `index_add`, checks in-place `index_add_`, and launches FlagGems `randn` on `flagos:0` between native `rand` calls. Repeating after `torch.flagos.manual_seed(20260817)` reproduced all outputs and confirmed the two shared C++ generator reservations. Native and hybrid suites must run in separate pytest processes because the C++ `BackendTable()` caches the backend configuration on first use. The generic installed Triton 3.7.1 is not MThreads-capable and is not execution evidence.
 
+## FlagGems Route Removals
+
+FlagGems routes removed after the 546-overload baseline was measured are
+tracked here. The four-platform summary tables above still describe the
+baseline cohort; the affected rows are **not revalidated** against the reduced
+route set because A100, mc550, and 810e hardware is unavailable to this change.
+
+### `index_select` rerouted to CUDA boxing (2026-08-19, Hygon DCU)
+
+`index_select` was moved from `flagos_python` to `cuda` in all FlagGems
+configurations (`backends_flaggems.conf`, `backends_flaggems_cpp.conf`,
+`backends_metax_flaggems.conf`, `backends_metax_flaggems_cpp.conf`,
+`backends_dcu_flaggems.conf`; `index_select.out` was already CUDA-routed).
+The generic configuration now activates 545 FlagGems Python routes with 27
+forced CUDA fallbacks (SHA-256
+`14b4c64c0d2684b126fe06c6f39f42b62c571a94813a684cb63d4a09b909b60c`).
+
+Reason: the FlagGems triton launch is not stream-ordered against the flagos
+(PrivateUse1) stream that produced the index tensor. Under a busy allocation
+stream (HF cached beam search, `DynamicCache.reorder_cache` ->
+`index_select(0, beam_idx)`) the kernel can read a stale index entry, fail its
+`indices < N` validity mask, and leave the output column unwritten, poisoning
+KV caches with recycled `torch.empty` bytes and NaNs. This is a launch
+integration race, not a kernel arithmetic defect.
+
+Targeted evidence on Hygon DCU bw1000 (FlagGems 5.4.0.dev0 hygon build,
+DTK triton, harness v4):
+
+- `flaggems_overload_survey.py --ops index_select` against a conf that still
+  routes `index_select = flagos_python`: **STRICT** (all CPU-valid synthesized
+  cases pass standalone), confirming the kernel math is correct and the hazard
+  is the missing stream ordering, which the synthesized-case harness does not
+  reproduce.
+- Failing HF UT nodes on the FlagGems route before the reroute:
+  `T5ModelTest::test_generate_with_past_key_values` (deterministic),
+  `Qwen3ModelTest::test_generate_from_inputs_embeds_1_beam_search` (flaky,
+  ~1/3), `Gemma3Vision2TextModelTest::test_generate_from_inputs_embeds_1_beam_search`
+  (deterministic). After the reroute all three pass (Qwen3 verified 3/3).
+- Minimal reproducer (tiny T5, `num_beams=2, use_cache=True`): NaN logits from
+  decoder step 1 before the reroute, 3/3 clean after.
+
+The generic four-platform FlagGems rows are **not revalidated** by this
+change; the evidence gap is that no A100/mc550/810e re-survey was run, and the
+545-route denominator applies only from this change forward. Note that PR #108
+(`native_layer_norm_backward` rerouted to CUDA boxing, 2026-08-14) previously
+reduced the same cohort 546 -> 545 without a re-survey; the baseline tables
+therefore describe the original 546-route cohort, not the current HEAD.
+
 ## Update History
 
 | Date | Hardware | Cohort | Change | Evidence |
 |---|---|---|---|---|
+| 2026-08-19 | Hygon DCU bw1000 | Generic FlagGems routes | Rerouted `index_select` from `flagos_python` to `cuda` in all FlagGems configs (cross-stream launch race drops output stores under load); generic cohort 546 -> 545 active routes, 26 -> 27 forced CUDA fallbacks. Four-platform rows **not revalidated** (A100/mc550/810e unavailable). | Targeted survey `--ops index_select` on the flagos_python route: STRICT (standalone math correct); three failing HF v5.5.0 UT nodes (T5/Qwen3/Gemma3 beam search) pass after the reroute; tiny-T5 NaN reproducer clean 3/3. |
 | 2026-08-18 | MTT S5000 (8 devices) | Native MUSA RNG, MThreads FlagGems hybrid, and MUPTI profiler | Added optional MUPTI activity tracing; the operator route cohort is unchanged. | `tests/integration/test_profiler_musa.py`: 1 passed with real positive-duration MUPTI kernel/runtime/memcpy activities and valid Chrome JSON. CPU-only Kineto resolver behavior remains environment-dependent; generic FlagGems operator coverage was not revalidated by this profiler change. |
 | 2026-08-18 | Ascend 910 (CANN 9.0) | Ascend AMP and dtype routes | Added generated AMP unscale and foreach list-add routes; fixed promotion-aware binary outputs, float64 copies, and CPU fallback for unsupported matmul/unary dtypes. | `test_amp.py`: 25 passed; `test_dtype_coverage.py`: 174 passed; targeted float64, promotion, and fallback parity probes passed. |
 | 2026-08-17 | MTT S5000 (8 devices) | Native MUSA RNG and MThreads FlagGems hybrid | Added shared per-device RNG reservations, muRAND/mudnn native RNG, shared stream compatibility, and seven non-overlapping FlagGems routes. | Native RNG: 7 passed; MUSA dispatch: 89 passed; routing/bridge units: 24 passed; real hybrid FlagGems: 2 passed, including selected reductions, duplicate-index `index_add`, and FlagGems `randn` mixed with native RNG. Vendor FlagTree wheel required; generic Triton 3.7.1 is not evidence. |

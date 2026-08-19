@@ -2415,6 +2415,17 @@ def main():
             # outputs; keep the operation on the CUDA boxing path until the
             # upstream FlagGems fix lands.
             "native_layer_norm_backward",
+            # The gems index_select triton launch is not stream-ordered against
+            # the flagos (PrivateUse1) stream that produced the index tensor.
+            # In HF cached beam search (DynamicCache.reorder_cache ->
+            # index_select(0, beam_idx)) the kernel can read a stale index
+            # entry, fail its indices < N validity mask, and leave the output
+            # column unwritten (recycled torch.empty bytes), poisoning the KV
+            # cache with garbage/NaN. The kernel math itself is correct
+            # standalone; the missing happens-before is in the flagos <->
+            # flag_gems launch integration. Keep on the CUDA boxing path until
+            # launches are ordered with the flagos current stream.
+            "index_select",
         }
 
         # backends_flaggems.conf: same cuda routes, but the auto-discovered
