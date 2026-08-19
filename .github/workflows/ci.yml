@@ -16,7 +16,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, devops, dev-hygon]
+    branches: ["2.9"]
     paths:
       - "cmake/**"
       - "csrc/**"
@@ -31,7 +31,7 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/**"
   pull_request:
-    branches: [main, dev, devops, dev-hygon]
+    branches: ["2.9"]
     paths:
       - "cmake/**"
       - "csrc/**"
