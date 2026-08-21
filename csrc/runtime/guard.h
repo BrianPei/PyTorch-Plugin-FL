@@ -8,7 +8,6 @@
 
 #include <c10/core/DeviceType.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
-#include <torch/version.h>
 
 #include <flagos.h>
 
@@ -265,15 +264,12 @@ struct GuardImpl final : public c10::impl::DeviceGuardImplInterface {
     return static_cast<c10::DeviceIndex>(count);
   }
 
-#if TORCH_VERSION_MAJOR > 2 || \
-    (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 10)
   c10::DeviceCapability getDeviceCapability(c10::Device d) const override {
     // Return a default device capability struct with all scalar types enabled
     // This is called by autograd profiler to determine device properties
     // The default constructor already enables all capabilities
     return c10::DeviceCapability();
   }
-#endif
 
   void record(
       void** event,

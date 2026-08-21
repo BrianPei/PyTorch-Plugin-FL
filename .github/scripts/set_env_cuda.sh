@@ -24,15 +24,8 @@ case "${CI_STAGE:-}" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.9.0}"
+CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
-# External libtorch_cuda.so is sourced from a version-matched cu130 wheel
-# (downloaded, NOT installed) so the CPU-only venv pairs with a 2.9.0 CUDA
-# build instead of the image's torch. See
-# docs/vendors/cuda/external-libtorch-cuda.md (constraint 3) and
-# .claude/skills/cuda-op-integration/SKILL.md Step 1.
-CUDA_TORCH_VERSION="${TORCH_FL_CUDA_TORCH_VERSION:-2.9.0}"
-CUDA_TORCH_INDEX_URL="${TORCH_FL_CUDA_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
 
 select_vendor_python() {
   local candidate="${TORCH_FL_VENDOR_PYTHON:-}"
@@ -97,12 +90,10 @@ for nvidia_lib in "$VENDOR_SITE"/nvidia/*/lib; do
   VENDOR_NVIDIA_LIBS="${VENDOR_NVIDIA_LIBS:+$VENDOR_NVIDIA_LIBS:}$nvidia_lib"
 done
 
-# The image's vendor torch (2.10.0+cu130) is reused only for the base
-# interpreter, nvidia runtime libs, and flag_gems/triton packages. Its torch
-# minor version no longer needs to match CPU_TORCH_VERSION, because the
-# matching libtorch_cuda.so is downloaded below from a 2.9.0+cu130 wheel.
-# Require only that the image's CUDA runtime is 13.0: the nvidia-* libs it
-# ships are cu130 and reusable across the 2.9-2.13 range.
+if [[ "$VENDOR_TORCH_BASE_VERSION" != "$CPU_TORCH_VERSION" ]]; then
+  echo "::error::Vendor torch is $VENDOR_TORCH_VERSION; expected $CPU_TORCH_VERSION"
+  exit 1
+fi
 if [[ "$VENDOR_CUDA_VERSION" != "13.0" ]]; then
   echo "::error::Vendor torch CUDA runtime is $VENDOR_CUDA_VERSION; expected 13.0"
   exit 1
@@ -135,52 +126,25 @@ if ! compgen -G "$VENDOR_FLAGGEMS_LIB/liboperators.so*" >/dev/null; then
   exit 1
 fi
 
-# Source accelerator-side PyTorch libraries from a version-matched cu130
-# wheel (downloaded, NOT installed) rather than the image's torch/lib, so
-# the CPU-only venv below pairs with a 2.9.0 libtorch_cuda.so. libc10.so,
-# libtorch.so, libtorch_cpu.so and libtorch_python.so still come from the
-# CPU wheel installed into the venv. setup.py copies these assets into
-# torch_fl/lib, and torch_fl preloads them before importing torch.
-# See docs/vendors/cuda/external-libtorch-cuda.md and
-# .claude/skills/cuda-op-integration/SKILL.md Step 1.
+# Copy only accelerator-side PyTorch libraries. libc10.so, libtorch.so,
+# libtorch_cpu.so and libtorch_python.so deliberately come from the upstream
+# CPU wheel installed below. setup.py copies these assets into torch_fl/lib,
+# and torch_fl preloads them before importing torch.
 CUDA_ASSETS_DIR="$REPO_ROOT/.libtorch_cuda_assets"
 rm -rf "$CUDA_ASSETS_DIR"
 mkdir -p "$CUDA_ASSETS_DIR"
-
-CUDA_WHEEL_DIR="$(mktemp -d)"
-echo "::group::Download torch==${CUDA_TORCH_VERSION}+cu130 (external libtorch_cuda.so)"
-"$VENDOR_PYTHON" -m pip download "torch==${CUDA_TORCH_VERSION}+cu130" \
-  --index-url "$CUDA_TORCH_INDEX_URL" --no-deps -d "$CUDA_WHEEL_DIR"
-echo "::endgroup::"
-CUDA_WHEEL="$(compgen -G "$CUDA_WHEEL_DIR/torch-${CUDA_TORCH_VERSION}+cu130-*.whl" | head -1)"
-if [[ -z "$CUDA_WHEEL" ]]; then
-  echo "::error::Expected wheel torch-${CUDA_TORCH_VERSION}+cu130-*.whl not found in $CUDA_WHEEL_DIR"
-  ls -la "$CUDA_WHEEL_DIR"
-  exit 1
-fi
-"$VENDOR_PYTHON" - "$CUDA_WHEEL" "$CUDA_ASSETS_DIR" <<'PY'
-import shutil, sys, zipfile
-from pathlib import Path
-
-wheel, out = Path(sys.argv[1]), Path(sys.argv[2])
-S_IFLNK = 0xA000
-with zipfile.ZipFile(wheel) as z:
-    for info in z.infolist():
-        if not info.filename.startswith("torch/lib/"):
-            continue
-        name = info.filename[len("torch/lib/"):]
-        if not name or name.endswith("/"):
-            continue
-        target = out / name
-        if target.exists() or target.is_symlink():
-            target.unlink()
-        if (info.external_attr >> 16) & S_IFLNK:
-            target.symlink_to(z.read(info).decode())
-        else:
-            with z.open(info) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-PY
-rm -rf "$CUDA_WHEEL_DIR"
+shopt -s nullglob
+for pattern in \
+  'libc10_cuda.so*' \
+  'libtorch_cuda.so*' \
+  'libtorch_cuda_linalg.so*' \
+  'libtorch_nvshmem.so*' \
+  'libcaffe2_nvrtc.so*'; do
+  for source in "$VENDOR_TORCH_LIB"/$pattern; do
+    cp -a "$source" "$CUDA_ASSETS_DIR/"
+  done
+done
+shopt -u nullglob
 
 # The CUDA dispatcher library is the only mandatory accelerator asset. Some
 # vendor Torch layouts (including cu130 images) do not ship a standalone
@@ -188,7 +152,7 @@ rm -rf "$CUDA_WHEEL_DIR"
 # present. Keep the check layout-agnostic instead of requiring a fixed set of
 # files on every CUDA image.
 if [[ ! -e "$CUDA_ASSETS_DIR/libtorch_cuda.so" ]]; then
-  echo "::error::Required CUDA asset was not found: $CUDA_ASSETS_DIR/libtorch_cuda.so"
+  echo "::error::Required CUDA asset was not found: $VENDOR_TORCH_LIB/libtorch_cuda.so"
   exit 1
 fi
 if [[ ! -e "$CUDA_ASSETS_DIR/libc10_cuda.so" ]]; then
@@ -237,7 +201,7 @@ from pathlib import Path
 import torch
 
 print(Path(torch.__file__).resolve().parent)
-assert torch.__version__.split("+", 1)[0] == "2.9.0", torch.__version__
+assert torch.__version__.split("+", 1)[0] == "2.10.0", torch.__version__
 assert torch.version.cuda is None, torch.version.cuda
 PY
 )"
@@ -301,7 +265,7 @@ import torch
 
 torch_path = Path(torch.__file__).resolve()
 assert sys.executable.startswith("/"), sys.executable
-assert torch.__version__.split("+", 1)[0] == "2.9.0", torch.__version__
+assert torch.__version__.split("+", 1)[0] == "2.10.0", torch.__version__
 assert torch.version.cuda is None, torch.version.cuda
 assert "/opt/conda/" not in str(torch_path), torch_path
 assert Path(".libtorch_cuda_assets/libtorch_cuda.so").is_file()
