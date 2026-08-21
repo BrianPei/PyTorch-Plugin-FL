@@ -171,6 +171,7 @@ with zipfile.ZipFile(wheel) as z:
         if not name or name.endswith("/"):
             continue
         target = out / name
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() or target.is_symlink():
             target.unlink()
         # external_attr high 16 bits hold the Unix st_mode. S_ISLNK
