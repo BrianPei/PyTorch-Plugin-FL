@@ -159,11 +159,10 @@ if [[ -z "$CUDA_WHEEL" ]]; then
   exit 1
 fi
 "$VENDOR_PYTHON" - "$CUDA_WHEEL" "$CUDA_ASSETS_DIR" <<'PY'
-import shutil, sys, zipfile
+import shutil, stat, sys, zipfile
 from pathlib import Path
 
 wheel, out = Path(sys.argv[1]), Path(sys.argv[2])
-S_IFLNK = 0xA000
 with zipfile.ZipFile(wheel) as z:
     for info in z.infolist():
         if not info.filename.startswith("torch/lib/"):
@@ -174,7 +173,12 @@ with zipfile.ZipFile(wheel) as z:
         target = out / name
         if target.exists() or target.is_symlink():
             target.unlink()
-        if (info.external_attr >> 16) & S_IFLNK:
+        # external_attr high 16 bits hold the Unix st_mode. S_ISLNK
+        # (mode & 0o170000 == 0o120000) distinguishes symlinks from the
+        # regular .so files that share the S_IFLNK bit under a naive
+        # mask -- that misclassifies every .so as a symlink and then
+        # utf-8-decodes binary contents, crashing with 0xd9.
+        if stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF):
             target.symlink_to(z.read(info).decode())
         else:
             with z.open(info) as src, open(target, "wb") as dst:
