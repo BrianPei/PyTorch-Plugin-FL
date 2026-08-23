@@ -244,6 +244,14 @@ done
 export LD_LIBRARY_PATH="$_vl"
 unset _vl _paths _p
 
+# torch 2.9 auto-loads registered device backend extensions at import time
+# (_import_device_backends). flagcx registers one, but flagcx._C is built
+# against the vendor's full torch and needs libc10_cuda.so, which the CPU-only
+# venv does not ship and the stripped LD_LIBRARY_PATH no longer provides. The
+# probe and the CPU_TORCH_ROOT block only verify the CPU torch version -- they
+# must not autoload any device backend. Disable it for the whole CI run.
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
 echo "::group::PROBE: import torch BEFORE copying vendor packages"
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 "$VENV_PYTHON" -c "import torch; print('pre-cp OK', torch.__version__, torch.__file__)" || echo "pre-cp FAILED (see traceback above)"
@@ -390,7 +398,8 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
     FLAGOS_CUDA_ASSETS_DIR FLAGGEMS_DIR FLAGCX_PATH \
-    CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH; do
+    CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH \
+    TORCH_DEVICE_BACKEND_AUTOLOAD; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
