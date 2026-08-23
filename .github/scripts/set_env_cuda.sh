@@ -223,11 +223,29 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install pytest transformers
 fi
 
-# PROBE: import torch before copying any vendor packages. If this succeeds but
-# the post-copy import (CPU_TORCH_ROOT block below) fails, the cp step is what
-# introduces the AttributeError on sym_node.DynamicInt. Printed to the CI log so
-# a single run settles whether the vendor-package copy is the culprit.
+# The container image exports LD_LIBRARY_PATH pointing at the vendor (torch
+# 2.10) torch/lib. With it present, the 2.9 torch/_C*.so (which uses RUNPATH
+# $ORIGIN/lib) loads the 2.10 libtorch_python.so instead -- LD_LIBRARY_PATH
+# takes precedence over RUNPATH. The 2.10 C-side torch.device implementation
+# then looks up sym_node.DynamicInt, which the 2.9 sym_node.py does not define,
+# crashing import with AttributeError. strip_vendor_paths (defined below) does
+# this same stripping at line ~287, but only AFTER the crash. Do it here,
+# before any venv torch import, so the probe and the CPU_TORCH_ROOT block both
+# run against a clean library path.
+_vl=""
+IFS=: read -ra _paths <<< "${LD_LIBRARY_PATH:-}"
+for _p in "${_paths[@]}"; do
+  [[ -z "$_p" ]] && continue
+  case "$_p" in
+    "$VENDOR_TORCH_ROOT"|"$VENDOR_TORCH_ROOT"/*) ;;   # drop vendor 2.10 torch lib paths
+    *) _vl="${_vl:+$_vl:}$_p" ;;
+  esac
+done
+export LD_LIBRARY_PATH="$_vl"
+unset _vl _paths _p
+
 echo "::group::PROBE: import torch BEFORE copying vendor packages"
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 "$VENV_PYTHON" -c "import torch; print('pre-cp OK', torch.__version__, torch.__file__)" || echo "pre-cp FAILED (see traceback above)"
 echo "::endgroup::"
 
