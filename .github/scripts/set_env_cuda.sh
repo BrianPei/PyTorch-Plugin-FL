@@ -302,7 +302,48 @@ nvidia-smi
 python - <<'PY'
 from pathlib import Path
 import sys
-import torch
+
+# DynamicInt is a torch-2.10 API (PR #162194 landed after the v2.9.0 tag).
+# A 2.9.0 torch package must not reference it. If `import torch` fails with
+# AttributeError on sym_node.DynamicInt, the executing torch package is NOT
+# the 2.9.0+cpu wheel installed into the venv -- either PATH resolved `python`
+# to the vendor interpreter, or the venv torch package is mixed with 2.10
+# files. Print the ground truth before re-raising so one CI run pinpoints it.
+try:
+    import torch
+except Exception:
+    import importlib.util
+    import traceback
+
+    spec = importlib.util.find_spec("torch")
+    torch_dir = (
+        Path(spec.origin).resolve().parent if spec and spec.origin else None
+    )
+    print("=== import torch FAILED (diagnostics) ===", flush=True)
+    print(f"sys.executable: {sys.executable}", flush=True)
+    print(f"torch dir: {torch_dir}", flush=True)
+    if torch_dir is not None:
+        vf = torch_dir / "version.py"
+        print(
+            f"version.py: "
+            f"{vf.read_text(errors='replace').strip() if vf.is_file() else '(missing)'}",
+            flush=True,
+        )
+        sn = torch_dir / "fx" / "experimental" / "sym_node.py"
+        sn_txt = sn.read_text(errors="replace") if sn.is_file() else ""
+        print(
+            f"sym_node.py defines DynamicInt: "
+            f"{'class DynamicInt' in sn_txt}",
+            flush=True,
+        )
+        ft = torch_dir / "_subclasses" / "functional_tensor.py"
+        if ft.is_file():
+            ls = ft.read_text(errors="replace").splitlines()
+            print("functional_tensor.py lines 274-284:", flush=True)
+            for i in range(273, min(284, len(ls))):
+                print(f"  {i + 1}: {ls[i]}", flush=True)
+    traceback.print_exc()
+    raise
 
 torch_path = Path(torch.__file__).resolve()
 assert sys.executable.startswith("/"), sys.executable
