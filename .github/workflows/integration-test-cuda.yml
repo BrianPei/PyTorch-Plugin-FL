@@ -14,6 +14,11 @@
 
 name: Integration Tests (CUDA)
 
+# The CUDA line builds its own native torch-2.9 ABI image from
+# docker/cuda/Dockerfile (no pre-built vendor image), then runs the
+# integration suite inside it. See .github/scripts/set_env_cuda.sh for why
+# the fix_2.9_watch hack is retired.
+
 on:
   workflow_call:
     inputs:
@@ -29,15 +34,71 @@ on:
         required: false
         type: number
         default: 60
+  push:
+    branches:
+      - build_cuda_docker
+      - "2.9"
+    paths:
+      - "docker/**"
+      - ".github/scripts/set_env_cuda.sh"
+      - ".github/workflows/integration-test-cuda.yml"
+      - "cmake/**"
+      - "csrc/**"
+      - "include/**"
+      - "tests/**"
+      - "torch_fl/**"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "setup.py"
+  pull_request:
+    branches:
+      - "2.9"
+    paths:
+      - "docker/**"
+      - ".github/scripts/set_env_cuda.sh"
+      - ".github/workflows/integration-test-cuda.yml"
+      - "cmake/**"
+      - "csrc/**"
+      - "include/**"
+      - "tests/**"
+      - "torch_fl/**"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "setup.py"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  build-image:
+    name: Build CUDA image (torch 2.9)
+    runs-on:
+      - torch-fl-nv
+    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the native torch-2.9 ABI image. BuildKit reuses layer cache in
+      # the runner's docker daemon, so subsequent runs skip the slow
+      # torch/FlagGems/FlagCX layers unless the Dockerfile or ARGs change.
+      - name: Build CUDA base image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            -t torch-fl/cuda-2.9:ci \
+            -f docker/cuda/Dockerfile \
+            .
+
   integration-tests:
     name: Build and test (CUDA)
+    needs: build-image
     runs-on:
       - torch-fl-nv
     timeout-minutes: ${{ inputs['timeout-minutes'] }}
     container:
-      image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl@sha256:8f6aec7fbd4b56c8d925169029462a09a0a58758fde0576b1509b2eed7627e25
+      image: torch-fl/cuda-2.9:ci
       volumes:
         - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
       options: >-
@@ -74,5 +135,5 @@ jobs:
         env:
           INTEGRATION_ENVIRONMENT: '{"MODEL_PATH":"/models/Qwen3-0.6B"}'
           INTEGRATION_TESTS: >-
-            [{"name":"Check model availability","command":"test -d \"$MODEL_PATH\""},{"name":"Check device availability","command":"python - <<'PY'\nfrom pathlib import Path\n\nimport torch_fl\nimport torch\n\ntorch_path = Path(torch.__file__).resolve()\npackage_lib = Path(torch_fl.__file__).resolve().parent / \"lib\"\n\nassert torch.__version__.startswith(\"2.9.0+cpu\"), torch.__version__\nassert torch.version.cuda is None, torch.version.cuda\nassert \"/opt/conda/\" not in str(torch_path), torch_path\nassert (package_lib / \"libtorch_cuda.so\").is_file(), package_lib\nassert torch_fl.flagos.is_available(), \"flagos device is unavailable\"\nprint(f\"CPU PyTorch: {torch.__version__}\")\nprint(f\"torch path: {torch_path}\")\nprint(f\"CUDA assets: {package_lib}\")\nprint(f\"flagos devices: {torch_fl.flagos.device_count()}\")\nPY\n"},{"name":"Run operator tests (vendor backend, main ops)","command":"python -m pytest tests/integration/ops/ -m \"main_ops and not flaggems_python and not flaggems_cpp\" -v -s --tb=short"},{"name":"Run operator tests (FlagGems runtime path, main ops)","command":"FLAGOS_USE_FLAGGEMS=1 python -m pytest tests/integration/ops/ -m \"flaggems and main_ops\" -v -s --tb=short"},{"name":"Run general tests","command":"python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short"},{"name":"Profiler parity test","command":"python -m pytest tests/integration/test_profiler_parity.py -v -m main_ops --tb=short"},{"name":"Run inference tests","command":"python -m pytest tests/integration/test_qwen3_infer.py --model \"$MODEL_PATH\" -v -s --tb=short"},{"name":"Run training tests","command":"python -m pytest tests/integration/test_qwen3_train.py --model \"$MODEL_PATH\" -v -s --tb=short"}]
+            [{"name":"Check model availability","command":"test -d \"$MODEL_PATH\""},{"name":"Check device availability","command":"python - <<'PY'\nfrom pathlib import Path\n\nimport torch\nimport torch_fl\n\ntorch_path = Path(torch.__file__).resolve()\ntorch_lib = torch_path.parent / \"lib\"\n\nassert torch.__version__.startswith(\"2.9.0+cu130\"), torch.__version__\nassert torch.version.cuda == \"13.0\", torch.version.cuda\nassert \"/opt/conda/\" not in str(torch_path), torch_path\nassert (torch_lib / \"libtorch_cuda.so\").is_file(), torch_lib\nassert torch_fl.flagos.is_available(), \"flagos device is unavailable\"\nprint(f\"GPU PyTorch: {torch.__version__}\")\nprint(f\"torch path: {torch_path}\")\nprint(f\"torch lib: {torch_lib}\")\nprint(f\"flagos devices: {torch_fl.flagos.device_count()}\")\nPY\n"},{"name":"Run operator tests (vendor backend, main ops)","command":"python -m pytest tests/integration/ops/ -m \"main_ops and not flaggems_python and not flaggems_cpp\" -v -s --tb=short"},{"name":"Run operator tests (FlagGems runtime path, main ops)","command":"FLAGOS_USE_FLAGGEMS=1 python -m pytest tests/integration/ops/ -m \"flaggems and main_ops\" -v -s --tb=short"},{"name":"Run general tests","command":"python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short"},{"name":"Profiler parity test","command":"python -m pytest tests/integration/test_profiler_parity.py -v -m main_ops --tb=short"},{"name":"Run inference tests","command":"python -m pytest tests/integration/test_qwen3_infer.py --model \"$MODEL_PATH\" -v -s --tb=short"},{"name":"Run training tests","command":"python -m pytest tests/integration/test_qwen3_train.py --model \"$MODEL_PATH\" -v -s --tb=short"}]
         run: python .github/scripts/run_integration_tests.py
