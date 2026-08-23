@@ -223,6 +223,14 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install pytest transformers
 fi
 
+# PROBE: import torch before copying any vendor packages. If this succeeds but
+# the post-copy import (CPU_TORCH_ROOT block below) fails, the cp step is what
+# introduces the AttributeError on sym_node.DynamicInt. Printed to the CI log so
+# a single run settles whether the vendor-package copy is the culprit.
+echo "::group::PROBE: import torch BEFORE copying vendor packages"
+"$VENV_PYTHON" -c "import torch; print('pre-cp OK', torch.__version__, torch.__file__)" || echo "pre-cp FAILED (see traceback above)"
+echo "::endgroup::"
+
 # Keep the vendor FlagGems/FlagCX Python packages available without copying the
 # vendor torch package. They are pure-Python/extension packages used by the
 # CUDA runtime path; the active torch package remains the CPU wheel below.
