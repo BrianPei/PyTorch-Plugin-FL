@@ -252,6 +252,17 @@ unset _vl _paths _p
 # must not autoload any device backend. Disable it for the whole CI run.
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
+# The vendor image's FlagGems C++ extensions (liboperators.so, libtriton_jit.so)
+# are compiled against the vendor torch (2.10). csrc/CMakeLists.txt defaults
+# FLAGGEMS_KERNEL=ON, which links FlagGems::operators into libtorch_fl.so and
+# pulls libtriton_jit.so, whose c10::MessageLogger::stream symbol is absent from
+# the 2.9 libc10.so preloaded above -> undefined symbol at import torch_fl._C.
+# Every non-CUDA accelerator branch passes -DFLAGGEMS_KERNEL=OFF; CUDA omitted
+# it only because the 2.10 baseline shared the vendor's ABI. Under the 2.9
+# CPU-venv + external libtorch_cuda scheme the C++ FlagGems path is unusable,
+# so force it off and rely on FLAGGEMS_PYTHON (CMake default ON) instead.
+export FLAGGEMS_KERNEL=0
+
 echo "::group::PROBE: import torch BEFORE copying vendor packages"
 echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
 "$VENV_PYTHON" -c "import torch; print('pre-cp OK', torch.__version__, torch.__file__)" || echo "pre-cp FAILED (see traceback above)"
@@ -399,7 +410,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
     FLAGOS_CUDA_ASSETS_DIR FLAGGEMS_DIR FLAGCX_PATH \
     CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH \
-    TORCH_DEVICE_BACKEND_AUTOLOAD; do
+    TORCH_DEVICE_BACKEND_AUTOLOAD FLAGGEMS_KERNEL; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
