@@ -295,6 +295,15 @@ class TestRngSeedSource:
             torch.manual_seed(SEED)
         assert not [w for w in caught if "does not take effect" in str(w.message)]
 
+    @pytest.mark.skipif(
+        torch.__version__.startswith("2.9"),
+        reason=(
+            "torch 2.9 lacks the native generator device-mismatch check added"
+            " in 2.10; a flagos generator on a boxed-to-CUDA tensor"
+            " infinite-redispaches to SIGSEGV instead of raising RuntimeError."
+            " Tracked as a 2.9-downgrade follow-up."
+        ),
+    )
     @pytest.mark.anyplatform
     @pytest.mark.main_ops
     def test_flagos_generator_device_mismatch_raises(self):
@@ -307,6 +316,13 @@ class TestRngSeedSource:
         with pytest.raises(RuntimeError, match="device type for generator"):
             _empty(8).normal_(generator=gen)
 
+    @pytest.mark.skipif(
+        torch.__version__.startswith("2.9"),
+        reason=(
+            "torch 2.9 lacks the native generator device-mismatch check added"
+            " in 2.10 (see test_flagos_generator_device_mismatch_raises)."
+        ),
+    )
     @pytest.mark.anyplatform
     @pytest.mark.main_ops
     def test_flagos_generator_factory_mismatch_raises(self):
