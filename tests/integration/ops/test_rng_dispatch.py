@@ -335,6 +335,13 @@ class TestRngSeedSource:
         with pytest.raises(RuntimeError, match="device type for generator"):
             torch.rand(8, device=DEVICE, generator=gen)
 
+    @pytest.mark.skipif(
+        torch.__version__.startswith("2.9"),
+        reason=(
+            "torch 2.9 lacks the native generator device-mismatch check added"
+            " in 2.10 (see test_flagos_generator_device_mismatch_raises)."
+        ),
+    )
     @pytest.mark.anyplatform
     @pytest.mark.main_ops
     def test_flagos_generator_does_not_reroute_cpu_op(self):
