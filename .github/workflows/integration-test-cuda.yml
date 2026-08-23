@@ -75,7 +75,8 @@ jobs:
     name: Build CUDA image (torch 2.9)
     runs-on:
       - torch-fl-nv
-    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    # inputs is empty on push/pull_request events; fall back to 60 there.
+    timeout-minutes: ${{ inputs.timeout-minutes || 60 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +97,7 @@ jobs:
     needs: build-image
     runs-on:
       - torch-fl-nv
-    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    timeout-minutes: ${{ inputs.timeout-minutes || 60 }}
     container:
       image: torch-fl/cuda-2.9:ci
       volumes:
