@@ -64,6 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates ccache curl git \
       libibverbs-dev libnuma-dev librdmacm-dev pkg-config \
       python3 python3-dev python3-pip python3-venv \
+    && git config --global http.version HTTP/1.1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /opt/venv \
@@ -87,6 +88,7 @@ RUN pip install --no-cache-dir \
 RUN CMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
     CMAKE_ARGS="-DFLAGGEMS_BUILD_C_EXTENSIONS=ON -DFLAGGEMS_BACKEND=CUDA" \
     pip install --no-cache-dir \
+      --index-url "${PYPI_INDEX_URL}" \
       "git+https://github.com/flagos-ai/FlagGems.git@${FLAGGEMS_REF}"
 
 # Build FlagCX with the NVIDIA adaptor against the active torch/CUDA env.
@@ -94,7 +96,10 @@ RUN git clone --depth 1 --branch "${FLAGCX_REF}" \
       https://github.com/flagos-ai/FlagCX.git /opt/FlagCX \
  && git -C /opt/FlagCX submodule update --init --recursive \
  && FLAGCX_ADAPTOR=nvidia \
-    pip install --no-cache-dir --no-build-isolation /opt/FlagCX
+    pip install --no-cache-dir \
+      --no-build-isolation \
+      --index-url "${PYPI_INDEX_URL}" \
+      /opt/FlagCX
 
 RUN pip install --no-cache-dir \
       --index-url "${PYPI_INDEX_URL}" \
