@@ -29,6 +29,7 @@
 
 ARG BASE_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu22.04
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG TORCH_VERSION=2.9.0
 ARG TORCH_CUDA_TAG=cu130
 ARG CUDA_VERSION=13.0
@@ -38,6 +39,7 @@ ARG FLAGCX_REF=v0.13.0
 FROM ${BASE_IMAGE}
 
 ARG TORCH_INDEX_URL
+ARG PYPI_INDEX_URL
 ARG TORCH_VERSION
 ARG TORCH_CUDA_TAG
 ARG CUDA_VERSION
@@ -66,6 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv \
  && pip install --no-cache-dir --upgrade \
+      --index-url "${PYPI_INDEX_URL}" \
       pip setuptools wheel cmake ninja \
       scikit-build-core pybind11
 
@@ -93,7 +96,9 @@ RUN git clone --depth 1 --branch "${FLAGCX_REF}" \
  && FLAGCX_ADAPTOR=nvidia \
     pip install --no-cache-dir --no-build-isolation /opt/FlagCX
 
-RUN pip install --no-cache-dir build pytest transformers
+RUN pip install --no-cache-dir \
+      --index-url "${PYPI_INDEX_URL}" \
+      build pytest transformers
 
 COPY docker/cuda/verify.py /tmp/verify.py
 RUN VERIFY_TORCH_VERSION="${TORCH_VERSION}" \
