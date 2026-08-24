@@ -212,11 +212,14 @@ fi
 # patchelf is missing by default on PPU nodes (bundle_common.sh notes it is
 # absent on all four vendor nodes). Install it into the venv so bundle_ppu's
 # bundle_require_patchelf check passes; mirrors the DCU line (commit 6568415).
-# Do not --upgrade pip/setuptools/wheel: the fresh venv from ensurepip already
+# Do not --upgrade pip/setuptools: the fresh venv from ensurepip already
 # satisfies them, and that upgrade round-trip is what hit the pod proxy 500.
-# Install only what the venv lacks: cmake, patchelf, and build (the dedicated
-# workflow runs `python -m build`, which needs the build package in the venv).
-"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" cmake patchelf build
+# Install only what the venv lacks: cmake, patchelf, build (the dedicated
+# workflow runs `python -m build`, which needs the build package in the venv),
+# and wheel (the setuptools wheel-build backend used by `python -m build
+# --wheel --no-isolation` requires it; ensurepip on this image does not
+# provide it).
+"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" cmake patchelf build wheel
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
