@@ -19,7 +19,7 @@ setup_script: .github/scripts/set_env_ppu.sh
 ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260811-ppu-dev
 
 runner_labels:
-  - pt-8g-cicd-pytorch
+  - flagcicd-810e
 
 container_volumes:
   # PPU_SDK (underscore, /usr/local/PPU_SDK) is baked into the image with
