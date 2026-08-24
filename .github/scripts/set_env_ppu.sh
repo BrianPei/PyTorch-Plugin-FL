@@ -224,7 +224,12 @@ fi
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
 if [[ "$CI_STAGE" == "integration" ]]; then
-  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest transformers
+  # sentencepiece + tiktoken: the Qwen3 inference/training tests load the model
+  # tokenizer via AutoTokenizer; the bundled model dir has no tokenizer.json, so
+  # transformers converts the slow tokenizer to a fast one, which needs one of
+  # these two. The isolated venv cannot see the vendor image's copies.
+  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" \
+    pytest transformers sentencepiece tiktoken
   # flag_gems runtime path (step 4) imports from the mounted source via the
   # _flag_gems_mounted_source.pth above. The CI image lacks flag_gems' pure
   # Python deps (sqlalchemy/PyYAML/packaging -- not in the image site-packages,
