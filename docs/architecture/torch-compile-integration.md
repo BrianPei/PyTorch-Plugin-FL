@@ -145,6 +145,62 @@ the upstream driver no longer initializes CUDA in a worker. An explicit
 `TORCHINDUCTOR_COMPILE_THREADS` value or `compile_threads` compile option remains
 authoritative.
 
+#### MUSA / MThreads FlagTree
+
+MUSA uses the vendor FlagTree runtime (`flagtree-0.5.0+mthreads3.1`, Triton 3.1)
+and its `mthreads` Python backend. The compiler emits a `musa` target. A stock
+Triton wheel only provides `nvidia`/`amd` backends and cannot compile MUSA
+kernels.
+
+FlagTree talks to `torch_fl` directly; the separate `torch_musa` plugin is not
+required and its `__init__` is never imported. The vendor MThreads driver reads
+four runtime facts from `torch_musa` — device availability (which is what makes
+Triton select the backend at all), current device, compute capability, and the
+raw `musaStream_t`. Running that plugin's `__init__` in this process is not an
+option, because it claims the process-global PrivateUse1 hooks that `torch_fl`
+must own. So
+[`torch_fl/compile/flagtree_shim.py`](../../torch_fl/compile/flagtree_shim.py)
+answers those four questions from `torch_fl`'s own MUSA runtime and rebinds them
+onto the vendor driver class before the first driver instance exists. The
+consequence that matters: compiled kernels are submitted to the same stream the
+native mudnn kernels use, so a compiled graph is ordered against eager MUSA work
+without an explicit synchronize between them.
+
+The binding must happen before Triton instantiates its driver, since the driver's
+`__init__` copies these attributes onto the instance. `flagos_compile_backend`
+therefore binds at module load and again per compile, both idempotently.
+`tests/integration/test_compile.py::test_musa_flagtree_binds_to_torch_fl_runtime`
+asserts the binding took effect by checking that every rebound driver callable
+resolves inside `torch_fl`. That, rather than `torch_musa` being absent from
+`sys.modules`, is the property worth pinning: the driver would also "work"
+against some other runtime, and `torch_fl` itself publishes a small
+compatibility surface under that module name when FlagGems is enabled (see
+`_install_musa_flaggems_compat`).
+
+MThreads FlagTree currently queries the MUSA runtime while compiling. The flagos
+backend therefore defaults this path to one Inductor compile thread, preserving
+an explicit `TORCHINDUCTOR_COMPILE_THREADS` or `compile_threads` setting. This
+serialization is a safety workaround for the vendor driver, not a performance
+claim; remove it only after the relevant FlagTree driver is verified fork-safe.
+
+On the measured MTT S5000 setup, validation requires the vendor FlagTree runtime,
+`ACCELERATOR=musa`, and `FLAGOS_USE_FLAGTREE=1`. The generic Triton 3.7.1 runtime
+is not MThreads execution evidence.
+
+Example environment:
+
+```bash
+PYTHONPATH=/path/to/flagtree-mthreads-runtime:$PWD \
+LD_LIBRARY_PATH=/path/to/flagtree-mthreads-runtime/triton/_C:/usr/local/musa/lib:$LD_LIBRARY_PATH \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 ACCELERATOR=musa FLAGOS_USE_FLAGTREE=1 \
+pytest tests/integration/test_compile.py -v
+```
+
+The focused FlagTree test must compare compiled output with eager output and
+assert that outputs and gradients remain on `flagos`; CPU-only tests can cover
+registration and vendor target selection but do not establish MUSA compiler
+support.
+
 ## Architecture
 
 ### Phase 1: Inductor Integration

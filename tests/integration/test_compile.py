@@ -19,6 +19,7 @@ Tests basic compilation, fusion gains, and FlagTree detection.
 """
 
 import os
+import sys
 
 import pytest
 import torch_fl
@@ -46,11 +47,14 @@ def assert_on_flagos(tensor, what="output"):
 
     A cuda round trip would both cost a copy per call and produce stream-less
     autograd nodes (see torch_fl/compile/inductor_backend.py), so this is a
-    load-bearing assertion, not a smoke check.
+    load-bearing assertion, not a smoke check. Native MUSA kernels are
+    asynchronous, so drain the shared default stream before comparing results.
     """
     assert tensor.device.type in FLAGOS_DEVICE_TYPES, (
         f"{what} landed on {tensor.device}, expected flagos"
     )
+    if tensor.device.type in FLAGOS_DEVICE_TYPES and torch_fl.flagos.is_available():
+        torch_fl.flagos.synchronize()
 
 
 @pytest.fixture
@@ -196,11 +200,18 @@ def test_inductor_benchmark_accepts_triton_backend_name():
     if device_type == "cuda":
         pytest.skip("triton backend name is already a valid torch device type")
 
-    # The name inductor would hand over is not a torch device on its own ...
-    with pytest.raises(RuntimeError, match="device type at start of device string"):
-        torch.device(device_type)
+    # The name inductor would hand over is normally not a torch device at all
+    # (``maca``). On native MUSA it happens to parse, because torch_fl's
+    # FLAGOS_ALIAS_CUDA mode deliberately aliases the ``musa`` spelling onto
+    # flagos -- so only assert the rejection where the name is not an alias.
+    try:
+        aliased_to = torch.device(device_type)
+    except RuntimeError as exc:
+        assert "device type at start of device string" in str(exc)
+    else:
+        assert aliased_to.type == torch._C._get_privateuse1_backend_name()
 
-    # ... so benchmark() must translate it rather than pass it through.
+    # Either way, benchmark() must translate the name rather than pass it through.
     assert benchmarking.Benchmarker.benchmark._flagos_patched
 
     recorded = {}
@@ -394,6 +405,36 @@ def test_non_ppu_flagtree_keeps_default_compile_threads(monkeypatch):
     assert "compile_threads" not in patches
 
 
+def test_musa_flagtree_defaults_to_serial_compile(monkeypatch):
+    """MThreads FlagTree must not initialize MUSA in a forked worker."""
+    from torch_fl.compile import inductor_backend
+
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    monkeypatch.setattr(
+        "torch_fl.compile.flagtree_shim.flagtree_backend", lambda: "mthreads"
+    )
+    monkeypatch.setattr("torch_fl._build_config.ACCELERATOR", "musa")
+
+    patches = {}
+    inductor_backend._patch_vendor_flagtree_compile_workers(patches)
+
+    assert patches["compile_threads"] == 1
+
+
+def test_musa_flagtree_preserves_explicit_compile_threads(monkeypatch):
+    """MUSA callers can override vendor serialization when they need to."""
+    from torch_fl.compile import inductor_backend
+
+    monkeypatch.setattr(
+        "torch_fl.compile.flagtree_shim.flagtree_backend", lambda: "mthreads"
+    )
+    monkeypatch.setattr("torch_fl._build_config.ACCELERATOR", "musa")
+
+    patches = {"compile_threads": 4}
+    inductor_backend._patch_vendor_flagtree_compile_workers(patches)
+    assert patches["compile_threads"] == 4
+
+
 def test_flagtree_is_never_importable_as_flagtree():
     """Guard the packaging trap: the wheel is 'flagtree', the module is 'triton'.
 
@@ -410,10 +451,7 @@ def test_flagtree_is_never_importable_as_flagtree():
     reason="FlagTree compilation not requested (set FLAGOS_USE_FLAGTREE=1)",
 )
 def test_flagtree_compiles_correct_results(device):
-    """Compiling through FlagTree must match eager.
-
-    Requires a FlagTree-built env; see docs/architecture/torch-compile-integration.md.
-    """
+    """Compile the basic model through the active vendor FlagTree runtime."""
     from torch_fl.compile.flagtree_shim import is_flagtree_active
 
     if not is_flagtree_active():
@@ -430,25 +468,116 @@ def test_flagtree_compiles_correct_results(device):
     torch.testing.assert_close(output, eager_output, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.musa
+def test_musa_flagtree_binds_to_torch_fl_runtime():
+    """FlagTree must reach MUSA through torch_fl, never through torch_musa.
+
+    The torch_musa plugin cannot coexist with torch_fl: its ``__init__`` claims
+    the process-global PrivateUse1 hooks torch_fl must own. The vendor MThreads
+    driver nevertheless reads its device/stream/capability from ``torch_musa``,
+    so torch_fl rebinds those lookups onto its own runtime. This asserts the
+    binding rather than the absence of a crash -- a driver reading from some
+    other runtime would still compile, just not against the device that owns the
+    tensors.
+    """
+    from torch_fl._build_config import ACCELERATOR
+    from torch_fl.compile import flagtree_shim
+
+    if ACCELERATOR != "musa":
+        pytest.skip("MUSA build required")
+    if (
+        not flagtree_shim.is_flagtree_active()
+        or flagtree_shim.flagtree_backend() != "mthreads"
+    ):
+        pytest.skip("MThreads FlagTree runtime required")
+
+    assert flagtree_shim.bind_flagtree_musa_driver()
+
+    # The driver's own target resolution now runs entirely through torch_fl.
+    target = flagtree_shim.flagtree_musa_driver_target()
+    assert target is not None
+    backend, capability, warp_size = target
+    major, minor = flagtree_shim.get_musa_device_capability()
+    assert backend == "musa"
+    assert capability == major * 10 + minor
+    assert warp_size == (32 if major > 2 else 128)
+
+    # The compiled kernels launch on the same stream the mudnn kernels use, so
+    # this handle must be torch_fl's, and it must be a real stream.
+    raw_stream = flagtree_shim.get_musa_current_raw_stream()
+    assert raw_stream == torch_fl.flagos.current_stream().musa_stream
+    assert raw_stream != 0
+
+    # Every lookup the driver now performs resolves inside torch_fl. Asserted on
+    # the module of the bound callables rather than on ``torch_musa`` being
+    # absent from sys.modules: FlagGems discovery legitimately publishes a small
+    # compatibility surface under that name (_install_musa_flaggems_compat), and
+    # this test must hold whether or not FlagGems is enabled.
+    from triton.backends import backends as triton_backends
+
+    driver_cls = triton_backends["mthreads"].driver
+    for attr in (
+        "is_active",
+        "_get_device_capability",
+        "_get_current_stream",
+        "_get_current_device",
+        "_set_current_device",
+    ):
+        func = getattr(driver_cls, attr)
+        assert func.__module__.startswith("torch_fl"), (attr, func)
+
+
+@pytest.mark.musa
+def test_musa_flagtree_compiles_forward_backward(device):
+    """The MThreads FlagTree path must preserve native MUSA autograd."""
+    from torch_fl._build_config import ACCELERATOR
+    from torch_fl.compile.flagtree_shim import flagtree_backend, is_flagtree_active
+
+    if ACCELERATOR != "musa":
+        pytest.skip("MUSA build required")
+    if not is_flagtree_active() or flagtree_backend() != "mthreads":
+        pytest.skip("MThreads FlagTree runtime required")
+
+    model = SimpleModel().to(device)
+    x = torch.randn(32, 128, device=device, requires_grad=True)
+    eager = model(x)
+    compiled = torch.compile(model, backend="flagos")(x)
+    assert_on_flagos(compiled)
+    torch.testing.assert_close(compiled, eager, rtol=1e-4, atol=1e-4)
+    compiled.sum().backward()
+    assert x.grad is not None
+    assert_on_flagos(x.grad, "gradient")
+    # A full compile+launch cycle must not have imported the real plugin. Only
+    # torch_fl's own shim may hold this name (see the binding test above).
+    plugin = sys.modules.get("torch_musa")
+    assert plugin is None or plugin.__spec__.origin == "torch_fl_shim"
+
+
+# The generic FlagTree test above also covers the MThreads runtime when the
+# vendor environment is active; the MUSA-specific test adds backward coverage.
+
+
+# End-to-end fallback remains useful on CPU-only hosts.
+
+
+# Keep the fallback test below independent of vendor availability.
+
+
 def test_compile_fallback_eager():
     """Test fallback to eager mode when compilation fails."""
     # Set fallback env var
     os.environ["FLAGOS_COMPILE_FALLBACK_EAGER"] = "1"
 
     try:
-        # Create a model that might cause compilation issues
+
         class ProblematicModel(torch.nn.Module):
             def forward(self, x):
-                # Some operation that might not compile cleanly
                 return x
 
         model = ProblematicModel()
         x = torch.randn(10, 10)
-
-        # Should not raise, falls back to eager
         compiled_model = torch.compile(model, backend="flagos")
         output = compiled_model(x)
-
         assert output.shape == (10, 10)
     finally:
         os.environ.pop("FLAGOS_COMPILE_FALLBACK_EAGER", None)
