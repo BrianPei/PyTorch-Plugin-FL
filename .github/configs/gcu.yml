@@ -71,7 +71,9 @@ integration_tests:
 
   # Initial GCU CI scope is limited to the operator files already passing on
   # the S60 runner. conv1d has no GCU convolution_overrideable implementation;
-  # the RNG generator contract is tracked separately and is not hidden here.
+  # the RNG generator contract is tracked separately. The factory suite below
+  # is intentionally run as a gap detector: its randn-dependent cases expose
+  # the current GCU Philox state overflow instead of silently hiding it.
   - name: Run validated GCU operator tests
     command: >-
       python -m pytest
@@ -85,3 +87,8 @@ integration_tests:
       tests/integration/ops/test_clamp_dispatch.py
       tests/integration/ops/test_constant_pad_nd_dispatch.py
       -m "anyplatform or main_ops" -v -s --tb=short
+
+  - name: Expose GCU factory and RNG gaps
+    command: >-
+      python -m pytest tests/integration/test_factory_ops.py
+      -v -s --tb=short
