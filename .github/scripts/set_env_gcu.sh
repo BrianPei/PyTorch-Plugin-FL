@@ -137,18 +137,27 @@ if [[ -z "${TORCH_FL_VENV_ROOT:-}" && -x "$PREBUILT_VENV/bin/python" ]]; then
   echo "Using prebuilt GCU venv: $VENV_ROOT"
 else
   VENV_ROOT="${TORCH_FL_VENV_ROOT:-${RUNNER_TEMP:-$REPO_ROOT/.ci}/torch-fl-gcu-${CI_STAGE}}"
-  if ! "$VENDOR_PYTHON" -m venv --clear "$VENV_ROOT"; then
-    echo "::warning::Python cannot create a venv; trying uv"
-    if ! command -v uv >/dev/null 2>&1; then
-      "$VENDOR_PYTHON" -m pip install --upgrade uv
-    fi
-    uv venv --clear --seed --python "$VENDOR_PYTHON" "$VENV_ROOT"
+  "$VENDOR_PYTHON" -m venv --clear "$VENV_ROOT" || true
+fi
+
+VENV_PYTHON="$VENV_ROOT/bin/python"
+if [[ ! -x "$VENV_PYTHON" ]]; then
+  # The current TopsRider base image does not ship python3.12-venv.  Keep the
+  # dependency in the chip-specific setup path so the common workflow remains
+  # image/workflow agnostic; a derived CI image should still bake this package
+  # in to avoid the apt fallback on every job.
+  if command -v apt-get >/dev/null 2>&1 && [[ "$(id -u)" -eq 0 ]]; then
+    python_mm="$($VENDOR_PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends "python${python_mm}-venv"
+    "$VENDOR_PYTHON" -m venv --clear "$VENV_ROOT"
   fi
 fi
 
 VENV_PYTHON="$VENV_ROOT/bin/python"
 if [[ ! -x "$VENV_PYTHON" ]]; then
-  echo "::error::Isolated Python was not created at $VENV_ROOT"
+  echo "::error::Isolated Python was not created at $VENV_ROOT; install python3.12-venv in the CI image" >&2
   exit 1
 fi
 
