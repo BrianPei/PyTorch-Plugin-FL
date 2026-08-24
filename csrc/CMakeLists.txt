@@ -32,26 +32,47 @@ list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/runtime/accelerator/.*")
 # stream_api is built as a separate shared lib
 list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/runtime/accelerator/ascend/stream_api\\.cc")
 
-# Profiler device tracer selection: exactly one vendor implementation may define
-# MakeDeviceTracer(). CUDA-compatible builds use CUPTI, DCU uses ROCtracer,
-# Ascend uses MSPTI, and MUSA uses MUPTI. Unsupported native platforms compile
-# the unavailable stub.
-if(ACCELERATOR STREQUAL "dcu")
+# Select exactly one vendor-specific DeviceTracer implementation. CUDA and PPU
+# use the CUPTI-compatible tracer, MetaX uses that same tracer against MCPTI,
+# DCU uses ROCtracer, Ascend uses CANN MSPTI, and MUSA uses MUPTI. Platforms
+# without a supported activity API use the unavailable implementation. Each
+# source defines the same factory.
+if(ACCELERATOR STREQUAL "cuda" OR ACCELERATOR STREQUAL "metax")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/gcu_topspti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/unavailable_device_tracer\\.cc$")
+elseif(ACCELERATOR STREQUAL "dcu")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/gcu_topspti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/unavailable_device_tracer\\.cc$")
 elseif(ACCELERATOR STREQUAL "ascend")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/gcu_topspti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/unavailable_device_tracer\\.cc$")
 elseif(ACCELERATOR STREQUAL "musa")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
-else()
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/unavailable_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/gcu_topspti_device_tracer\\.cc$")
+elseif(ACCELERATOR STREQUAL "gcu")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
   list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/unavailable_device_tracer\\.cc$")
+else()
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/roctracer_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/cann_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/musa_mupti_device_tracer\\.cc$")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/profiler/gcu_topspti_device_tracer\\.cc$")
 endif()
 
 # CANN's public MSPTI headers are optional. The tracer is still compiled with a
@@ -85,6 +106,21 @@ elseif(ACCELERATOR STREQUAL "musa")
     message(STATUS "mupti_activity.h found: ${MUPTI_INCLUDE_DIR}")
   else()
     message(STATUS "mupti_activity.h NOT found; MUSA profiler will be unavailable")
+  endif()
+elseif(ACCELERATOR STREQUAL "gcu")
+  find_path(TOPSPTI_INCLUDE_DIR
+    NAMES topspti_activity.h
+    PATHS
+      "$ENV{TOPS_HOME}/extras/TOPSPTI/include"
+      "$ENV{TOPS_HOME}/include/gcu/topspti"
+      /opt/tops/extras/TOPSPTI/include
+      /opt/tops/include/gcu/topspti)
+  if(TOPSPTI_INCLUDE_DIR)
+    include_directories(${TOPSPTI_INCLUDE_DIR})
+    add_compile_definitions(FLAGOS_HAVE_TOPSPTI=1)
+    message(STATUS "topspti_activity.h found: ${TOPSPTI_INCLUDE_DIR}")
+  else()
+    message(STATUS "topspti_activity.h NOT found; GCU profiler will be unavailable")
   endif()
 endif()
 
@@ -212,7 +248,9 @@ find_path(CUPTI_INCLUDE_DIR cupti_activity.h
         /usr/local/cuda/extras/CUPTI/include)
 if(CUPTI_INCLUDE_DIR)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${CUPTI_INCLUDE_DIR})
-  target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_HAVE_CUPTI=1)
+  if(ACCELERATOR STREQUAL "cuda" OR ACCELERATOR STREQUAL "metax")
+    target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_HAVE_CUPTI=1)
+  endif()
 endif()
 
 # cuda_occupancy.h -- CUDA's occupancy calculator, used by the device tracer to
@@ -228,12 +266,18 @@ endif()
 # Optional by design: without it we simply omit the three occupancy fields
 # rather than fail the build, so a machine with no CUDA toolkit headers still
 # gets everything else in the trace.
+set(CUDA_OCCUPANCY_SEARCH_PATHS
+  "$ENV{CUDA_HOME}/include"
+  "$ENV{CUDA_HOME}/targets/x86_64-linux/include"
+  /usr/local/cuda/include
+  /usr/local/cuda/targets/x86_64-linux/include
+  /usr/local/cuda-13.0/targets/x86_64-linux/include)
+if(ACCELERATOR STREQUAL "metax")
+  list(APPEND CUDA_OCCUPANCY_SEARCH_PATHS
+    "${METAX_PATH}/tools/cu-bridge/include")
+endif()
 find_path(CUDA_OCCUPANCY_INCLUDE_DIR cuda_occupancy.h
-  PATHS "$ENV{CUDA_HOME}/include"
-        "$ENV{CUDA_HOME}/targets/x86_64-linux/include"
-        /usr/local/cuda/include
-        /usr/local/cuda/targets/x86_64-linux/include
-        /usr/local/cuda-13.0/targets/x86_64-linux/include)
+  PATHS ${CUDA_OCCUPANCY_SEARCH_PATHS})
 if(CUDA_OCCUPANCY_INCLUDE_DIR)
   target_include_directories(${LIBRARY_NAME} PRIVATE ${CUDA_OCCUPANCY_INCLUDE_DIR})
   target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_HAVE_CUDA_OCCUPANCY=1)
@@ -338,7 +382,10 @@ endif()
 if(ACCELERATOR STREQUAL "metax")
   # maca's torch headers are a hard fork gated on USE_MACA (e.g. C10_WARP_SIZE,
   # Context.h allow_tf32_cudnn). Without it the headers hit static_assert(0).
-  target_compile_definitions(${LIBRARY_NAME} PRIVATE USE_MACA=1)
+  # MCPTI callback ids use a different namespace from NVIDIA CUPTI ids.
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE
+    USE_MACA=1
+    FLAGOS_METAX_MCPTI=1)
 endif()
 
 set(_torch_fl_link_libs torch_cpu_library torch_python_library flagos ${CUDA_RUNTIME_LIB})

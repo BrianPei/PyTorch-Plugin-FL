@@ -586,6 +586,29 @@ FLAGGEMS_PYTHON_SKIP = {
     "i0_",
     "zero",
     "zero.out",
+    # Same CUDA-device assert family (measured on the 5060 survey): the gems
+    # kernels raise on flagos and fall back to the boxed CUDA kernels.
+    "i0",
+    "i0.out",
+    "special_i0e",
+    "special_i0e.out",
+    "special_i1",
+    "upsample_bicubic2d",
+    "soft_margin_loss",
+    # _FULL_CONFIG spells these out variants with underscores, so the dotted
+    # names above would not match on their own.
+    "special_i0e_out",
+    "special_i1_out",
+    # Same device guard, found by re-running the survey and by source review.
+    "special_modified_bessel_k0",
+    "special_modified_bessel_k0.out",
+    "special_scaled_modified_bessel_k1",
+    "special_scaled_modified_bessel_k1.out",
+    "reflection_pad3d",
+    "reflection_pad3d.out",
+    "replication_pad2d",
+    "replication_pad2d.out",
+    "_embedding_bag_dense_backward",
     # rand/randn/rand_like/randn_like/randperm/multinomial are now ROUTED (not
     # skipped). gems' internal philox_backend_seed_offset(increment) reads
     # torch_device_fn.default_generators[device] (torch.cuda for the nvidia/metax
@@ -1312,12 +1335,18 @@ def optional_tensor_names(args: List[Tuple[str, str]]) -> List[str]:
 def _generator_inject_line(args, device_expr):
     """Emit the CUDA-boxing prelude for a schema carrying `Generator?`.
 
-    Reject a caller-supplied flagos generator before the inner ATen redispatch:
-    its PrivateUse1 key otherwise routes back to this same kernel after every
-    tensor has been boxed to CUDA, recursing until stack overflow. Its mt19937
-    state is not convertible to CUDA's philox state, so failing cleanly matches
-    native PyTorch's handling of incompatible generator devices. If no generator
-    was supplied, inject the shared CUDA generator so torch.manual_seed unifies
+    Translate a caller-supplied flagos (PrivateUse1) generator into a CUDA one
+    before the inner ATen redispatch. Left untranslated, the generator's
+    PrivateUse1 key routes the already-boxed call back into this same kernel,
+    recursing until stack overflow -- the old prelude guarded this by
+    TORCH_CHECK-rejecting the generator, but that broke HF-style code that
+    seeds torch.Generator(device=<device string>) generically (diffusers
+    randn_tensor). The flagos generator carries CPU mt19937 state, so
+    translation draws this op's seed via c10::flagos::ReserveSeed
+    (mutex-guarded; the caller-visible state advances exactly once per call,
+    the same per-op seed-reservation semantics the flaggems/native routes use)
+    and reseeds a clone of the shared CUDA generator. If no generator was
+    supplied, inject the shared CUDA generator so torch.manual_seed unifies
     native and FlagGems RNG.
 
     Returns '' for non-RNG ops. `device_expr` is a C++ expression yielding the
@@ -1328,7 +1357,8 @@ def _generator_inject_line(args, device_expr):
         return ""
     # The generator parameter is always named `generator` in the faithful sig.
     return (
-        "  ValidateGeneratorForCudaBoxing(generator);\n"
+        "  generator = TranslateGeneratorForCudaBoxing(generator, "
+        f"{device_expr});\n"
         f"  if (!generator.has_value()) generator = "
         f"at::native::flagos::GetFlagosDefaultCudaGenerator({device_expr});\n"
     )
@@ -2175,9 +2205,11 @@ def main():
         '#include "ops.h"',
         '#include "../device_boxing.h"',
         '#include "../backends/flagos/python_op_caller.h"',
+        '#include "../../runtime/generator.h"',
         "",
         "#include <vector>",
         "#include <tuple>",
+        "#include <mutex>",
         "",
     ]
     lines += api_headers(op_info)
@@ -2186,13 +2218,57 @@ def main():
         "namespace at::native::flagos {",
         "namespace {",
         "",
-        "void ValidateGeneratorForCudaBoxing(",
-        "    const ::std::optional<at::Generator>& generator) {",
-        "  TORCH_CHECK(",
-        "      !generator.has_value() || !generator->defined() ||",
-        "          generator->device().type() != c10::DeviceType::PrivateUse1,",
-        "      \"Expected a 'cuda' device type for generator but found '\",",
-        '      generator->device().type(), "\'");',
+        "// Translate a caller-supplied generator into one the vendor CUDA RNG",
+        "// kernels accept; returns the input unchanged when no translation is",
+        "// needed.",
+        "//",
+        '// torch.Generator(device="flagos") creates a PrivateUse1 generator',
+        "// backed by CPU mt19937 state, which vendor philox kernels cannot",
+        "// consume. The old prelude TORCH_CHECK-rejected it (safe against the",
+        "// generator-key redispatch recursion, but it broke generic HF code",
+        "// that seeds torch.Generator from the runtime device string, e.g.",
+        "// diffusers randn_tensor). So draw this op's seed from the flagos",
+        "// generator through ReserveSeed -- mutex-guarded, advancing the",
+        "// caller-visible state exactly once per call, matching the per-op",
+        "// seed-reservation semantics the flaggems/native routes use -- and",
+        "// reseed a *clone* of the shared CUDA generator, so the vendor",
+        "// kernel runs on a fresh philox stream anchored at that seed while",
+        "// torch.manual_seed on the shared default generator stays untouched.",
+        "// The clone is taken under the shared generator's lock, per Note",
+        "// [Acquire lock when using random generators].",
+        "//",
+        "// The translation also preserves the anti-recursion property of the",
+        "// old reject: after boxing, every tensor in the inner at::<op> call",
+        "// is CUDA, so forwarding a CUDA-typed generator keeps dispatch on",
+        "// the CUDA path and never re-enters this PrivateUse1 kernel. CUDA",
+        "// generators pass through unchanged; any other device type keeps",
+        "// upstream ATen's native generator type error.",
+        "::std::optional<at::Generator> TranslateGeneratorForCudaBoxing(",
+        "    ::std::optional<at::Generator> generator,",
+        "    c10::DeviceIndex cuda_index) {",
+        "  if (generator.has_value() && generator->defined() &&",
+        "      generator->device().type() == c10::DeviceType::PrivateUse1) {",
+        "    // ReserveSeed takes the caller generator's own lock internally,",
+        "    // so draw the per-op seed first and never hold both generator",
+        "    // locks at once.",
+        "    const uint64_t seed = c10::flagos::ReserveSeed(generator, cuda_index);",
+        "    at::Generator shared =",
+        "        at::native::flagos::GetFlagosDefaultCudaGenerator(cuda_index);",
+        "    at::Generator translated;",
+        "    {",
+        "      // clone() copies the shared generator's philox state without",
+        "      // synchronization while a concurrent default-generator draw",
+        "      // mutates it; hold the shared generator's lock while copying",
+        "      // (Note [Acquire lock when using random generators]).",
+        "      std::lock_guard<std::mutex> lock(shared.mutex());",
+        "      translated = shared.clone();",
+        "    }",
+        "    // The clone is private to this call, so reseeding it needs no",
+        "    // lock.",
+        "    translated.set_current_seed(seed);",
+        "    return translated;",
+        "  }",
+        "  return generator;",
         "}",
         "",
     ]
@@ -2399,13 +2475,61 @@ def main():
             "im2col",
             "smooth_l1_loss",
             "smooth_l1_loss_backward",
-            "special_i1.out",
+            # special_i1.out has no kernel under flag_gems 7fb49bad (its parent
+            # is skipped above); the out variant routes to cuda via plain conf.
             "_upsample_bilinear2d_aa",
             "_upsample_nearest_exact2d_backward",
             "upsample_trilinear3d",
             # (3) DTK triton cannot compile the gems kernel
             "gcd",
             "gcd.out",
+            # (3b) kernel dtype/value limits, measured on the 5060 survey:
+            # tl.dot rejects int64, tl.atomic_add rejects bool, cummax/cummin
+            # bool loop types clash, randint high=1 hits a gems constexpr gap.
+            "mm",
+            "mm.out",
+            "addmm",
+            "addmm.out",
+            "addmm_",
+            "index_add",
+            "index_add_",
+            "cummax",
+            "cummin",
+            "randint",
+            "randint_like",
+            # (3c) regressions of the 7fb49bad regeneration: these routes were
+            # cuda on main and fail on the gems path (nan, wrong shape, ...).
+            "_batch_norm_no_update",
+            "_cdist_forward",
+            "_pdist_backward",
+            "dequantize.self",
+            "igamma_",
+            "igammac_",
+            "linalg_lstsq",
+            "lu_unpack.out",
+            "mse_loss_backward",
+            "nansum.out",
+            "norm.Scalar",
+            "norm.ScalarOpt_dim",
+            "range",
+            "special_chebyshev_polynomial_u",
+            "special_chebyshev_polynomial_w",
+            "special_hermite_polynomial_h",
+            "special_shifted_chebyshev_polynomial_u",
+            "special_shifted_chebyshev_polynomial_w",
+            # (3d) rest of the tl.dot int64 family; view-vs-copy and rstd
+            # shape bugs in gems kernels.
+            "addbmm",
+            "bmm",
+            "bmm.out",
+            "baddbmm",
+            "mv",
+            "dot",
+            "addmm.dtype",
+            "addmm.dtype_out",
+            "_fused_rms_norm",
+            "_conj",
+            "_pdist_forward",
             # (4) wrong numerics or memory safety on the gems path
             "adaptive_max_pool3d_backward",
             "leaky_relu_",
@@ -2582,6 +2706,9 @@ def main():
         dcu_triton_fallback = flaggems_forced_cuda | {
             "slice_backward",
             "silu_backward",
+            # gcd/gcd.out fail DTK triton compile (see runtime_broken); the
+            # in-place twin shares the kernel family on DCU.
+            "gcd_",
         }
         dfg_conf_path = repo_root / "torch_fl/configs/backends_dcu_flaggems.conf"
         dfg_lines = conf_license + [

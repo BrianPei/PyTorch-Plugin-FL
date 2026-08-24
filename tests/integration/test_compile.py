@@ -19,9 +19,10 @@ Tests basic compilation, fusion gains, and FlagTree detection.
 """
 
 import os
+
 import pytest
-import torch
 import torch_fl
+import torch
 
 
 # Skip all tests if torch.compile not available (torch < 2.0)
@@ -153,6 +154,71 @@ def test_compile_with_max_autotune(device):
     torch.testing.assert_close(output, eager_output, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skipif(
+    torch_fl._build_accelerator() != "metax",
+    reason="MetaX compatibility event regression",
+)
+def test_metax_inductor_event_uses_real_stream(device):
+    """Inductor timing events must not record on the raw-stream-only shim."""
+    assert torch.cuda.Event is torch.flagos.Event
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    output = torch.ones(4096, device=device) + 1
+    end.record()
+    end.synchronize()
+
+    assert_on_flagos(output)
+    assert start.elapsed_time(end) >= 0
+
+
+def test_inductor_benchmark_accepts_triton_backend_name():
+    """The Triton backend name must not reach torch.device() as a device type.
+
+    DeviceProperties reports the *Triton* backend name (``maca`` on MetaX) so
+    triton picks the right backend, but inductor forwards that same string to its
+    benchmarker as a torch device. ``maca`` is not one, so autotuning died with
+    "Expected one of cpu, cuda, ... device string: maca". The vendor MetaX torch
+    patches this in-tree; the official CPU wheel we ship against does not, so
+    torch_fl maps it back to cuda (same physical GPU).
+    """
+    from torch._inductor.runtime import benchmarking
+
+    from torch_fl.compile.device_interface import (
+        _triton_backend,
+        register_flagos_device_interface,
+    )
+
+    register_flagos_device_interface()
+    device_type, _ = _triton_backend()
+
+    if device_type == "cuda":
+        pytest.skip("triton backend name is already a valid torch device type")
+
+    # The name inductor would hand over is not a torch device on its own ...
+    with pytest.raises(RuntimeError, match="device type at start of device string"):
+        torch.device(device_type)
+
+    # ... so benchmark() must translate it rather than pass it through.
+    assert benchmarking.Benchmarker.benchmark._flagos_patched
+
+    recorded = {}
+
+    def fake_gpu_benchmark(self, _callable, **kwargs):
+        recorded["ran"] = True
+        return 0.0
+
+    original = benchmarking.Benchmarker.benchmark_gpu
+    benchmarking.Benchmarker.benchmark_gpu = fake_gpu_benchmark
+    try:
+        benchmarking.Benchmarker().benchmark(lambda: None, device=device_type)
+    finally:
+        benchmarking.Benchmarker.benchmark_gpu = original
+
+    assert recorded.get("ran"), "benchmark() did not reach the GPU implementation"
+
+
 def test_compile_multiple_inputs(device):
     """Test compilation with multiple input tensors."""
     model = MatMulModel().to(device)
@@ -278,6 +344,54 @@ def test_flagtree_requires_flagtree_install():
     else:
         with pytest.raises(RuntimeError, match="not FlagTree"):
             require_flagtree()
+
+
+def test_ppu_flagtree_defaults_to_serial_compile(monkeypatch):
+    """PPU FlagTree must avoid CUDA initialization in forked compile workers."""
+    from torch_fl.compile import inductor_backend
+
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    monkeypatch.setattr(
+        "torch_fl.compile.flagtree_shim.flagtree_backend", lambda: "ppu"
+    )
+
+    patches = {}
+    inductor_backend._patch_ppu_flagtree_compile_workers(patches)
+
+    assert patches["compile_threads"] == 1
+
+
+def test_ppu_flagtree_preserves_explicit_compile_threads(monkeypatch):
+    """An explicit per-compile or environment setting remains authoritative."""
+    from torch_fl.compile import inductor_backend
+
+    monkeypatch.setattr(
+        "torch_fl.compile.flagtree_shim.flagtree_backend", lambda: "ppu"
+    )
+
+    patches = {"compile_threads": 4}
+    inductor_backend._patch_ppu_flagtree_compile_workers(patches)
+    assert patches["compile_threads"] == 4
+
+    monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "8")
+    patches = {}
+    inductor_backend._patch_ppu_flagtree_compile_workers(patches)
+    assert "compile_threads" not in patches
+
+
+def test_non_ppu_flagtree_keeps_default_compile_threads(monkeypatch):
+    """Other FlagTree backends keep Inductor's asynchronous compilation."""
+    from torch_fl.compile import inductor_backend
+
+    monkeypatch.delenv("TORCHINDUCTOR_COMPILE_THREADS", raising=False)
+    monkeypatch.setattr(
+        "torch_fl.compile.flagtree_shim.flagtree_backend", lambda: "hcu"
+    )
+
+    patches = {}
+    inductor_backend._patch_ppu_flagtree_compile_workers(patches)
+
+    assert "compile_threads" not in patches
 
 
 def test_flagtree_is_never_importable_as_flagtree():

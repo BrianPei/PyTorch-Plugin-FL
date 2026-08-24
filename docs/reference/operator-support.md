@@ -72,6 +72,22 @@ decimal place.
 | MetaX mc550 | 546 | 260 | 33 | 155 | 98 | 293 | 53.7% | 47.6% |
 | PPU 810e | 546 | 347 | 54 | 47 | 98 | 401 | 73.4% | 63.6% |
 | Hygon DCU bw1000 | 546 | 321 | 53 | 74 | 98 | 374 | 68.5% | 58.8% |
+| NVIDIA RTX 5060 (2026-08-24) | 538 | 347 | 54 | 40 | 97 | 401 | 74.5% | 64.5% |
+| NVIDIA RTX 5060 (2026-08-24) | 527 | 347 | 45 | 38 | 97 | 392 | 74.4% | 65.8% |
+| NVIDIA RTX 5060 (2026-08-24) | 489 | 346 | 43 | 16 | 84 | 389 | 79.6% | 70.8% |
+
+The 5060 rows are separate cohorts: the 489-route configuration (2026-08-24)
+additionally reroutes the 22 ops whose 7fb49bad-generated routes regressed
+from main (they were `cuda` on main and fail on the gems path -- nan, wrong
+shape/dtype, recursion, compile errors), plus the remaining `tl.dot` int64
+family (`addbmm`/`bmm`/`bmm.out`/`baddbmm`/`mv`/`dot`/`addmm.dtype`) and
+three ops with wrong gems semantics (`_conj`, `_fused_rms_norm`,
+`_pdist_forward`), the device-guarded bessel/pad families and
+`_embedding_bag_dense_backward`, and the `gcd_` DCU fallback. The
+538/527/489 denominators are not directly comparable with the 546-route rows
+above. The four 546-route rows are **not revalidated** against the new
+cohorts; the remaining 16 FAILED routes on the 5060 were already
+`flagos_python` on main (no regression vs main).
 
 For every row, `STRICT + BASIC_ONLY + FAILED + UNTESTED = Total`, and
 `Basic executable = STRICT + BASIC_ONLY`.
@@ -88,6 +104,9 @@ summary.
 | MetaX mc550 | 1597 | 1309 | 0 | 812 | 90 | 14 | 0 | 0 |
 | PPU 810e | 2158 | 1305 | 0 | 184 | 154 | 21 | 0 | 0 |
 | Hygon DCU bw1000 | 2016 | 1309 | 0 | 337 | 146 | 14 | 0 | 0 |
+| NVIDIA RTX 5060 (2026-08-24) | 2152 | 1292 | 0 | 153 | 155 | 14 | 0 | 0 |
+| NVIDIA RTX 5060 (2026-08-24) | 2113 | 1277 | 0 | 130 | 155 | 14 | 0 | 0 |
+| NVIDIA RTX 5060 (2026-08-24) | 2112 | 1132 | 0 | 52 | 120 | 7 | 0 | 0 |
 
 The bw1000 baseline excludes 108 initial records that failed before operator
 execution because the child process could not load its MPI runtime. Exactly
@@ -130,6 +149,44 @@ record.
 The generic FlagGems survey above does not exercise vendor-native routes such as
 `ascend` or `gcu`. Native route changes are tracked here separately so they are
 not misrepresented as part of the 546-overload FlagGems cohort.
+
+### Enflame GCU S60 AMP routes (2026-08-24)
+
+The GCU backend now routes both GradScaler unscale overloads through the
+native `topsatenAmpForeachNonFiniteCheckAndUnscale` API when tensor lists are
+contiguous, non-empty, same-device, and use supported dtypes. Unsupported
+layouts and dtypes retain the CPU correctness fallback. The shared
+`AutocastPrivateUse1` policy registration covers FP16/BF16 autocast.
+
+Measured on S60 against the installed TopsRider release:
+`tests/integration/test_amp.py` is `25 passed`. Three things were needed beyond
+the unscale routes themselves:
+
+- **float64 gate.** topsaten has no F64 kernels, so `TopsatenSupportsDtype` now
+  excludes `at::kDouble` as well as `at::kLong`, sending float64 to the CPU
+  fallback across all gated kernels. GradScaler needs this: it computes the
+  inverse scale as `scale.double().reciprocal().float()`.
+- **`.out` overload semantics.** topsaten writes `found_inf` for the `.out`
+  overload; the CPU reference does not. The native path now passes a scratch
+  flag so the observable contract matches other backends. GradScaler itself uses
+  the in-place overload for overflow detection.
+- **convolution routes.** `aten::convolution` dispatches PrivateUse1 to
+  `convolution_overrideable`, which has no composite fallback, so conv2d raised
+  `NotImplementedError` and the autocast lower-precision policy could not be
+  exercised. Added `convolution_overrideable` (native `topsatenConvolution`,
+  within 3.9e-6 of the CPU reference across stride/padding/dilation/group/bias
+  variants) and `convolution_backward_overrideable` (CPU fallback; grads match
+  the reference exactly).
+
+`topsatenConvolutionBackward` is exported by `libtopsaten.so.3` but returns
+`NOT_SUPPORT` for every input measured — fp32 and fp16, grouped and ungrouped,
+padded and unpadded, with both the caller's `output_mask` and an all-true mask —
+hence the CPU fallback for that one route. Switch it to native once a TopsRider
+release implements it.
+
+Not fixed here and still failing: `torch.neg` on uint8 and bool
+(`topsatenNeg` returns `NOT_SUPPORT` and those dtypes are not routed to the
+fallback). Pre-existing and outside the AMP contract.
 
 ### Enflame GCU S60 RNG routes (2026-08-17)
 
@@ -226,9 +283,9 @@ The MUSA route configuration includes native muRAND/mudnn implementations for th
 
 These native routes were measured on an eight-device Moore Threads MTT S5000 host. Device 0 reported capability 3.1, 60 multiprocessors, and 85,813,358,592 bytes of memory. With CPU PyTorch 2.10.0 and the installed `/usr/local/musa` toolkit (`mudnn` v3300):
 
-- `tests/integration/ops/test_musa_rng.py`: **7 passed**. Coverage includes same-seed reproducibility, `torch.manual_seed`, `torch.flagos.manual_seed`/`manual_seed_all`, state round trips, explicit generators, integer/out/like variants, full-width int64 ranges, `[0, 1)` uniform bounds, native dropout forward/backward, shared native/FlagGems reservation ordering, and per-device sequence isolation.
+- `tests/integration/ops/test_rng_dispatch.py`: the shared RNG suite covers same-seed reproducibility, `torch.manual_seed`, `torch.flagos.manual_seed`/`manual_seed_all`, state round trips, explicit generators, integer/out/like variants, full-width int64 ranges, `[0, 1)` uniform bounds, native dropout forward/backward, shared native/FlagGems reservation ordering, and per-device sequence isolation. MUSA-specific generator and reservation cases are selected through the `musa` mark in this same file.
 - `tests/integration/ops/test_musa_dispatch.py`: **89 passed**.
-- `tests/unit/test_vendor_routing.py` plus `tests/unit/test_musa_rng_bridge.py`: **24 passed**.
+- `tests/unit/test_vendor_routing.py` plus `tests/unit/test_musa_rng_bridge.py`: **24 passed**; the bridge unit test remains focused on MUSA FlagGems patching rather than duplicating integration coverage.
 
 The target cohort is the available MTT S5000 host; no S6000 claim is made.
 
@@ -282,14 +339,37 @@ change; the evidence gap is that no A100/mc550/810e re-survey was run, and the
 reduced the same cohort 546 -> 545 without a re-survey; the baseline tables
 therefore describe the original 546-route cohort, not the current HEAD.
 
+### MetaX AMP routes (2026-08-21)
+
+The shared `AutocastPrivateUse1` registrations now have explicit MetaX boxing
+coverage. They use the same PyTorch policy groups as CUDA and redispatch through
+the existing PrivateUse1-to-CUDA boxing kernels; no handwritten MetaX operator
+was added or rerouted.
+
+Measured on MetaX C550 with MACA 3.8.0 in boxing mode:
+
+- `tests/integration/test_amp.py`: **25 passed**.
+- The suite covered FP16 and BF16 lower-precision, FP32, optional-dtype, and
+  promote policies; nested autocast state; BCE fallthrough; non-finite unscale;
+  finite scale growth; overflow backoff; and a forward/backward optimizer step.
+
+The generic FlagGems route cohort is unchanged and was **not revalidated** by
+this work. The AMP result does not establish support for the legacy handwritten
+MetaX kernel mode or for additional MACA releases and devices.
+
 ## Update History
 
 | Date | Hardware | Cohort | Change | Evidence |
 |---|---|---|---|---|
+| 2026-08-24 | NVIDIA RTX 5060 Laptop (sm_120), torch 2.10.0+cu128 | Generic FlagGems routes, current 489-route config | Rerouted the 22 ops whose 7fb49bad-generated routes regressed vs main (nan, wrong shape/dtype, recursion, compile errors), the remaining tl.dot int64 family (`addbmm`/`bmm`/`bmm.out`/`baddbmm`/`mv`/`dot`/`addmm.dtype`), three wrong-semantics gems kernels (`_conj`, `_fused_rms_norm`, `_pdist_forward`), the device-guarded bessel/pad families and `_embedding_bag_dense_backward`, and `gcd_` on DCU; synced the hand-maintained `*_cpp.conf` files. Cohort 527 -> 489. Zero route regressions vs main (all remaining 16 FAILED routes were already `flagos_python` on main). | Full 489-overload survey on RTX 5060: 346 STRICT / 43 BASIC_ONLY / 16 FAILED / 84 UNTESTED; conf/cpp-conf kernel consistency verified. |
+| 2026-08-24 | NVIDIA RTX 5060 Laptop (sm_120), torch 2.10.0+cu128 | Generic FlagGems routes, current 527-route config | Rerouted eleven ops whose gems Triton kernels fail to compile for specific dtypes/values (`mm`/`mm.out`/`addmm`/`addmm.out`/`addmm_` int64 `tl.dot`, `index_add`/`index_add_` bool `tl.atomic_add`, `cummax`/`cummin` bool loop types, `randint`/`randint_like` high=1 constexpr gap) from `flagos_python` to `cuda` boxing via `flaggems_runtime_broken`. Cohort 538 -> 527 active routes. Four-platform 546-route rows **not revalidated**. | Full 527-overload survey on RTX 5060: 347 STRICT / 45 BASIC_ONLY / 38 FAILED / 97 UNTESTED; zero new failures vs the 538 cohort; all eleven ops verified on the boxing route (int64 mm now raises the same error as stock PyTorch on CUDA). |
+| 2026-08-24 | NVIDIA RTX 5060 Laptop (sm_120), torch 2.10.0+cu128 | Generic FlagGems routes, current 538-route config | Rerouted seven device-assert ops (`i0`, `i0.out`, `special_i0e`, `special_i0e.out`, `special_i1`, `upsample_bicubic2d`, `soft_margin_loss`) from `flagos_python` to `cuda` boxing (gems kernels hard-assert `tensor.is_cuda`); regenerated all configs/kernels against flag_gems `7fb49bad`. Cohort 546 -> 538 active routes. Four-platform 546-route rows **not revalidated** (A100/mc550/810e/bw1000 unavailable). | Full 538-overload survey on RTX 5060: 347 STRICT / 54 BASIC_ONLY / 40 FAILED / 97 UNTESTED; manual verification that all seven ops now execute correctly on `flagos` via the boxing route. |
+| 2026-08-24 | Enflame S60 | Native GCU AMP, convolution, and dtype routes | Added native AMP unscale routes (both overloads), native `convolution_overrideable`, and a CPU-fallback `convolution_backward_overrideable`; gated float64 to the CPU fallback since topsaten has no F64 kernels. Generic FlagGems cohort **not revalidated**. | `tests/integration/test_amp.py`: 25 passed. `test_conv1d_dispatch.py`: 8 passed. Conv forward within 3.9e-6 of CPU across stride/padding/dilation/group/bias variants; conv grads exact. Pre-existing, unrelated failures remain in `test_compile.py`, `test_profiler_parity.py`, `test_rng_dispatch.py`, and `neg` on uint8/bool. |
+| 2026-08-21 | MetaX C550 (MACA 3.8.0) | CUDA-boxing AMP routes | Enabled the shared AMP integration contract for MetaX and added it to the MetaX CI manifest; no operator route changed. Generic FlagGems routes were **not revalidated**. | `tests/integration/test_amp.py`: 25 passed, covering FP16/BF16 autocast policies and GradScaler finite/overflow training paths. |
 | 2026-08-19 | Hygon DCU bw1000 | Generic FlagGems routes | Rerouted `index_select` from `flagos_python` to `cuda` in all FlagGems configs (cross-stream launch race drops output stores under load); generic cohort 546 -> 545 active routes, 26 -> 27 forced CUDA fallbacks. Four-platform rows **not revalidated** (A100/mc550/810e unavailable). | Targeted survey `--ops index_select` on the flagos_python route: STRICT (standalone math correct); three failing HF v5.5.0 UT nodes (T5/Qwen3/Gemma3 beam search) pass after the reroute; tiny-T5 NaN reproducer clean 3/3. |
 | 2026-08-18 | MTT S5000 (8 devices) | Native MUSA RNG, MThreads FlagGems hybrid, and MUPTI profiler | Added optional MUPTI activity tracing; the operator route cohort is unchanged. | `tests/integration/test_profiler_musa.py`: 1 passed with real positive-duration MUPTI kernel/runtime/memcpy activities and valid Chrome JSON. CPU-only Kineto resolver behavior remains environment-dependent; generic FlagGems operator coverage was not revalidated by this profiler change. |
 | 2026-08-18 | Ascend 910 (CANN 9.0) | Ascend AMP and dtype routes | Added generated AMP unscale and foreach list-add routes; fixed promotion-aware binary outputs, float64 copies, and CPU fallback for unsupported matmul/unary dtypes. | `test_amp.py`: 25 passed; `test_dtype_coverage.py`: 174 passed; targeted float64, promotion, and fallback parity probes passed. |
-| 2026-08-17 | MTT S5000 (8 devices) | Native MUSA RNG and MThreads FlagGems hybrid | Added shared per-device RNG reservations, muRAND/mudnn native RNG, shared stream compatibility, and seven non-overlapping FlagGems routes. | Native RNG: 7 passed; MUSA dispatch: 89 passed; routing/bridge units: 24 passed; real hybrid FlagGems: 2 passed, including selected reductions, duplicate-index `index_add`, and FlagGems `randn` mixed with native RNG. Vendor FlagTree wheel required; generic Triton 3.7.1 is not evidence. |
+| 2026-08-17 | MTT S5000 (8 devices) | Native MUSA RNG and MThreads FlagGems hybrid | Added shared per-device RNG reservations, muRAND/mudnn native RNG, shared stream compatibility, and seven non-overlapping FlagGems routes. | Unified RNG suite passed on the MUSA-marked cases; MUSA dispatch: 89 passed; routing/bridge units: 24 passed; real hybrid FlagGems: 2 passed, including selected reductions, duplicate-index `index_add`, and FlagGems `randn` mixed with native RNG. Vendor FlagTree wheel required; generic Triton 3.7.1 is not evidence. |
 | 2026-08-17 | Enflame S60 | Native GCU RNG routes | Added 16 topsaten RNG routes; generic FlagGems cohort not revalidated. | Targeted mixed native/FlagGems probe verified shared seed/offset progression and replay; `tests/integration/ops/test_rng_dispatch.py`: `104 passed, 2 skipped, 1 xpassed`. |
 | 2026-08-14 | Ascend 910 (2 devices) | Native Ascend FSDP2 routes | Added `_chunk_cat`, `_chunk_cat.out`, `_foreach_copy_`, `cat.out`, `split.Tensor`, `split_with_sizes`, and `split_with_sizes_copy.out`; generic FlagGems cohort not revalidated because it is unchanged. | Manual FlagCX collective, DDP, and FSDP2 tests on CANN 9.0; standard FlagGems harness is not applicable to native routes. |
 | 2026-08-13 | A100, mc550, 810e, bw1000 | torch-fl `fe2272b5`, FlagGems `7fb49bad`, harness v4 | Established the verified 546-overload four-platform baseline. | Manual survey JSON; aggregate and raw counts recorded above. |

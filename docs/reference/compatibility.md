@@ -23,12 +23,12 @@
 | Platform | Build selector | Execution path | Eager and autograd | `torch.compile` | Distributed | Profiler | FlagGems | Status |
 |---|---|---|---|---|---|---|---|---|
 | NVIDIA CUDA | `ACCELERATOR=cuda` (default) | CUDA boxing over an external `libtorch_cuda.so` | Stable | Experimental (inductor GPU device registered; no CI test step) | Beta (FlagCX + NCCL fallback, DDP live-verified) | Stable (CUPTI parity) | Beta (Python + C++ dispatch paths) | Stable |
-| MetaX | `ACCELERATOR=metax` | CUDA-boxing reuse via `cu-bridge`/mxcc, or native MetaX kernels | Stable | Not validated | Experimental (NCCL-shaped `mccl` fallback; not CI-covered) | Not validated on this vendor's tracer | Experimental (Python dispatch; not CI-tested on MetaX) | Stable |
+| MetaX | `ACCELERATOR=metax` | CUDA-boxing reuse via `cu-bridge`/mxcc, or native MetaX kernels | Stable (FP16/BF16 autocast and GradScaler measured in boxing mode) | Experimental (vendor Triton and FlagTree MetaX measured on C550; vendor Triton CI-covered) | Experimental (NCCL-shaped `mccl` fallback; not CI-covered) | Experimental (MCPTI parity measured on C550; not CI-covered) | Experimental (Python dispatch; not CI-tested on MetaX) | Stable |
 | Ascend | `ACCELERATOR=ascend` | Native ACLNN operator backend, optional FlagGems via triton-ascend | Stable (CI-covered ops, RNG suite) | Not validated | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Runtime only (device/runtime events not emitted; profiler parity suite excluded from CI) | Experimental (Python dispatch; not CI-tested on Ascend) | Beta |
 | PPU | `ACCELERATOR=cuda` + `PPU_SDK`/`PPU_HOME` detection | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK | Experimental (FP16/BF16 autocast and GradScaler measured on PPU hardware, not in CI) | Not validated | Experimental (NCCL fallback via vendor-adapted `libnccl.so.2`; not CI-covered) | Not validated on this vendor's tracer | Experimental (vendor-index Triton required) | Experimental |
 | Hygon DCU | `ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | Beta (including FP16/BF16 autocast and GradScaler) | Experimental (FlagTree HCU validated on `gfx936`; not in CI) | Experimental (RCCL via DTK; all_reduce/DDP measured on 2 cards, not in CI) | Beta (parity suite runs in CI) | Beta (Python dispatch only) | Beta |
-| Enflame GCU | `ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64 ops | Experimental | Not validated | Not validated | Not validated | Experimental (Python dispatch, requires vendor Triton) | Experimental |
-| Moore Threads MUSA | `ACCELERATOR=musa` | Native `mudnn` operator backend, with CPU fallback for unrouted ops | Experimental | Not validated | Not validated | Experimental (MUPTI device timeline measured on MTT S5000; CPU-Kineto linkage is environment-dependent) | Experimental (Python dispatch, requires vendor Triton) | Experimental |
+| Enflame GCU | `ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64/float64 ops | Experimental (FP16/BF16 autocast and GradScaler measured on S60, not in CI) | Not validated | Not validated | Not validated | Experimental (Python dispatch, requires vendor Triton) | Experimental |
+| Moore Threads MUSA | `ACCELERATOR=musa` | Native `mudnn` operator backend, with CPU fallback for unrouted ops | Experimental (including FP16/BF16 autocast and GradScaler measured on MTT S5000) | Not validated | Not validated | Experimental (MUPTI device timeline measured on MTT S5000; CPU-Kineto linkage is environment-dependent) | Experimental (Python dispatch, requires vendor Triton) | Experimental |
 | D-Robotics BPU | `ACCELERATOR=bpu` | No eager kernel sets are built; eager ops run on CPU | Runtime only (CPU fallback for eager) | Experimental (`torch.compile(backend="bpu")` graph path via hbdk4) | Not applicable | Not validated | Not applicable (no per-op kernel build) | Runtime only |
 | TsingMicro | `ACCELERATOR=tsingmicro` | Runtime/build selector present; no per-op kernel set documented | Runtime only | Not validated | Not validated | Not validated | Not applicable | Runtime only |
 
@@ -52,15 +52,33 @@ parity with torch-cuda via CUPTI (see
 
 ### MetaX
 
-[`.github/configs/metax.yml`](../../.github/configs/metax.yml) (lines 99-125) runs representative
-operator dispatch tests and general factory/autograd tests in CI, but its test command explicitly
-excludes all FlagGems tests (`-m "not flaggems and not flaggems_python and not flaggems_cpp"` at
-line 118), so FlagGems on MetaX has no CI validation. MetaX carries FSDP2 and Qwen3 training
-parity work (see repository history). Distributed support routes through the same NCCL-shaped
-fallback as CUDA (`_VENDOR_PROFILES["metax"]` in
+[`.github/configs/metax.yml`](../../.github/configs/metax.yml) runs representative
+operator dispatch, factory/autograd, RNG, AMP, and `torch.compile` tests in CI. The operator
+command explicitly excludes all FlagGems tests, so FlagGems on MetaX has no CI validation. The
+shared `AutocastPrivateUse1` policy registrations dispatch FP16/BF16 lower-precision, FP32,
+optional-dtype, and promote groups through the existing CUDA-boxing kernels. On a C550 with
+MACA 3.8.0, the 25-case AMP suite passed, including nested autocast state, non-finite unscale,
+finite scale growth, overflow backoff, and a forward/backward optimizer step. This evidence is
+specific to MetaX boxing mode; the legacy handwritten MetaX kernels were not revalidated.
+
+`torch.compile(backend="flagos")` is experimentally validated in the same C550/MACA 3.8.0
+boxing environment with both the installed vendor Triton and FlagTree main at revision
+`140bd6ab1ad86c5df4b07b76d9c722e357a9166d` (Triton 3.6, MetaX backend). The complete compile
+suite passes with outputs and gradients remaining on `flagos`, including forward, backward,
+FP32/FP16, max-autotune, recompilation, FakeTensor tracing, and the FlagTree-specific result
+check. MetaX CI continuously exercises the vendor Triton path; FlagTree remains a manual
+measurement because it replaces the environment's installed `triton` distribution.
+
+MetaX carries FSDP2 and Qwen3 training parity work (see repository history). Distributed
+support routes through the same NCCL-shaped fallback as CUDA (`_VENDOR_PROFILES["metax"]` in
 [`torch_fl/comm/process_group.py`](../../torch_fl/comm/process_group.py), line 93), but that is
-architectural routing, not a CI-verified collective test on this platform. `torch.compile` and
-profiler-tracer parity are not represented in tests or docs for this platform.
+architectural routing, not a CI-verified collective test on this platform. Profiler-tracer
+parity was measured locally on a C550 with MACA 3.8.0 MCPTI: the seven-case
+`tests/integration/test_profiler_parity.py` suite passed in MetaX boxing mode, covering kernel,
+memcpy, memset, and runtime events, flow pairing, device-time attribution, kernel metadata,
+runtime callback names, and capture-window filtering. This is not yet a CI result, and the
+scanner remains unvalidated across multiple MetaX SDK versions, devices, and non-default
+streams.
 
 ### Ascend
 
@@ -146,11 +164,17 @@ with a documented CPU fallback for ops the vendor kernel table does not cover (s
 [`setup.py`](../../setup.py), lines 440-457, and
 `tests/integration/ops/test_musa_dispatch.py`, lines 15-24). No CUDA boxing kernels or FlagGems
 C++ kernels are compiled for this platform; FlagGems Python dispatch is optional and needs the
-vendor Triton backend. Distributed support remains unvalidated on hardware. The optional MUPTI
-tracer has been measured on the available MTT S5000 host and emits real positive-duration kernel,
-runtime, and memcpy activities with device, stream, name, and Chrome-trace metadata. CPU-to-device
-linkage depends on whether the installed PyTorch/Kineto build supplies the PrivateUse1 resolver;
-the CPU-only PyTorch 2.10 wheel used for this measurement does not justify a general parity claim.
+vendor Triton backend. The shared `AutocastPrivateUse1` policies and native mudnn routes were
+measured on an MTT S5000 with both FP16 and BF16. The 25-case AMP suite covers lower-precision
+matmul, linear, and convolution; float32 and promote policies; nested autocast state; finite scale
+growth; overflow backoff and optimizer-step skipping; and end-to-end GradScaler training. The
+GradScaler unscale operation currently follows the correctness-oriented CPU fallback and copies
+its mutated tensors and `found_inf` flag back to MUSA rather than using a native mudnn foreach
+kernel. Distributed support remains unvalidated on hardware. The optional MUPTI tracer has been
+measured on the available MTT S5000 host and emits real positive-duration kernel, runtime, and
+memcpy activities with device, stream, name, and Chrome-trace metadata. CPU-to-device linkage
+depends on whether the installed PyTorch/Kineto build supplies the PrivateUse1 resolver; the
+CPU-only PyTorch 2.10 wheel used for this measurement does not justify a general parity claim.
 
 ### D-Robotics BPU
 

@@ -265,6 +265,13 @@ def is_metax_available():
     return _load_mcruntime(metax_path) is not None
 
 
+def _patch_inductor_event():
+    """Make Inductor events bypass the lightweight CUDA stream shim."""
+    flagos = getattr(torch, "flagos", None)
+    if flagos is not None and getattr(flagos, "Event", None) is not None:
+        torch.cuda.Event = flagos.Event
+
+
 def patch_torch_cuda_for_metax():
     """
     Monkey-patch torch.cuda functions to work on MetaX hardware.
@@ -281,6 +288,10 @@ def patch_torch_cuda_for_metax():
     global _mcruntime, _patched
 
     if _patched:
+        # FLAGOS_METAX_COMPAT can call us once before torch.flagos is registered
+        # and again afterward. Keep this late-bound patch outside the one-time
+        # runtime setup so the second call can install the real Event wrapper.
+        _patch_inductor_event()
         return True
 
     metax_path = _find_metax_path()
@@ -405,6 +416,11 @@ def patch_torch_cuda_for_metax():
         _device_index(device)
     )
 
+    # Inductor's autotuner constructs torch.cuda.Event directly. Its default
+    # record path rejects the lightweight stream shim above, while flagos.Event
+    # resolves the real underlying stream before recording the same MetaX event.
+    _patch_inductor_event()
+
     # Device context exchange: extract index for flagos/privateuseone tensors.
     def _exchange_device(idx):
         if idx < 0:
@@ -454,6 +470,31 @@ def patch_torch_cuda_for_metax():
         torch.cuda.default_generators = _CudaDefaultGenerators()
     except Exception:
         pass
+
+    # The public backend is flagos. Keep its seed/state API synchronized with
+    # the CUDA-shaped Philox generators required by the MetaX FlagGems path.
+    if _flagos is not None:
+        native_manual_seed = _flagos.manual_seed
+        native_manual_seed_all = _flagos.manual_seed_all
+
+        def _flagos_manual_seed(seed):
+            native_manual_seed(seed)
+            _manual_seed(seed)
+
+        def _flagos_manual_seed_all(seed):
+            native_manual_seed_all(seed)
+            _manual_seed_all(seed)
+
+        def _flagos_get_rng_state(device="flagos"):
+            return _get_cuda_generator(_device_index(device)).get_state()
+
+        def _flagos_set_rng_state(state, device="flagos"):
+            _get_cuda_generator(_device_index(device)).set_state(state)
+
+        _flagos.manual_seed = _flagos_manual_seed
+        _flagos.manual_seed_all = _flagos_manual_seed_all
+        _flagos.get_rng_state = _flagos_get_rng_state
+        _flagos.set_rng_state = _flagos_set_rng_state
 
     # FlagGems/Triton autotuners benchmark kernels with torch.cuda.Event, which
     # fails on the CPU torch wheel ("invalid device ordinal"). Time with a wall

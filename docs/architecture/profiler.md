@@ -1,9 +1,14 @@
 # torch_fl profiler architecture: parity with torch-cuda
 
 > Completed: 2026-08-04
-> Measured on: A100-SXM4-40GB; torch 2.11.0+cpu + external libtorch_cuda.so (cu128)
+> NVIDIA measurement: A100-SXM4-40GB; torch 2.11.0+cpu + external libtorch_cuda.so (cu128)
+> MetaX measurement: C550; torch 2.10.0 MetaX wheel + MACA 3.8.0 MCPTI, boxing mode
 > Reference baseline: torch 2.10.0+cu128, see `tests/data/profiler_cuda_baseline.json`
 > Tests: `tests/integration/test_profiler_parity.py`, 7 structural assertions
+
+The MetaX measurement passed all seven parity assertions. It is a local hardware
+validation rather than a CI result; the compatibility matrix therefore records MetaX
+profiler support as experimental until a vendor runner is available.
 
 The Chrome trace that `torch.profiler.profile(activities=[CPU, PrivateUse1])` produces for
 flagos devices is **structurally** equivalent to torch+cuda's:
@@ -29,12 +34,16 @@ The entire Task 2–4 refactor had one goal: **adding a vendor should mean writi
 ```
 csrc/profiler/
   device_tracer.h              ← vendor-agnostic interface (DeviceTracer / DeviceEvent / EventKind)
-  cupti_device_tracer.cc       ← NVIDIA implementation; all CUPTI types live only here
+  cupti_device_tracer.cc       ← CUPTI/MCPTI implementation; vendor activity types live here
   cann_device_tracer.cc        ← Ascend implementation using public MSPTI activities
   musa_mupti_device_tracer.cc  ← MUSA implementation using MUPTI activities
+  roctracer_device_tracer.cc   ← ROCtracer implementation for DCU
+  unavailable_device_tracer.cc ← explicit no-device-activity fallback
+  gcu_topspti_device_tracer.cc ← GCU implementation using TOPSPTI activities
   flagos_kineto_profiler.{h,cc}← generic kineto adaptor; zero vendor coupling
-  cupti_shim.h                 ← symbol binding for dlopen'd system libcupti (NVIDIA-only)
+  cupti_shim.h                 ← dlopen binding for CUPTI-compatible activity libraries
   mupti_shim.h                 ← optional runtime binding for MUSA libmupti
+  topspti_shim.h               ← optional runtime binding for GCU libtopspti
 ```
 
 ### 1.1 Vendor-agnostic interface — `device_tracer.h`
@@ -77,8 +86,8 @@ time to the wrong operator.
 
 ### 1.2 NVIDIA implementation — `cupti_device_tracer.cc`
 
-Every CUPTI type, the cbid table, and the activity-record layout mirrors appear only in this
-file:
+Every CUPTI/MCPTI type, callback-ID table, and activity-record layout mirror appears only in
+this file:
 
 - `CuptiTracerInit` (file-level static) — arms CUPTI at module load; see §3.1
 - `bufferRequested` / `bufferCompleted` — CUPTI activity buffer callbacks
@@ -115,15 +124,11 @@ type. It does exactly two things — translate `DeviceEvent` into
 
 1. Write `csrc/profiler/{vendor}_device_tracer.cc`, implement `DeviceTracer`, and define
    `MakeDeviceTracer()` in it.
-2. Make CMake compile only your tracer for that `ACCELERATOR`. **Note the current state**:
-   `csrc/CMakeLists.txt` uses `GLOB_RECURSE` over all of `csrc/`, so today the mere presence
-   of two `*_device_tracer.cc` files would produce two conflicting `MakeDeviceTracer()`
-   definitions at link time. **The second vendor to land therefore also needs to do the
-   per-vendor source selection** (either list sources explicitly under
-   `if(ACCELERATOR STREQUAL ...)`, or add `#ifdef` guards inside each tracer). This is the
-   one part of the vendor split that is designed but not yet exercised, recorded here
-   honestly.
-3. Done. The kineto adaptor needs no changes.
+2. Add the tracer to the per-accelerator source selection in `csrc/CMakeLists.txt`. The
+   build uses `GLOB_RECURSE`, so exactly one tracer factory must be compiled for every
+   accelerator: CUPTI/MCPTI for CUDA, MetaX, and PPU; ROCtracer for DCU; and the
+   unavailable tracer for platforms without a supported activity API.
+3. Done. The kineto adaptor needs no vendor-specific changes.
 
 ---
 
@@ -345,7 +350,27 @@ measure the cost of profiling itself rather than the user's workload, so their a
 not affect any measurement of that workload. Recorded together with the reason under
 `categories_known_gap` in the baseline JSON, rather than quietly omitted.
 
-### 6.2 The flow-pairing assertion is stricter than torch-cuda itself
+### 6.2 MetaX MCPTI compatibility
+
+The MetaX implementation uses the CUDA-compatible MCPTI activity API exposed by
+MACA 3.8.0. MCPTI's runtime callback IDs are not NVIDIA CUPTI IDs, so the tracer
+uses the MetaX callback namespace and defers `mcptiActivityGetApiName` calls until
+after activity flushing. Calling that resolver from the MCPTI buffer callback can
+deadlock the profiler.
+
+MCPTI 3.8.0 can also return a stale iterator pointer after external-correlation
+records. The MetaX path therefore scans the aligned vendor records independently,
+advancing by the complete MCPTI record sizes and resynchronizing on malformed
+candidates. Records with `start == end == 0` are skipped because MCPTI documents
+that pair as the "timing unavailable" sentinel.
+
+The validated workload passed all seven parity assertions on a C550 with the
+MetaX 3.8.0 SDK. The test covered kernel, memcpy, memset, and runtime records,
+flow pairing, external-correlation device-time attribution, kernel metadata,
+callback-ID names, and capture-window filtering. The scanner has not yet been
+validated across multiple MetaX SDK versions, devices, or non-default streams.
+
+### 6.3 The flow-pairing assertion is stricter than torch-cuda itself
 
 Parity assertion 2 requires **every** flow arrow to be paired. **torch-cuda does not satisfy
 that** — same workload, 3 consecutive runs, fully reproducible:
@@ -405,3 +430,42 @@ Torch profiler ID used by `getLinkedActivity()`. `FLAGOS_MUPTI_LIBRARY` override
 and `FLAGOS_MUPTI_DEBUG=1` enables setup diagnostics. The MTT S5000 validation captured real
 positive-duration kernel, runtime, and memcpy records and valid Chrome JSON; CPU-only Kineto
 resolver behavior remains environment-dependent, so full profiler parity is not claimed.
+
+## Enflame GCU TOPSPTI integration
+
+GCU uses `csrc/profiler/gcu_topspti_device_tracer.cc` and the optional `topspti_shim.h`. The
+Enflame TopsRider SDK ships a CUPTI-shaped tracing interface in
+`/opt/tops/extras/TOPSPTI` (`libtopspti.so`), which delivers kernel, memcpy, memset, runtime,
+and driver records through asynchronous activity buffers. The tracer keeps every TOPSPTI type
+below the generic `DeviceTracer` boundary, and CMake excludes CUPTI, ROCtracer, MSPTI, and
+MUPTI for `ACCELERATOR=gcu`, leaving exactly one `MakeDeviceTracer()` factory.
+`topsptiActivityRegisterCallbacks` and the activity kinds are armed when a Kineto session
+starts, not at shared-library import, so ordinary GCU operator processes never load the
+vendor profiler. Records with implausible timestamps are dropped rather than emitted as
+corrupt trace entries, and kernel grid/block, context, stream, byte-count, fill-value,
+callback-name, and correlation metadata are copied before the buffer is released.
+
+TOPSPTI reports its own device clock, so the tracer samples `topsptiGetTimestamp()` against
+`CLOCK_REALTIME` at session start and stop and maps activity times with the same affine
+conversion the MUPTI path uses. `FLAGOS_TOPSPTI_LIBRARY` overrides library lookup and
+`FLAGOS_TOPSPTI_DEBUG=1` enables setup diagnostics. When the SDK headers are missing at build
+time or the runtime library cannot be resolved, the GCU tracer compiles and reports as an
+unavailable stub and CPU-only profiling continues normally.
+
+**The GCU correlation path differs from every other vendor here, and §2 applies directly.**
+TOPSPTI exposes no equivalent of `cuptiActivityPushExternalCorrelationId`, so there are no
+external-correlation activity records to decode. The vendor `correlationId` still pairs a
+runtime record with the device record it produced, which is what `ac2g` flow arrows need. To
+recover the *torch* id that drives device-time attribution, the tracer records the Kineto
+session's current correlation (a thread-local set by `pushCorrelation`/`popCorrelation`)
+inside the TOPSPTI API-enter callback, keyed by vendor correlation id, and resolves the
+mapping in `drain()`. Device timing therefore does not depend on that callback: if a TOPSPTI
+release does not deliver runtime callbacks, kernels are still captured, and only
+`External id` linkage is absent.
+
+This integration is verified at the build level only: the tracer compiles against the
+installed TOPSPTI headers, against a no-SDK GCU configuration, and in the non-GCU
+configuration, and CMake detects `/opt/tops/extras/TOPSPTI/include`. It has **not** been run
+on physical GCU hardware, so no captured-activity, flow-arrow, or device-time claim is made
+for this platform; `tests/integration/test_profiler_gcu.py` is the gate that would establish
+those, and it skips without a GCU device.
