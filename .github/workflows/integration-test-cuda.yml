@@ -50,25 +50,10 @@ on:
       - "CMakeLists.txt"
       - "pyproject.toml"
       - "setup.py"
-  pull_request:
-    branches:
-      - "2.9"
-    paths:
-      - "docker/**"
-      - ".github/scripts/set_env_cuda.sh"
-      - ".github/workflows/integration-test-cuda.yml"
-      - "cmake/**"
-      - "csrc/**"
-      - "include/**"
-      - "tests/**"
-      - "torch_fl/**"
-      - "CMakeLists.txt"
-      - "pyproject.toml"
-      - "setup.py"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# Pull requests targeting 2.9 are executed by ci.yml, which calls this
+# workflow through workflow_call. Do not also trigger this workflow directly on
+# pull_request: GitHub would create a duplicate CUDA run and the called workflow
+# can share the caller's concurrency group, causing a deadlock.
 
 jobs:
   build-image:
