@@ -58,6 +58,14 @@ jobs:
       - torch-fl-nv
     timeout-minutes: ${{ inputs.timeout-minutes || 60 }}
     steps:
+      # Previous container runs may have left root-owned build artifacts in the
+      # persistent self-hosted workspace. Restore ownership before checkout so
+      # actions/checkout can clean the repository as the runner user.
+      - name: Repair workspace ownership
+        run: |
+          set -euo pipefail
+          sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
       - uses: actions/checkout@v4
 
       - name: Build CUDA base image
