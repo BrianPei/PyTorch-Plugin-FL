@@ -34,10 +34,12 @@ on:
         required: false
         type: number
         default: 60
+  # Direct pushes to the fork branch are useful for testing this workflow.
+  # Once merged into upstream/2.9, ci.yml is the single entry point and calls
+  # this file through workflow_call, so do not add 2.9 here.
   push:
     branches:
       - build_cuda_docker
-      - "2.9"
     paths:
       - "docker/**"
       - ".github/scripts/set_env_cuda.sh"
