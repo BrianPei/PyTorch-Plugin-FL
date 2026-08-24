@@ -141,7 +141,12 @@ else
 fi
 
 VENV_PYTHON="$VENV_ROOT/bin/python"
-if [[ ! -x "$VENV_PYTHON" ]]; then
+venv_is_usable() {
+  [[ -x "$VENV_PYTHON" ]] || return 1
+  "$VENV_PYTHON" -m pip --version >/dev/null 2>&1
+}
+
+if ! venv_is_usable; then
   # The current TopsRider base image does not ship python3.12-venv.  Keep the
   # dependency in the chip-specific setup path so the common workflow remains
   # image/workflow agnostic; a derived CI image should still bake this package
@@ -155,8 +160,7 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   fi
 fi
 
-VENV_PYTHON="$VENV_ROOT/bin/python"
-if [[ ! -x "$VENV_PYTHON" ]]; then
+if ! venv_is_usable; then
   echo "::error::Isolated Python was not created at $VENV_ROOT; install python3.12-venv in the CI image" >&2
   exit 1
 fi
