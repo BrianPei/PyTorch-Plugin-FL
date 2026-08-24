@@ -41,16 +41,15 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
-# Default to Tsinghua mirrors for speed on the Aliyun DSW runner pod: the
-# pytorch-wheels CPU index for the stock torch wheel and the TUNA PyPI mirror
-# for build/test deps (setuptools/cmake/patchelf/pytest/transformers/...). The
-# PPU image's pip.conf points at an internal mirror that returns 503, so these
-# defaults bypass it. Both stay overridable via env: if the pod proxy blocks a
-# mirror (the TUNA PyPI mirror has been seen to 403 pip's UA on some pods),
-# set TORCH_FL_PIP_INDEX_URL=https://pypi.org/simple and/or
-# TORCH_FL_CPU_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu.
-CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cpu}"
-PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+# Use the official indexes by default: the PPU runner pod's HTTP proxy returns
+# 500 on HTTPS CONNECT to *.tuna.tsinghua.edu.cn, so the Tsinghua PyPI and
+# pytorch-wheels mirrors are unreachable from the pod (the proxy whitelists
+# pypi.org and download.pytorch.org, which CI was green on before). The PPU
+# image's own pip.conf points at an internal mirror that 503s, so the explicit
+# index-url here bypasses it. Both stay overridable via env: flip to the
+# Tsinghua mirrors once the pod proxy allows them.
+CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
+PIP_INDEX_URL="${TORCH_FL_PIP_INDEX_URL:-https://pypi.org/simple}"
 
 # PPU SDK lives under either /usr/local/PPU-SDK (hyphen, host-mounted on the
 # CI runner via container_volumes) or /usr/local/PPU_SDK (underscore, in-image
@@ -213,7 +212,11 @@ fi
 # patchelf is missing by default on PPU nodes (bundle_common.sh notes it is
 # absent on all four vendor nodes). Install it into the venv so bundle_ppu's
 # bundle_require_patchelf check passes; mirrors the DCU line (commit 6568415).
-"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" --upgrade pip setuptools wheel cmake patchelf
+# Do not --upgrade pip/setuptools/wheel: the fresh venv from ensurepip already
+# satisfies them, and that upgrade round-trip is what hit the pod proxy 500.
+# Install only what the venv lacks: cmake, patchelf, and build (the dedicated
+# workflow runs `python -m build`, which needs the build package in the venv).
+"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" cmake patchelf build
 "$VENV_PYTHON" -m pip install \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
