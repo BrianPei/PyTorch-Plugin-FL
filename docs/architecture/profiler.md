@@ -467,5 +467,8 @@ This integration is verified at the build level only: the tracer compiles agains
 installed TOPSPTI headers, against a no-SDK GCU configuration, and in the non-GCU
 configuration, and CMake detects `/opt/tops/extras/TOPSPTI/include`. It has **not** been run
 on physical GCU hardware, so no captured-activity, flow-arrow, or device-time claim is made
-for this platform; `tests/integration/test_profiler_gcu.py` is the gate that would establish
-those, and it skips without a GCU device.
+for this platform; `tests/integration/test_profiler_contract.py` is the gate that would
+establish those. That contract test asserts unconditionally once a device is present, so a
+capture or linkage gap on real GCU hardware surfaces as a CI failure rather than a skip;
+the only skip-like early exit is the environment preflight in `conftest.py`, which aborts the
+whole run when no flagos device exists at all.
