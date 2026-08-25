@@ -123,11 +123,3 @@ integration_tests:
       python -m pytest tests/integration/test_qwen3_train.py
       --model "$MODEL_PATH" -v -s --tb=short
 
-  # Device-only contract cases skip through profiler capabilities while the
-  # Ascend tracer exposes CPU/Trace records only. CPU/API coverage still runs.
-  # ---------------------------------------------------------------------------
-  # Follow-up (not part of first-version acceptance). Tracked here so the
-  # upstream gaps not yet covered by CI are not lost:
-  #   - Qwen3 inference/training smoke once a model is mounted on the Ascend
-  #     runner (deferred; not required for the first-version op contract).
-  # ---------------------------------------------------------------------------
