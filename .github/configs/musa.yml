@@ -1,0 +1,143 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MUSA runs native mudnn kernels, not CUDA boxing: the toolkit ships no cudart
+# and builds against stock CPU PyTorch 2.10 (see docs/vendors/musa/installation.md).
+#
+# Generic per-op correctness is kept: the representative run below selects
+# `(anyplatform or main_ops)`, minus the FlagGems Python/C++ markers. These
+# tests hold on MUSA because conftest's platform gate only skips the
+# cuda/metax/ascend/flaggems_python markers on this backend, not
+# anyplatform/main_ops. In addition, test_musa_dispatch.py is run with `-m musa`
+# to assert that ops route to the `musa` backend and match the CPU reference
+# (it calls mudnn directly).
+#
+# FlagGems steps are omitted: this image ships no MThreads Triton/FlagGems stack
+# (the vendor flagtree wheel is absent). The hybrid routing can be added once that
+# backend is provisioned and validated, matching how the GCU config defers it.
+#
+# torch.compile is also not run here: the CPU wheel ships no Triton, so a real
+# compile would need the vendor flagtree wheel (flagtree-0.5.0+mthreads3.1) and
+# the MThreads backend. That is recorded as a follow-up environment gap, not as a
+# MUSA compile defect; the gate is left out until the flagtree stack is
+# provisioned and validated on this line.
+#
+# The profiler contract step runs the generic test_profiler_contract.py marked
+# `-m profiler`, same as the other non-CUDA lines. MUSA's mupti tracer is
+# documented under docs/vendors/musa/installation.md; the step is intentionally
+# kept and will be measured end to end on a MUSA runner. If the tracer does not
+# emit the full device/kernel/memcpy event set, that is recorded as an
+# environment gap on this line (the CPU-only Kineto limitation shared with GCU),
+# not as a MUSA tracer defect.
+
+display_name: MUSA
+
+setup_script: .github/scripts/set_env_musa.sh
+
+ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
+
+runner_labels:
+  - mt-8g-cicd-pytorch
+
+container_volumes:
+  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
+
+integration_environment:
+  MODEL_PATH: /models/Qwen3-0.6B
+
+container_options: >-
+  --privileged
+  --ipc=host
+  --shm-size=512g
+  --ulimit memlock=-1
+  --cap-add=SYS_PTRACE
+  --env MTHREADS_VISIBLE_DEVICES=all
+
+timeout_minutes: 60
+wheel_artifact_name: wheel-musa
+# Download the wheel built in the build job instead of rebuilding it in the
+# integration job. This matches the other accelerator lines (ascend/gcu/ppu).
+integration_wheel_source: artifact
+
+integration_tests:
+  - name: Check device availability
+    command: |
+      python - <<'PY'
+      from pathlib import Path
+
+      import torch_fl
+      import torch
+
+      torch_path = Path(torch.__file__).resolve()
+      package_lib = Path(torch_fl.__file__).resolve().parent / "lib"
+
+      assert torch.version.cuda is None, torch.version.cuda
+      assert "/opt/conda/" not in str(torch_path), torch_path
+      assert (package_lib / "libtorch_fl.so").is_file(), package_lib
+      # MUSA is native, not CUDA boxing: no cudart and no CUDA boxing kernels.
+      assert not (package_lib / "libtorch_cuda.so").is_file(), package_lib
+      assert torch_fl.flagos.is_available(), "flagos device is unavailable"
+      assert torch_fl.flagos.device_count() > 0, torch_fl.flagos.device_count()
+      print(f"CPU PyTorch: {torch.__version__}")
+      print(f"torch path: {torch_path}")
+      print(f"MUSA bundled libs: {package_lib}")
+      print(f"flagos devices: {torch_fl.flagos.device_count()}")
+      PY
+
+  - name: Run generic per-op correctness tests
+    command: >-
+      python -m pytest tests/integration/ops/
+      -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp"
+      -v -s --tb=short
+
+  - name: Run MUSA dispatcher capability tests
+    command: >-
+      python -m pytest tests/integration/ops/test_musa_dispatch.py
+      -m musa -v --tb=long
+
+  - name: Run unified RNG tests
+    command: >-
+      python -m pytest tests/integration/ops/test_rng_dispatch.py
+      -m "main_ops" -v -s --tb=short
+
+  - name: Run general factory and autograd tests
+    command: >-
+      python -m pytest
+      tests/integration/test_factory_ops.py
+      -v -s --tb=short
+
+  - name: Run AMP tests
+    command: python -m pytest tests/integration/test_amp_contract.py -v -m amp --tb=short
+
+  - name: Unified profiler contract
+    command: >-
+      python -m pytest tests/integration/test_profiler_contract.py
+      -v -m profiler --tb=short
+
+  # torch.compile is intentionally not run: the CPU wheel ships no Triton and
+  # this line lacks the vendor flagtree/MThreads runtime. Recorded as a
+  # follow-up environment gap; see the header comment.
+  #
+  - name: Check model availability
+    command: test -d "$MODEL_PATH"
+
+  - name: Run inference tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_infer.py
+      --model "$MODEL_PATH" -v -s --tb=short
+
+  - name: Run training tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_train.py
+      --model "$MODEL_PATH" -v -s --tb=short
