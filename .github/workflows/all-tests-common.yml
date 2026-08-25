@@ -177,6 +177,9 @@ jobs:
           CI_STAGE: integration
         run: bash "${{ needs.configuration.outputs.setup_script }}"
 
+      - name: Install build dependencies
+        run: python -m pip install --upgrade build
+
       - name: Build wheel
         run: python -m build --wheel --no-isolation
 
