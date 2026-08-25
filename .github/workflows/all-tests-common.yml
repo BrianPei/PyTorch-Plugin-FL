@@ -28,21 +28,10 @@ on:
         required: false
         type: boolean
         default: true
-      # Legacy inputs retained for backwards compatibility with existing
-      # callers (ci.yml and manual workflow_dispatch). Build and integration
-      # tests now run in a single job, in the same container, so the wheel is
-      # always built locally and these two inputs are no longer consulted.
       upload_artifact:
         required: false
         type: boolean
         default: true
-      integration_wheel_source:
-        required: false
-        type: string
-        default: auto
-        description: >-
-          Deprecated. Wheel source for integration tests: auto, artifact, or
-          local-build.
       timeout_minutes:
         required: false
         type: number
@@ -98,9 +87,6 @@ jobs:
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
           INTEGRATION_TESTS=$(yq -o=json -I=0 '.integration_tests // []' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
-          # Build and integration tests now run in a single job, so the wheel is
-          # always built in-container. The legacy artifact/upload selection is
-          # retained only for callers that still pass the inputs; it is a no-op.
           if [[ "${{ inputs.timeout_minutes }}" -gt 0 ]]; then
             TIMEOUT_MINUTES="${{ inputs.timeout_minutes }}"
           fi
@@ -138,7 +124,7 @@ jobs:
 
   build-and-test:
     name: Build and test (${{ needs.configuration.outputs.display_name }})
-    if: inputs.run_build
+    if: inputs.run_build || inputs.run_integration_tests
     needs: configuration
     runs-on: ${{ fromJson(needs.configuration.outputs.runs_on) }}
     timeout-minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
@@ -155,20 +141,54 @@ jobs:
 
       - name: Prepare platform environment
         env:
-          CI_STAGE: integration
+          CI_STAGE: ${{ inputs.run_integration_tests && 'integration' || 'build' }}
         run: bash "${{ needs.configuration.outputs.setup_script }}"
 
       - name: Install build tools
         run: python -m pip install --upgrade build
 
       - name: Build wheel
-        run: python -m build --wheel --no-isolation
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python -m build --wheel --no-isolation
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [[ ${#wheels[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one wheel in dist/, found ${#wheels[@]}"
+            printf '::error::  %s\n' "${wheels[@]}"
+            exit 1
+          fi
+          WHEEL_PATH="${wheels[0]}"
+          echo "WHEEL_PATH=$WHEEL_PATH"
+          echo "WHEEL_SHA256=$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
+          echo "WHEEL_PATH=$WHEEL_PATH" >> "$GITHUB_ENV"
+          echo "WHEEL_SHA256=$(sha256sum "$WHEEL_PATH" | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: Install wheel and test dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install --force-reinstall --no-deps dist/*.whl
-          python -m pip install pytest
+          python -m pip install --force-reinstall --no-deps "$WHEEL_PATH"
+          # Missing or malformed Requires-Dist must surface as a real failure.
+          python -m pip check
+          if [[ "${{ inputs.run_integration_tests }}" == "true" ]]; then
+            python -m pip install pytest
+          fi
+          python - <<PY
+          from importlib import metadata
+          from pathlib import Path
+
+          wheel = Path("$WHEEL_PATH")
+          assert wheel.is_file(), f"wheel not found: {wheel}"
+          files = metadata.files("torch_fl")
+          assert files is not None, "torch_fl has no RECORD in installed metadata"
+          names = {str(f) for f in files}
+          assert any(n.endswith("lib/libtorch_fl.so") for n in names), (
+              "installed torch_fl has no lib/libtorch_fl.so in RECORD"
+          )
+          print(f"wheel metadata RECORD OK: {len(names)} files")
+          PY
 
       - name: Prepare wheel-only test workspace
         run: |
@@ -186,8 +206,8 @@ jobs:
           python .github/scripts/run_integration_tests.py
 
       - name: Upload wheel
-        if: inputs.upload_artifact
+        if: always() && inputs.run_build && inputs.upload_artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-          path: dist/*.whl
+          path: ${{ env.WHEEL_PATH }}
