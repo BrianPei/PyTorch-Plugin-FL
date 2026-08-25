@@ -12,9 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared fixtures and helpers for the cross-backend profiler contract."""
+"""Shared fixtures and helpers for the cross-backend profiler contract.
 
+Three layers are kept separate so a backend that cannot yet satisfy the full
+public contract still leaves evidence instead of being whitelisted out:
+
+1. Environment preflight -- the integration conftest exits early when no flagos
+   device is available (``pytest.exit`` in ``conftest.py``). That decides whether
+   the backend is present at all, not how much profiling it can do.
+2. Required Contract -- ``test_profiler_contract.py`` asserts a full-featured
+   profiler (kernel, runtime, memcpy, memset, flow, linkage, metadata). There is
+   no per-platform capability table and no skip: if a backend emits none of a
+   category, the test fails.
+3. Observed result -- ``submit_observation`` records what the profiler actually
+   emitted on this box, and ``pytest_sessionfinish`` writes ``profiler-observations.json``
+   under ``REPORT_DIR`` (``integration-reports/``). This is report-only and never
+   gates a test, so a genuinely missing capability is visible in CI rather than
+   silently dropped.
+"""
+
+import inspect
 import json
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,17 +45,23 @@ from platform_support import detect_platform
 
 @dataclass(frozen=True)
 class ProfilerCapabilities:
-    """Observable profiler features expected from the active backend."""
+    """The Required Contract a full-featured profiler must satisfy.
+
+    ``platform`` labels the active backend. The feature flags are constants,
+    never switches: every supported backend is expected to emit all of them.
+    Kept as a dataclass so the contract reads as one object; no test may use a
+    flag to skip.
+    """
 
     platform: str
-    device: bool
-    kernel: bool
-    runtime: bool
-    memcpy: bool
-    memset: bool
-    flow: bool
-    linkage: bool
-    metadata: bool
+    device: bool = True
+    kernel: bool = True
+    runtime: bool = True
+    memcpy: bool = True
+    memset: bool = True
+    flow: bool = True
+    linkage: bool = True
+    metadata: bool = True
 
 
 def _torch_device():
@@ -51,31 +76,96 @@ def _torch_module():
     return torch
 
 
-def capabilities_for_platform(platform: str) -> ProfilerCapabilities:
-    """Describe public profiler features currently emitted by each tracer.
-
-    All supported platforms should provide full device profiling capabilities
-    (kernel, runtime, memcpy, memset, flow, linkage, metadata) to ensure
-    uniform CI coverage across hardware backends.
-    """
-    # All platforms should support full profiling
-    return ProfilerCapabilities(
-        platform=platform,
-        device=True,
-        kernel=True,
-        runtime=True,
-        memcpy=True,
-        memset=True,
-        flow=True,
-        linkage=True,
-        metadata=True,
-    )
+def required_capabilities() -> ProfilerCapabilities:
+    """The Required Contract for the active backend (report label only)."""
+    return ProfilerCapabilities(platform=detect_platform())
 
 
 @pytest.fixture(scope="session")
 def profiler_capabilities():
-    """Capabilities for the active hardware/backend."""
-    return capabilities_for_platform(detect_platform())
+    """Required Contract capabilities for the active backend."""
+    return required_capabilities()
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: observed result. Purely report-only; nothing here may skip a test.
+# ---------------------------------------------------------------------------
+
+_OBSERVATION_STORE: dict = {}
+
+
+def submit_observation(module: str, trace) -> None:
+    """Record what the active tracer actually emitted for ``module``.
+
+    ``module`` is the test module that produced ``trace`` (captured by the
+    ``profile_result`` fixture). Aggregated at session finish and written by
+    ``publish_observations``.
+    """
+    events = trace.get("traceEvents", [])
+    _OBSERVATION_STORE[module] = {
+        "categories": sorted(event_categories(trace)),
+        "total_events": len(events),
+        "kernel": len(events_in(trace, "kernel")),
+        "gpu_memcpy": len(events_in(trace, "gpu_memcpy")),
+        "gpu_memset": len(events_in(trace, "gpu_memset")),
+        "privateuse1_runtime": len(events_in(trace, "privateuse1_runtime")),
+        "flow": len(
+            [e for e in events if e.get("cat") == "ac2g" and e.get("ph") in {"s", "f"}]
+        ),
+    }
+
+
+def _observation_path() -> Path:
+    """Where to write profiler-observations.json.
+
+    CI sets ``REPORT_DIR`` (see the integration runner). A local run falls back
+    to ``integration-reports/`` under the repository root.
+    """
+    report_dir = os.environ.get("REPORT_DIR")
+    if report_dir:
+        return Path(report_dir) / "profiler-observations.json"
+    return Path(__file__).resolve().parents[2] / "integration-reports" / "profiler-observations.json"
+
+
+def publish_observations(exitstatus: int) -> None:
+    """Write the observed result, even when the contract failed."""
+    if not _OBSERVATION_STORE:
+        return
+    record = {
+        "platform": detect_platform(),
+        "pytest_exitstatus": exitstatus,
+        "observed_modules": [
+            {"module": module, "metrics": metrics}
+            for module, metrics in sorted(_OBSERVATION_STORE.items())
+        ],
+    }
+    path = _observation_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"\n[profiler] wrote observed result: {path}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Pytest hook: publish the observed profiler result at session end."""
+    # Kept above the fixture so a trace failure still writes the report.
+    publish_observations(exitstatus)
+
+
+def _consumer_module() -> str:
+    """Name of the test module that requested the ``profile_result`` fixture.
+
+    The fixture is solved while a test module is being set up, so the module
+    whose tests requested it is on the stack. ``profile_result`` itself lives
+    here in ``profiler_support``, so the walk skips this module and returns the
+    first other ``tests.integration`` module.
+    """
+    frame = inspect.currentframe()
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if module.startswith("tests.integration") and module != __name__:
+            return module
+        frame = frame.f_back
+    return "unknown-module"
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +216,7 @@ def profile_result():
         trace = json.loads(trace_path.read_text())
     finally:
         trace_path.unlink(missing_ok=True)
+    submit_observation(_consumer_module(), trace)
     return prof, trace
 
 

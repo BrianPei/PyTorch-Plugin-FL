@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One public profiler contract shared by every FlagOS hardware backend."""
+"""One public profiler contract shared by every FlagOS hardware backend.
+
+This is the Required Contract: a full-featured profiler (device activity,
+kernel, runtime, memcpy, memset, flow, linkage, metadata). There is no
+per-platform capability table and no skip -- if the active backend emits none
+of a category, the test fails and the evidence is written to
+``profiler-observations.json`` (see profiler_support.py)."""
 
 from collections import Counter
 
@@ -42,11 +48,8 @@ def test_profiler_cpu_api_and_trace_export(profile_result):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_kernel
-def test_profiler_kernel_events(profile_result, profiler_capabilities):
+def test_profiler_kernel_events(profile_result):
     """Device profiling exposes named kernels with positive durations."""
-    if not profiler_capabilities.kernel:
-        pytest.skip(f"{profiler_capabilities.platform} does not emit kernel events")
-
     kernels = events_in(profile_result[1], "kernel")
     assert kernels, "profiler produced no kernel events"
     assert all(event.get("name") for event in kernels)
@@ -55,11 +58,8 @@ def test_profiler_kernel_events(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_runtime
-def test_profiler_runtime_events(profile_result, profiler_capabilities):
+def test_profiler_runtime_events(profile_result):
     """Device runtime activity uses the neutral PrivateUse1 runtime category."""
-    if not profiler_capabilities.runtime:
-        pytest.skip(f"{profiler_capabilities.platform} does not emit runtime events")
-
     runtimes = events_in(profile_result[1], "privateuse1_runtime")
     assert runtimes, "profiler produced no privateuse1_runtime events"
     assert all(event.get("name") for event in runtimes)
@@ -69,11 +69,8 @@ def test_profiler_runtime_events(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_metadata
-def test_profiler_kernel_device_metadata(profile_result, profiler_capabilities):
+def test_profiler_kernel_device_metadata(profile_result):
     """Kernel records expose usable device and stream metadata."""
-    if not profiler_capabilities.metadata:
-        pytest.skip(f"{profiler_capabilities.platform} has no kernel metadata contract")
-
     kernels = events_in(profile_result[1], "kernel")
     assert kernels, "metadata check has no kernel events"
     for event in kernels:
@@ -84,11 +81,8 @@ def test_profiler_kernel_device_metadata(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_flow
-def test_profiler_flow_events_are_paired(profile_result, profiler_capabilities):
+def test_profiler_flow_events_are_paired(profile_result):
     """CPU-to-device flow arrows are renderable start/finish pairs."""
-    if not profiler_capabilities.flow:
-        pytest.skip(f"{profiler_capabilities.platform} does not emit flow events")
-
     flows = [
         event
         for event in profile_result[1].get("traceEvents", [])
@@ -103,11 +97,8 @@ def test_profiler_flow_events_are_paired(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_linkage
-def test_profiler_device_time_linkage(profile_result, profiler_capabilities):
+def test_profiler_device_time_linkage(profile_result):
     """key_averages device time equals the linked device events in the trace."""
-    if not profiler_capabilities.linkage:
-        pytest.skip(f"{profiler_capabilities.platform} has no linkage contract")
-
     prof, trace = profile_result
     mm = next((event for event in prof.key_averages() if event.key == "aten::mm"), None)
     assert mm is not None, "aten::mm is absent from key_averages"
@@ -127,11 +118,8 @@ def test_profiler_device_time_linkage(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_memcpy
-def test_profiler_memcpy_events(profile_result, profiler_capabilities):
-    """Backends advertising memcpy support expose positive byte-count records."""
-    if not profiler_capabilities.memcpy:
-        pytest.skip(f"{profiler_capabilities.platform} does not emit memcpy events")
-
+def test_profiler_memcpy_events(profile_result):
+    """The public memcpy contract exposes positive byte-count records."""
     copies = events_in(profile_result[1], "gpu_memcpy")
     assert copies, "profiler produced no gpu_memcpy events"
     assert all(event.get("dur", 0) > 0 for event in copies)
@@ -140,11 +128,8 @@ def test_profiler_memcpy_events(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_memset
-def test_profiler_memset_events(profile_result, profiler_capabilities):
-    """Backends advertising memset support expose positive byte-count records."""
-    if not profiler_capabilities.memset:
-        pytest.skip(f"{profiler_capabilities.platform} does not emit memset events")
-
+def test_profiler_memset_events(profile_result):
+    """The public memset contract exposes positive byte-count records."""
     memsets = events_in(profile_result[1], "gpu_memset")
     assert memsets, "profiler produced no gpu_memset events"
     assert all(event.get("dur", 0) > 0 for event in memsets)
@@ -153,11 +138,8 @@ def test_profiler_memset_events(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_metadata
-def test_profiler_device_arg_keys(profile_result, profiler_capabilities):
+def test_profiler_device_arg_keys(profile_result):
     """Required neutral metadata fields remain present across device events."""
-    if not profiler_capabilities.metadata:
-        pytest.skip(f"{profiler_capabilities.platform} has no metadata contract")
-
     trace = profile_result[1]
     for category in ("kernel", "privateuse1_runtime"):
         events = events_in(trace, category)
@@ -168,12 +150,9 @@ def test_profiler_device_arg_keys(profile_result, profiler_capabilities):
 @pytest.mark.profiler_device
 @pytest.mark.profiler_runtime
 def test_profiler_capture_window_contains_device_events(
-    profile_result, profiler_capabilities
+    profile_result
 ):
     """Collected device/runtime events remain inside the Trace capture span."""
-    if not profiler_capabilities.device:
-        pytest.skip(f"{profiler_capabilities.platform} has no device activity")
-
     trace = profile_result[1]
     spans = events_in(trace, "Trace")
     assert spans, "trace has no capture window"
@@ -195,11 +174,8 @@ def test_profiler_capture_window_contains_device_events(
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_kernel
-def test_profiler_kernel_names_are_demangled(profile_result, profiler_capabilities):
+def test_profiler_kernel_names_are_demangled(profile_result):
     """Kernel names are readable rather than raw Itanium symbols."""
-    if not profiler_capabilities.kernel:
-        pytest.skip(f"{profiler_capabilities.platform} has no kernel activity")
-
     kernels = events_in(profile_result[1], "kernel")
     assert kernels
     assert not [event for event in kernels if event.get("name", "").startswith("_ZN")]
@@ -208,12 +184,9 @@ def test_profiler_kernel_names_are_demangled(profile_result, profiler_capabiliti
 @pytest.mark.profiler_device
 @pytest.mark.profiler_runtime
 def test_profiler_runtime_names_are_not_all_fallback(
-    profile_result, profiler_capabilities
+    profile_result
 ):
     """Runtime records preserve callback identity instead of one hard-coded name."""
-    if not profiler_capabilities.runtime:
-        pytest.skip(f"{profiler_capabilities.platform} has no runtime activity")
-
     names = Counter(
         event.get("name")
         for event in events_in(profile_result[1], "privateuse1_runtime")
