@@ -15,12 +15,13 @@
 """Shared fixtures and helpers for the cross-backend profiler contract."""
 
 import json
-import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from platform_support import detect_platform
 
 
 @dataclass(frozen=True)
@@ -36,33 +37,6 @@ class ProfilerCapabilities:
     flow: bool
     linkage: bool
     metadata: bool
-
-
-def detect_platform() -> str:
-    """Reuse the integration platform conventions for profiler selection."""
-    accelerator = os.environ.get("ACCELERATOR", "").lower()
-    if accelerator in {"ascend", "metax", "maca", "musa", "gcu"}:
-        return "metax" if accelerator == "maca" else accelerator
-    if os.environ.get("PPU_SDK") or os.environ.get("PPU_HOME"):
-        return "ppu"
-    if Path("/usr/local/PPU_SDK").is_dir():
-        return "ppu"
-
-    try:
-        import torch_fl
-
-        marker = Path(torch_fl.__file__).resolve().parent / "lib" / "flagos_platform"
-        platform = marker.read_text().strip().lower()
-        if platform:
-            return platform
-    except (ImportError, OSError):
-        pass
-
-    config = os.environ.get("FLAGOS_BACKEND_CONFIG", "").lower()
-    for platform in ("ascend", "metax", "musa", "gcu", "cuda"):
-        if platform in config:
-            return platform
-    return "cuda"
 
 
 def _torch_device():
@@ -107,11 +81,22 @@ def profiler_capabilities():
 
 @pytest.fixture(scope="module")
 def profile_result():
-    """Capture one common workload and export it as a Chrome trace."""
+    """Capture one common workload and export it as a Chrome trace.
+
+    Shape and iteration count are kept identical to ``_run_traced_ops()`` in
+    test_profiler_parity.py, which is the workload proven to emit every activity
+    class this module asserts on. It matters for memsets specifically: cuBLAS
+    only allocates (and zeroes) a gemm workspace once the matmul is large enough
+    and repeated enough to pick a workspace-using kernel. A 256x256 x3 loop stays
+    under that threshold on CUDA and produced no gpu_memset events at all, while
+    still passing on backends whose sort allocates zeroed scratch -- so shrinking
+    this workload silently converts the memset assertion into a no-op on some
+    vendors and a failure on others.
+    """
     torch = _torch_module()
     device = _torch_device()
-    x = torch.randn(256, 256, device=device)
-    y = torch.randn(256, 256, device=device)
+    x = torch.randn(1024, 1024, device=device)
+    y = torch.randn(1024, 1024, device=device)
     small = torch.randn(16, device=device)
 
     with torch.profiler.profile(
@@ -121,10 +106,10 @@ def profile_result():
         ],
         with_stack=False,
     ) as prof:
-        for _ in range(3):
+        for _ in range(5):
             z = (x @ y).relu()
         torch.sort(small)
-        z.sum().item()
+        z.sum().item()  # force sync so device activity lands inside the window
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as trace_file:
         trace_path = Path(trace_file.name)

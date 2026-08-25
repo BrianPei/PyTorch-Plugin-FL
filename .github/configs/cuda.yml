@@ -82,10 +82,24 @@ integration_tests:
       -m "main_ops" -v -s --tb=short
   - name: Run general tests
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+  - name: Unified AMP contract
+    command: >-
+      python -m pytest tests/integration/test_amp_contract.py
+      -v -m amp --tb=short
   - name: Unified profiler contract
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
+
+  # Structural comparison against tests/data/profiler_cuda_baseline.json, which
+  # the shared contract does not cover: it asserts the public API surface, while
+  # this checks tracer output against stock torch+cuda. Carried over from the
+  # inline step this manifest replaces.
+  - name: Profiler parity test
+    command: >-
+      python -m pytest tests/integration/test_profiler_parity.py
+      -v -m main_ops --tb=short
+
   - name: Run inference tests
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py
