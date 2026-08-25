@@ -231,8 +231,14 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   # to parse the spm model proto. The isolated venv cannot see the vendor image's
   # copies. These belong here rather than in a workflow step: pip must be given
   # an explicit --index-url to bypass the image pip.conf internal mirror (503).
+  # transformers is pinned below 5: an unpinned install resolves to 5.3.0, whose
+  # TokenizersBackend rewrite has an unresolved upstream bug where the Qwen3
+  # slow-to-fast tokenizer conversion still raises "Couldn't instantiate the
+  # backend tokenizer" even with sentencepiece/tiktoken installed (see
+  # https://huggingface.co/Qwen/Qwen3-8B/discussions/33). Revisit once upstream
+  # ships a fix.
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" \
-    pytest transformers sentencepiece tiktoken protobuf
+    pytest "transformers<5" sentencepiece tiktoken protobuf
   # flag_gems runtime path (step 4) imports from the mounted source via the
   # _flag_gems_mounted_source.pth above. The CI image lacks flag_gems' pure
   # Python deps (sqlalchemy/PyYAML/packaging -- not in the image site-packages,
