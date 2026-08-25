@@ -104,6 +104,4 @@ jobs:
             {"name":"Run general tests","command":"python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short"},
             {"name":"Run inference tests","command":"python -m pytest tests/integration/test_qwen3_infer.py --model \"$MODEL_PATH\" -v -s --tb=short"},
             {"name":"Run training tests","command":"python -m pytest tests/integration/test_qwen3_train.py --model \"$MODEL_PATH\" -v -s --tb=short"}]
-        run: |
-          python -m pip install sentencepiece tiktoken protobuf
-          python .github/scripts/run_integration_tests.py
+        run: python .github/scripts/run_integration_tests.py
