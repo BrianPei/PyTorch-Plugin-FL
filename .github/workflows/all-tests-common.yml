@@ -28,6 +28,10 @@ on:
         required: false
         type: boolean
         default: true
+      # Legacy inputs retained for backwards compatibility with existing
+      # callers (ci.yml and manual workflow_dispatch). Build and integration
+      # tests now run in a single job, in the same container, so the wheel is
+      # always built locally and these two inputs are no longer consulted.
       upload_artifact:
         required: false
         type: boolean
@@ -37,7 +41,8 @@ on:
         type: string
         default: auto
         description: >-
-          Wheel source for integration tests: auto, artifact, or local-build.
+          Deprecated. Wheel source for integration tests: auto, artifact, or
+          local-build.
       timeout_minutes:
         required: false
         type: number
@@ -61,7 +66,6 @@ jobs:
       container_options: ${{ steps.config.outputs.container_options }}
       timeout_minutes: ${{ steps.config.outputs.timeout_minutes }}
       wheel_artifact_name: ${{ steps.config.outputs.wheel_artifact_name }}
-      integration_wheel_source: ${{ steps.config.outputs.integration_wheel_source }}
       integration_tests: ${{ steps.config.outputs.integration_tests }}
       integration_environment: ${{ steps.config.outputs.integration_environment }}
     steps:
@@ -94,32 +98,9 @@ jobs:
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
           INTEGRATION_TESTS=$(yq -o=json -I=0 '.integration_tests // []' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
-          CONFIG_WHEEL_SOURCE=$(yq -r '.integration_wheel_source // "auto"' "$CONFIG_FILE")
-          INTEGRATION_WHEEL_SOURCE="${{ inputs.integration_wheel_source }}"
-
-          if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
-            INTEGRATION_WHEEL_SOURCE="$CONFIG_WHEEL_SOURCE"
-          fi
-          if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
-            if [[ "${{ inputs.run_build }}" == "true" ]]; then
-              INTEGRATION_WHEEL_SOURCE="artifact"
-            else
-              INTEGRATION_WHEEL_SOURCE="local-build"
-            fi
-          fi
-          if [[ "$INTEGRATION_WHEEL_SOURCE" != "artifact" &&
-                "$INTEGRATION_WHEEL_SOURCE" != "local-build" ]]; then
-            echo "::error::integration_wheel_source must be artifact or local-build"
-            exit 1
-          fi
-          if [[ "${{ inputs.run_integration_tests }}" == "true" &&
-                "$INTEGRATION_WHEEL_SOURCE" == "artifact" &&
-                ( "${{ inputs.run_build }}" != "true" ||
-                  "${{ inputs.upload_artifact }}" != "true" ) ]]; then
-            echo "::error::artifact integration requires run_build and upload_artifact"
-            exit 1
-          fi
-
+          # Build and integration tests now run in a single job, so the wheel is
+          # always built in-container. The legacy artifact/upload selection is
+          # retained only for callers that still pass the inputs; it is a no-op.
           if [[ "${{ inputs.timeout_minutes }}" -gt 0 ]]; then
             TIMEOUT_MINUTES="${{ inputs.timeout_minutes }}"
           fi
@@ -150,48 +131,63 @@ jobs:
           printf '%s=%s\n' container_options "$OPTIONS" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' timeout_minutes "$TIMEOUT_MINUTES" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' wheel_artifact_name "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          printf '%s=%s\n' integration_wheel_source "$INTEGRATION_WHEEL_SOURCE" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' runs_on "$RUNS_ON" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' container_volumes "$VOLUMES" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' integration_tests "$INTEGRATION_TESTS" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' integration_environment "$INTEGRATION_ENVIRONMENT" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build
+  build-and-test:
+    name: Build and test (${{ needs.configuration.outputs.display_name }})
     if: inputs.run_build
     needs: configuration
-    uses: ./.github/workflows/build-wheel-common.yml
-    with:
-      display_name: ${{ needs.configuration.outputs.display_name }}
-      setup_script: ${{ needs.configuration.outputs.setup_script }}
+    runs-on: ${{ fromJson(needs.configuration.outputs.runs_on) }}
+    timeout-minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
+    container:
       image: ${{ needs.configuration.outputs.ci_image }}
-      runs_on: ${{ needs.configuration.outputs.runs_on }}
-      container_volumes: ${{ needs.configuration.outputs.container_volumes }}
-      container_options: ${{ needs.configuration.outputs.container_options }}
-      timeout_minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
-      artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-      upload_artifact: ${{ inputs.upload_artifact }}
+      volumes: ${{ fromJson(needs.configuration.outputs.container_volumes) }}
+      options: ${{ needs.configuration.outputs.container_options }}
+    defaults:
+      run:
+        shell: bash
 
-  integration-tests:
-    name: Integration tests
-    if: >-
-      always() &&
-      inputs.run_integration_tests &&
-      needs.configuration.result == 'success' &&
-      (inputs.run_build == false || needs.build.result == 'success')
-    needs:
-      - configuration
-      - build
-    uses: ./.github/workflows/integration-tests-common.yml
-    with:
-      display_name: ${{ needs.configuration.outputs.display_name }}
-      setup_script: ${{ needs.configuration.outputs.setup_script }}
-      image: ${{ needs.configuration.outputs.ci_image }}
-      runs_on: ${{ needs.configuration.outputs.runs_on }}
-      container_volumes: ${{ needs.configuration.outputs.container_volumes }}
-      container_options: ${{ needs.configuration.outputs.container_options }}
-      timeout_minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
-      artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-      wheel_source: ${{ needs.configuration.outputs.integration_wheel_source }}
-      integration_tests: ${{ needs.configuration.outputs.integration_tests }}
-      integration_environment: ${{ needs.configuration.outputs.integration_environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare platform environment
+        env:
+          CI_STAGE: integration
+        run: bash "${{ needs.configuration.outputs.setup_script }}"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build
+
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation
+
+      - name: Install wheel and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip install pytest
+
+      - name: Prepare wheel-only test workspace
+        run: |
+          TEST_ROOT=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-${{ inputs.platform }}.XXXXXX")
+          cp -a tests pyproject.toml "$TEST_ROOT/"
+          printf 'INTEGRATION_WORKDIR=%s\n' "$TEST_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run integration tests
+        if: inputs.run_integration_tests
+        env:
+          INTEGRATION_TESTS: ${{ needs.configuration.outputs.integration_tests }}
+          INTEGRATION_ENVIRONMENT: ${{ needs.configuration.outputs.integration_environment }}
+        run: |
+          set -euo pipefail
+          python .github/scripts/run_integration_tests.py
+
+      - name: Upload wheel
+        if: inputs.upload_artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.configuration.outputs.wheel_artifact_name }}
+          path: dist/*.whl
