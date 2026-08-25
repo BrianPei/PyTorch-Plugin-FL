@@ -157,41 +157,40 @@ jobs:
           printf '%s=%s\n' integration_environment "$INTEGRATION_ENVIRONMENT" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build
-    if: inputs.run_build
+    name: Build and test (${{ needs.configuration.outputs.display_name }})
     needs: configuration
-    uses: ./.github/workflows/build-wheel-common.yml
-    with:
-      display_name: ${{ needs.configuration.outputs.display_name }}
-      setup_script: ${{ needs.configuration.outputs.setup_script }}
+    runs-on: ${{ fromJson(needs.configuration.outputs.runs_on) }}
+    timeout-minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
+    container:
       image: ${{ needs.configuration.outputs.ci_image }}
-      runs_on: ${{ needs.configuration.outputs.runs_on }}
-      container_volumes: ${{ needs.configuration.outputs.container_volumes }}
-      container_options: ${{ needs.configuration.outputs.container_options }}
-      timeout_minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
-      artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-      upload_artifact: ${{ inputs.upload_artifact }}
+      volumes: ${{ fromJson(needs.configuration.outputs.container_volumes) }}
+      options: ${{ needs.configuration.outputs.container_options }}
+    defaults:
+      run:
+        shell: bash
 
-  integration-tests:
-    name: Integration tests
-    if: >-
-      always() &&
-      inputs.run_integration_tests &&
-      needs.configuration.result == 'success' &&
-      (inputs.run_build == false || needs.build.result == 'success')
-    needs:
-      - configuration
-      - build
-    uses: ./.github/workflows/integration-tests-common.yml
-    with:
-      display_name: ${{ needs.configuration.outputs.display_name }}
-      setup_script: ${{ needs.configuration.outputs.setup_script }}
-      image: ${{ needs.configuration.outputs.ci_image }}
-      runs_on: ${{ needs.configuration.outputs.runs_on }}
-      container_volumes: ${{ needs.configuration.outputs.container_volumes }}
-      container_options: ${{ needs.configuration.outputs.container_options }}
-      timeout_minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
-      artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-      wheel_source: ${{ needs.configuration.outputs.integration_wheel_source }}
-      integration_tests: ${{ needs.configuration.outputs.integration_tests }}
-      integration_environment: ${{ needs.configuration.outputs.integration_environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare platform environment
+        env:
+          CI_STAGE: integration
+        run: bash "${{ needs.configuration.outputs.setup_script }}"
+
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation
+
+      - name: Install wheel
+        run: python -m pip install --force-reinstall --no-deps dist/*.whl
+
+      - name: Prepare wheel-only test workspace
+        run: |
+          TEST_ROOT=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-${{ inputs.platform }}.XXXXXX")
+          cp -a tests pyproject.toml "$TEST_ROOT/"
+          printf 'INTEGRATION_WORKDIR=%s\n' "$TEST_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run integration tests
+        env:
+          INTEGRATION_TESTS: ${{ needs.configuration.outputs.integration_tests }}
+          INTEGRATION_ENVIRONMENT: ${{ needs.configuration.outputs.integration_environment }}
+        run: python .github/scripts/run_integration_tests.py
