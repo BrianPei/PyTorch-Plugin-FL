@@ -209,6 +209,14 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
   exit 1
 fi
 
+# The pod's proxied egress to files.pythonhosted.org has been observed at
+# ~90 kB/s, well below what pip's 15s default read timeout tolerates for a
+# single wheel (e.g. the ~30 MB cmake wheel stalled mid-download and tripped
+# ReadTimeoutError). Raise it for every venv pip install below so a slow but
+# still-progressing download is not killed early; this is independent of the
+# index-url choice and applies regardless of which index ends up serving it.
+export PIP_DEFAULT_TIMEOUT=120
+
 # patchelf is missing by default on PPU nodes (bundle_common.sh notes it is
 # absent on all four vendor nodes). Install it into the venv so bundle_ppu's
 # bundle_require_patchelf check passes; mirrors the DCU line (commit 6568415).
