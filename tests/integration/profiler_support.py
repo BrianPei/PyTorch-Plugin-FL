@@ -83,6 +83,9 @@ def capabilities_for_platform(platform: str) -> ProfilerCapabilities:
     The capability table is intentionally about observable behavior, not vendor
     library names. Ascend currently exposes CPU/Trace records only in CI; all
     other supported tracers are expected to provide kernel and runtime records.
+
+    All device-supporting platforms should provide memcpy and memset profiling
+    to ensure uniform CI coverage across hardware backends.
     """
     device = platform != "ascend"
     runtime = device
@@ -91,8 +94,8 @@ def capabilities_for_platform(platform: str) -> ProfilerCapabilities:
         device=device,
         kernel=device,
         runtime=runtime,
-        memcpy=device and platform in {"cuda", "metax", "ppu"},
-        memset=device and platform in {"cuda", "metax"},
+        memcpy=device,  # All device platforms should support memcpy profiling
+        memset=device,  # All device platforms should support memset profiling
         flow=device,
         linkage=device,
         metadata=device,
@@ -123,6 +126,15 @@ def profile_result():
     ) as prof:
         for _ in range(3):
             z = (x @ y).relu()
+
+        # Trigger memset: zero initialization
+        zeros_tensor = torch.zeros(128, 128, device=device)
+
+        # Trigger memcpy: host-to-device and device-to-host transfers
+        cpu_tensor = torch.randn(64, 64)
+        device_copy = cpu_tensor.to(device)
+        back_to_cpu = device_copy.cpu()
+
         torch.sort(small)
         z.sum().item()
 
