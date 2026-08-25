@@ -124,7 +124,11 @@ def _observation_path() -> Path:
     report_dir = os.environ.get("REPORT_DIR")
     if report_dir:
         return Path(report_dir) / "profiler-observations.json"
-    return Path(__file__).resolve().parents[2] / "integration-reports" / "profiler-observations.json"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "integration-reports"
+        / "profiler-observations.json"
+    )
 
 
 def publish_observations(exitstatus: int) -> None:

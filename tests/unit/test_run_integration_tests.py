@@ -14,7 +14,10 @@ from pathlib import Path
 import pytest
 
 SCRIPT_PATH = (
-    Path(__file__).resolve().parents[2] / ".github" / "scripts" / "run_integration_tests.py"
+    Path(__file__).resolve().parents[2]
+    / ".github"
+    / "scripts"
+    / "run_integration_tests.py"
 )
 
 
@@ -160,9 +163,7 @@ def test_preflight_policy_default(runner):
     # A name containing a preflight marker defaults to fail-fast; anything else
     # defaults to the script-level fail-fast constant.
     assert (
-        runner._entry_failure_policy(
-            {"name": "check isolated environment"}, 0
-        )
+        runner._entry_failure_policy({"name": "check isolated environment"}, 0)
         == "fail-fast"
     )
     assert (
@@ -172,7 +173,9 @@ def test_preflight_policy_default(runner):
 
 
 def test_validate_only_does_not_write_reports(runner, monkeypatch, tmp_path):
-    monkeypatch.setenv("INTEGRATION_TESTS", json.dumps([_abort_test("check device", "fail-fast")]))
+    monkeypatch.setenv(
+        "INTEGRATION_TESTS", json.dumps([_abort_test("check device", "fail-fast")])
+    )
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({}))
     monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
     monkeypatch.setattr("sys.argv", ["run_integration_tests.py", "--validate-only"])

@@ -177,9 +177,7 @@ def run_entry(test, command_environment, workdir, report_root, index, total):
         output = result.stdout.decode("utf-8", errors="replace")
         log_fh.write(output)
         if result.returncode:
-            log_fh.write(
-                f"\n--- {name} FAILED (exit code {result.returncode}) ---\n"
-            )
+            log_fh.write(f"\n--- {name} FAILED (exit code {result.returncode}) ---\n")
         log_fh.flush()
 
     duration = time.monotonic() - start
@@ -197,7 +195,10 @@ def run_entry(test, command_environment, workdir, report_root, index, total):
 
 def _has_junitxml(command):
     words = shlex.split(command)
-    return any(word.startswith("--junitxml") or word.startswith("--junit-xml") for word in words)
+    return any(
+        word.startswith("--junitxml") or word.startswith("--junit-xml")
+        for word in words
+    )
 
 
 def write_summary(results, success, out_dir):
@@ -251,7 +252,9 @@ def main():
     results = []
     aborted = False
     for index, test in enumerate(tests, start=1):
-        entry = run_entry(test, command_environment, workdir, report_root, index, len(tests))
+        entry = run_entry(
+            test, command_environment, workdir, report_root, index, len(tests)
+        )
         results.append(entry)
         if entry["status"] == "failed":
             if entry["failure_policy"] == "fail-fast":

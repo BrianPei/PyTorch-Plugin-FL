@@ -149,9 +149,7 @@ def test_profiler_device_arg_keys(profile_result):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_runtime
-def test_profiler_capture_window_contains_device_events(
-    profile_result
-):
+def test_profiler_capture_window_contains_device_events(profile_result):
     """Collected device/runtime events remain inside the Trace capture span."""
     trace = profile_result[1]
     spans = events_in(trace, "Trace")
@@ -183,9 +181,7 @@ def test_profiler_kernel_names_are_demangled(profile_result):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_runtime
-def test_profiler_runtime_names_are_not_all_fallback(
-    profile_result
-):
+def test_profiler_runtime_names_are_not_all_fallback(profile_result):
     """Runtime records preserve callback identity instead of one hard-coded name."""
     names = Counter(
         event.get("name")
