@@ -216,14 +216,19 @@ fi
 
 cd "$REPO_ROOT"
 
-if [[ "$CI_STAGE" == "build" ]]; then
-  # Prebuild so package_data sees libtorch_fl.so before the common workflow
-  # invokes python -m build. The following wheel build is incremental. The
-  # integration job downloads this artifact and must not rebuild from source.
+# build_ext must run in both stages: it produces the libtorch_fl.so that
+# package_data stages into the wheel, and the same single job is the one that
+# later installs and tests that wheel. Gating it to the build stage would leave
+# the integration stage without the native library.
+if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   python setup.py build_ext --inplace
+fi
 
-  # Build-stage availability check. Integration repeats this after installing
-  # the artifact wheel from an isolated test workspace.
+# Availability check. It must run only when the stage actually exercises the
+# device: in the build-only stage there is no device required (the wheel is
+# rebuilt from source in the same job), while the integration stage asserts the
+# card is present before the manifest-driven tests run.
+if [[ "$CI_STAGE" == "integration" ]]; then
   python - <<'PY'
 import torch_fl
 import torch

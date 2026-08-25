@@ -200,9 +200,11 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 fi
 
 cd "$REPO_ROOT"
-if [[ "$CI_STAGE" == "build" ]]; then
-  # Prebuild so package_data contains the generated libtorch_fl.so before the
-  # common wheel workflow stages the final artifact. No device is required at
-  # build time: the MUSA card is checked only in the integration stage below.
+# build_ext must run in both stages: it produces the libtorch_fl.so that
+# package_data stages into the wheel, and the same single job is the one that
+# later installs and tests that wheel. Gating it to the build stage would leave
+# the integration stage without the native library. No device is required here:
+# the MUSA card is checked (in the integration stage) below.
+if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   python setup.py build_ext --inplace
 fi

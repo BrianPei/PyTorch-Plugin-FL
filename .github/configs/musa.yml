@@ -27,29 +27,27 @@
 # (the vendor flagtree wheel is absent). The hybrid routing can be added once that
 # backend is provisioned and validated, matching how the GCU config defers it.
 #
-# torch.compile is also not run here: the CPU wheel ships no Triton, so a real
-# compile would need the vendor flagtree wheel (flagtree-0.5.0+mthreads3.1) and
-# the MThreads backend. That is recorded as a follow-up environment gap, not as a
-# MUSA compile defect; the gate is left out until the flagtree stack is
-# provisioned and validated on this line.
+# torch.compile is run as a real gate, not skipped: the CPU wheel ships no
+# Triton, so a compile needs the vendor flagtree wheel (flagtree-0.5.0+mthreads3.1)
+# and the MThreads backend. Until that stack is provisioned and validated on
+# this line, the compile step fails loudly in CI and the failure is preserved as
+# an environment-gap record rather than hidden behind a skip or a deselect.
 #
 # The profiler contract step runs the generic test_profiler_contract.py marked
 # `-m profiler`, same as the other non-CUDA lines. MUSA's mupti tracer is
-# documented under docs/vendors/musa/installation.md. The shared profiler
-# capability table in tests/integration/profiler_support.py now requires the
-# full device/kernel/memcpy/memset event set on every platform; this is a
-# deliberate raise of the test bar. If the MUSA tracer does not emit those
-# events, the contract test fails loudly in CI rather than being skipped —
-# exactly the outcome we want an environment gap to produce.
+# documented under docs/vendors/musa/installation.md. The profiler is a Required
+# Contract with no per-platform capability table (see profiler_support.py): it
+# requires the full device/kernel/memcpy/memset event set on every platform.
+# If the MUSA tracer does not emit those events, the contract test fails loudly
+# in CI rather than being skipped, and the observed categories land in
+# profiler-observations.json — exactly the evidence an environment gap should
+# produce.
 
 display_name: MUSA
 
 setup_script: .github/scripts/set_env_musa.sh
 
-# Pinned to the verified single-arch manifest digest so the build is
-# reproducible even if the mutable release tag is repointed. Resolved via
-# `docker buildx imagetools inspect` on 2026-08-25.
-ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef@sha256:13f7375aab77a4ace7084558eb939a977467330f558a3c2a185c6c6d31ec8935
+ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
 
 runner_labels:
   - mt-8g-cicd-pytorch
@@ -70,9 +68,8 @@ container_options: >-
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-musa
-# Download the wheel built in the build job instead of rebuilding it in the
-# integration job. This matches the other accelerator lines (ascend/gcu/ppu).
-integration_wheel_source: artifact
+# The single build-and-test job builds the wheel, installs it, and runs the
+# manifest below; this name identifies the uploaded artifact.
 
 integration_tests:
   - name: Check device availability
@@ -99,7 +96,7 @@ integration_tests:
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
 
-  - name: Run generic per-op correctness tests
+  - name: Run operator tests (vendor backend, main ops)
     command: >-
       python -m pytest tests/integration/ops/
       -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp"
@@ -115,13 +112,13 @@ integration_tests:
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops" -v -s --tb=short
 
-  - name: Run general factory and autograd tests
+  - name: Run general tests
     command: >-
       python -m pytest
       tests/integration/test_factory_ops.py
       -v -s --tb=short
 
-  - name: Run AMP tests
+  - name: Unified AMP contract
     command: python -m pytest tests/integration/test_amp_contract.py -v -m amp --tb=short
 
   - name: Unified profiler contract
@@ -129,12 +126,33 @@ integration_tests:
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
 
-  # torch.compile is intentionally not run: the CPU wheel ships no Triton and
-  # this line lacks the vendor flagtree/MThreads runtime. Recorded as a
-  # follow-up environment gap; see the header comment.
-  #
   - name: Check model availability
     command: test -d "$MODEL_PATH"
+
+  # torch.compile must be a real failure, not a comment or a skip. The CPU wheel
+  # ships no Triton and the image lacks the MThreads flagtree backend, so a
+  # genuine compile attempt fails at codegen; running it makes that environment
+  # gap visible in CI and preserving it is the point of this gate. A scripted
+  # compile is used (rather than test_compile.py, which self-skips without
+  # Triton) so the missing stack cannot be silently ignored.
+  - name: Run torch.compile tests
+    command: |
+      python - <<'PY'
+      import torch
+      import torch_fl
+
+      model = torch.nn.Sequential(
+          torch.nn.Linear(128, 128),
+          torch.nn.ReLU(),
+      ).to("flagos:0")
+      x = torch.randn(32, 128, device="flagos:0")
+      compiled = torch.compile(model, backend="flagos")
+      out = compiled(x)
+      assert out.device.type in ("flagos", "privateuseone"), out.device
+      torch_fl.flagos.synchronize()
+      torch.testing.assert_close(out, model(x), rtol=1e-4, atol=1e-4)
+      print("torch.compile on MUSA: OK")
+      PY
 
   - name: Run inference tests
     command: >-

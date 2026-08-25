@@ -43,7 +43,7 @@ Public PyTorch APIs whose behavior must be identical on every backend are tested
 | `amp` | Selects the whole `torch.amp` contract (`tests/integration/test_amp_contract.py`) |
 | `amp_device`, `amp_grad_scaler` | AMP device compute and GradScaler route capabilities |
 
-Each contract has a support module (`profiler_support.py`, `amp_support.py`) holding a frozen capability dataclass resolved from the active platform. A test that needs a capability the backend does not provide skips with a reason naming the platform, so an unimplemented vendor route reports as an intentional skip instead of a fabricated pass. Adding a backend means extending one capability table, not adding a test file.
+Each contract has a support module (`profiler_support.py`, `amp_support.py`). The profiler contract has no per-platform capability table: a full-featured profiler (device activity, kernel, runtime, memcpy, memset, flow, linkage, metadata) is the *required public contract* for every backend. A backend that emits none of a category fails the contract test rather than skipping, and the observed categories are written to `profiler-observations.json` for that platform as evidence. Adding a backend means the same contract test must pass (or fail visibly with recorded evidence), not that a capability table is extended.
 
 Both support modules share `platform_support.detect_platform()` and must not import torch at module scope: they are loaded as pytest plugins before `torch_fl` preloads its device assets, and importing torch first breaks the required library initialization order.
 
@@ -157,7 +157,7 @@ One contract validates the public `torch.profiler` API, Chrome trace export, and
 pytest tests/integration/test_profiler_contract.py -m profiler -v
 ```
 
-Device-only cases (kernel, runtime, memcpy, memset, flow, linkage, metadata) skip on a backend whose tracer does not emit that category. Low-level PrivateUse1 dispatcher and CUPTI-bridge regressions stay in `tests/unit/test_profiler_privateuse1.py`.
+Device-only cases (kernel, runtime, memcpy, memset, flow, linkage, metadata) are asserted unconditionally. A backend whose tracer does not emit one of these categories fails the contract test instead of skipping, and the categories it did emit are written to `profiler-observations.json` under `REPORT_DIR` (default `integration-reports/`) as observed evidence. Low-level PrivateUse1 dispatcher and CUPTI-bridge regressions stay in `tests/unit/test_profiler_privateuse1.py`.
 
 ### AMP Tests
 
@@ -231,14 +231,14 @@ GitHub Actions CI runs a subset of tests based on pytest marks:
 - **Smoke tests**: `-m main_ops` (CUDA boxing kernels only)
 - **FlagGems tests**: `-m "flaggems and main_ops"` (when `FLAGOS_USE_FLAGGEMS=1`)
 - **Platform tests**: Vendor-specific runners filter by platform marker (e.g., `-m "ascend and main_ops"`)
-- **Cross-backend contracts**: platform manifests under `.github/configs/` run the same `-m amp` and `-m profiler` commands rather than per-vendor test files. A manifest omits a contract only when the gap is recorded in the file (GCU currently omits the profiler contract: its CPU-only PyTorch/Kineto image supplies no PrivateUse1 resolver, so TOPSPTI activities never surface as device events).
+- **Cross-backend contracts**: platform manifests under `.github/configs/` run the same `-m amp` and `-m profiler` commands rather than per-vendor test files. The profiler contract is a Required Contract: every platform runs it unconditionally. A backend that cannot emit a category fails the contract test instead of skipping, and the observed categories are recorded in `profiler-observations.json` -- so a real gap surfaces in CI as a failure plus evidence, not as a silent omission (GCU and PPU currently fail this contract on their CPU-only images).
 
 To replicate CI behavior locally, use the same mark expressions shown above.
 
-`.github/configs/<platform>.yml` is the only place that defines what a platform runs. Platforms
-without dedicated hardware requirements go through `all-tests-common.yml`; ascend, cuda, dcu, and
-metax keep their own pipelines (hardcoded runner labels and container images) but pull the test
-list through `load-platform-tests.yml`, an `ubuntu-latest` job that parses the config with `yq`
-and hands the result to the hardware job. Adding or renaming a step means editing only the
-config: nothing lists tests inline. Keeping `yq` off the vendor images is deliberate, so no
-accelerator container needs a YAML dependency.
+`.github/configs/<platform>.yml` is the only place that defines what a platform runs. `ci.yml`
+discovers the configured platforms (`discover-platforms`) and fans each one out to the single
+`all-tests-common.yml` pipeline, which reads the platform's `integration_tests` and `integration_environment`
+and drives the build-and-test job. Per-platform `integration-test-<platform>.yml` and
+`build-wheel-<platform>.yml` remain as thin `workflow_call` shims for standalone dispatch, each
+forwarding `platform`, `run_build`, `run_integration_tests`, and `upload_artifact`. Adding or
+renaming a step means editing only the config: nothing lists tests inline.

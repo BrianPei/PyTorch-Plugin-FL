@@ -69,7 +69,6 @@ wheel_artifact_name: wheel-ppu
 # Keep PPU integration self-contained; the bundled lib_ppu wheel is large and
 # transferring it through the Actions artifact service can exceed the
 # self-hosted runner job timeout.
-integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
 integration_tests:
@@ -133,12 +132,31 @@ integration_tests:
       FLAGOS_USE_FLAGGEMS=1
       python -m pytest tests/integration/ops/
       -m "flaggems and main_ops"
-      --deselect tests/integration/ops/test_bmm_dispatch.py::TestBmmDispatchLog::test_dispatch_log_flaggems_runtime
-      --deselect tests/integration/ops/test_mm_dispatch.py::TestMmDispatchLog::test_dispatch_log_flaggems_runtime
       -v -s --tb=short
 
   - name: Run general tests
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+
+  - name: Run unified RNG tests
+    command: >-
+      python -m pytest tests/integration/ops/test_rng_dispatch.py
+      -m "main_ops" -v -s --tb=short
+
+  - name: Unified AMP contract
+    command: >-
+      python -m pytest tests/integration/test_amp_contract.py
+      -v -m amp --tb=short
+
+  # The profiler contract is a Required Contract (see profiler_support.py): the
+  # step is not withheld, it runs and fails on an environment that cannot emit
+  # device events. PPU CUPTI Activity API is defective, so torch.profiler
+  # collects no device-side events; the failure and the observed report
+  # (profiler-observations.json) are the evidence for the functional team. This
+  # step must not be skipped or xfailed.
+  - name: Unified profiler contract
+    command: >-
+      python -m pytest tests/integration/test_profiler_contract.py
+      -v -m profiler --tb=short
 
   # ---------------------------------------------------------------------------
   # Follow-up (not part of first-version acceptance). PPU CUPTI Activity API is

@@ -210,15 +210,10 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 fi
 
 cd "$REPO_ROOT"
-if [[ "$CI_STAGE" == "build" ]]; then
-  # Prebuild so package_data contains the generated libtorch_fl.so before the
-  # common wheel workflow stages the final artifact.
+# build_ext must run in both stages: it produces the libtorch_fl.so that
+# package_data stages into the wheel, and the same single job is the one that
+# later installs and tests that wheel. Gating it to the build stage would leave
+# the integration stage without the native library.
+if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   python setup.py build_ext --inplace
-
-  python - <<'PY'
-import torch_fl
-
-assert torch_fl.flagos.is_available(), "flagos device is unavailable"
-print(f"flagos devices: {torch_fl.flagos.device_count()}")
-PY
 fi
