@@ -59,3 +59,10 @@ debug/
 
 .serena/
 .spec-workflow/
+
+# Machine-local Claude session state (config, project memory, plans). The
+# checked-in .claude/skills/ live outside this ignore.
+.claude/config.json
+.claude/PROJECT_MEMORY.md
+.claude/VSCODE_INTEGRATION.md
+.claude/plans/
