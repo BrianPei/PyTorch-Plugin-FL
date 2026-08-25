@@ -21,9 +21,11 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260731-metax-d
 runner_labels:
   - mx-8g-cicd-pytorch
 
-container_volumes: []
+container_volumes:
+  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
-integration_environment: {}
+integration_environment:
+  MODEL_PATH: /models/Qwen3-0.6B
 
 container_options: >-
   --privileged
@@ -139,3 +141,13 @@ integration_tests:
 
   - name: Run torch.compile tests
     command: python -m pytest tests/integration/test_compile.py -v --tb=short
+  - name: Check model availability
+    command: test -d "$MODEL_PATH"
+  - name: Run inference tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_infer.py
+      --model "$MODEL_PATH" -v -s --tb=short
+  - name: Run training tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_train.py
+      --model "$MODEL_PATH" -v -s --tb=short

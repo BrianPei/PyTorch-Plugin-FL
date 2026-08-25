@@ -34,8 +34,10 @@ runner_labels:
 # standard layout as any DCU box, so the source path is portable across hosts.
 container_volumes:
   - /usr/local/hyhal:/usr/local/hyhal:ro
+  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
-integration_environment: {}
+integration_environment:
+  MODEL_PATH: /models/Qwen3-0.6B
 
 # DCU is non-NVIDIA: expose the /dev/kfd and /dev/dri device nodes through
 # --privileged (mirrors the MetaX layout) instead of --gpus all.
@@ -103,3 +105,13 @@ integration_tests:
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
+  - name: Check model availability
+    command: test -d "$MODEL_PATH"
+  - name: Run inference tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_infer.py
+      --model "$MODEL_PATH" -v -s --tb=short
+  - name: Run training tests
+    command: >-
+      python -m pytest tests/integration/test_qwen3_train.py
+      --model "$MODEL_PATH" -v -s --tb=short
