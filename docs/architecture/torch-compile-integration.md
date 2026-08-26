@@ -200,6 +200,104 @@ The focused FlagTree test must compare compiled output with eager output and
 assert that outputs and gradients remain on `flagos`; CPU-only tests can cover
 registration and vendor target selection but do not establish MUSA compiler
 support.
+### Ascend (triton-ascend)
+
+Ascend compiles through `triton-ascend`, which installs itself as the `triton`
+package and registers an `AscendBackend`; it is not a FlagTree build, so
+`FLAGOS_USE_FLAGTREE=1` does not apply and `test_flagtree_compiles_correct_results`
+skips here.
+
+**FlagTree is not a drop-in option on Ascend yet**, which is why this route
+exists. The blocker is not the Triton version — torch declares no `triton` pin
+and inductor's only version gate above 3.5 is a ROCm-only `fast_tanhf` path
+(`_inductor/codegen/triton.py:1687`), so a 3.5-based build would be fine on torch
+2.10; `triton-ascend` here is 3.2.0. Two things actually block it:
+
+- FlagTree's Ascend backend exists only on the 3.5 line (`triton_v3.5.x`,
+  `v0.6.0-rc2-triton3.5`); `main`, `v0.6.0-rc2-triton3.6` and `triton_v3.7.x`
+  carry no `third_party/ascend` at all.
+- That backend routes its host runtime through `torch_npu`, which claims
+  PrivateUse1 on import, after which `torch_fl` cannot register `flagos` — the
+  same conflict documented under vendor setup. This is a genuine incompatibility
+  with the plugin model, not a packaging detail.
+
+  The coupling is deeper than the `import torch_npu` lines suggest
+  (`driver.py:231`, `utils.py:48`, `backend_register.py:87`). FlagTree dispatches
+  these operations through a *backend policy*, and the `torch_npu` policy also
+  decides generated C++ and link flags: `get_cc_cmd` emits `-ltorch_npu`,
+  `header_file` includes `<torch_npu/csrc/core/npu/NPUWorkspaceAllocator.h>`, and
+  `allocate_sync_block_lock`/`async_launch` emit `at_npu::native::` calls
+  (`backend_register.py:227`, `:293`, `:316`, `:340`). So stubbing `sys.modules`
+  cannot fix it — the launcher `.so` needs real headers and `libtorch_npu.so`.
+  Upstream's own `allocate_memory` allocates on `at::kPrivateUse1`
+  (`backend_register.py:305`), i.e. it wants exactly the slot `flagos` needs.
+
+  The seam that does work is the registry itself: `register(category, method)`
+  accepts any category string, and `mindspore` already exists as a second,
+  non-torch_npu policy. `torch_fl/compile/flagtree_ascend_policy.py` registers a
+  third, `flagos`, backed by `torch.flagos` and the ACL stream registry, emitting
+  plain ATen against PrivateUse1. It has to set `utils.backend_policy` directly,
+  because `get_backend_func` only honours `TRITON_BACKEND` when it names
+  `torch_npu` or `mindspore` (`utils.py:42-44`), and it forces
+  `TRITON_ENABLE_TASKQUEUE=false` since the task queue is torch_npu-only.
+  Upstream request to make this unnecessary:
+  https://github.com/flagos-ai/FlagTree/issues/1046
+
+  Verified against a real FlagTree build (`triton_v3.5.x` @ `d2063b06`,
+  `flagtree-0.6.0+ascend`, built with the prebuilt LLVM `7d5de303` and
+  `TRITON_CODEGEN_BACKENDS=nvidia;amd;ascend` on aarch64/Python 3.10): after
+  `install_policy()`, the registry reports `['flagos', 'mindspore', 'torch_npu']`,
+  `flagos` covers all 15 required strategies with no parity gap against
+  `torch_npu`, and each signature matches upstream's. The generated output is
+  clean: `header_file` emits `<ATen/ATen.h>` with no `torch_npu`/`at_npu`
+  reference, and `get_cc_cmd` does not link `-ltorch_npu`.
+
+  The build also exposed a second, import-order-dependent coupling, separate from
+  the policy: `backends/ascend/__init__.py:24` imports `do_bench_npu`, and
+  `testing.py:28` imports `torch_npu` at module scope. Only profiling needs it,
+  but it runs during backend *discovery*, before any policy can be selected. With
+  `torch_fl` holding PrivateUse1, a real torch_npu refuses to load
+  (`Two accelerators cannot be used at the same time`). In practice this is
+  already absorbed: `torch_fl/__init__.py:828` installs a `torch_npu` stub for
+  FlagGems' sake, and that stub satisfies FlagTree's import too — verified on the
+  real build, where `import torch_fl` first yields `backend_policy = flagos` with
+  PrivateUse1 named `flagos`. The failure only appears if `triton` is imported
+  *before* `torch_fl`, which the stub-ordering guard already exists to prevent.
+  Making the upstream import lazy would remove the ordering constraint
+  altogether; `install_policy()` reports this case with an actionable message
+  rather than letting the bare "npu and npu" error through.
+
+The naming side, at least, is already compatible: FlagTree's Ascend backend
+reports `name.conf` = `ascend` and `supports_target` accepts only
+`target.backend == "npu"` — exactly the pair `_ASCEND_PROFILE` already encodes,
+so `triton_device_type`/`triton_backend_key` need no change. The three
+workarounds below would still need re-testing, since that backend is separate
+code with its own defect surface.
+
+No extra configuration is needed beyond
+the environment FlagGems already requires
+([vendor setup](../vendors/ascend/installation.md)) — `torch.compile(backend="flagos")`
+picks the Ascend profile from `ACCELERATOR=ascend`.
+
+Measured on a real 910 (`Ascend910_9382`, CANN 9.0.0, triton-ascend 3.2.0,
+torch 2.10.0+cpu, Python 3.10): forward, backward, fused elementwise, and
+matmul+normalization graphs all compile and match eager. Support is
+**experimental** — three vendor-toolchain defects had to be worked around, and
+each workaround is a place where a toolchain upgrade should let us delete code:
+
+| Defect | Symptom | Workaround |
+|---|---|---|
+| Masked 2-D load of an 8-bit dtype is miscompiled | Silently reads only the first two elements of each row, repeated. Surfaced as wrong `relu` gradients (4090/4096 elements off, max abs diff 3.05), no error raised | `triton_byte_loads.py`: pass `enable_linearize=True` on every compile, **and** rewrite bool kernel args from `*i1` to `*i8`. Both are needed — linearize does not fix the `*i1` pointer type, and the identical bytes read correctly through `*i8` |
+| `ub overflow` is raised as a generic compilation error | An oversized autotune config fails the whole compile instead of being dropped | `triton_resource_limits.py`: parse `requires N bits while M bits available` and re-raise as Triton's `OutOfResources`, which inductor already knows to skip |
+| A kernel built in a compile worker segfaults when the parent launches it | Crash in `NPULauncher.__call__` (`triton/backends/ascend/driver.py`), only with a cold inductor cache and two or more compiles in one process | `inductor_backend.py` defaults Ascend to `compile_threads=1`. `fork` and `spawn` both crash, so this is not the CUDA-after-fork problem the PPU path above hits |
+
+`triton_libdevice.py` additionally fills the Ascend backend's libdevice module
+map, which the vendor backend leaves empty.
+
+The first row's `enable_linearize` requirement is exercised directly by
+`test_ascend_masked_byte_load_requires_linearize`, which asserts the bug is
+*still present* without the option. That test failing is the signal that the
+toolchain was fixed and the workaround can go.
 
 ## Architecture
 
@@ -215,18 +313,40 @@ inductor generates Triton kernels that operate on flagos tensors directly.
    - Expands `mode` / `options` into inductor `config_patches`
    - Delegates to `compile_fx` with no graph rewriting
 
-2. **Device interface** (`torch_fl/compile/device_interface.py`)
-   - `DeviceInterface` subclass: device state from `torch.flagos`, hardware
-     properties from `torch.cuda` (the same physical GPU)
+2. **Platform profile** (`torch_fl/compile/platform_profile.py`)
+   - flagos has no Triton backend of its own, so the compile path must name the
+     *hardware's* backend. The profile carries the three facts that differ per
+     vendor: the name reported as `DeviceProperties.type` (and therefore as
+     `GPUTarget.backend`), the key that backend is registered under in
+     `triton.backends.backends`, and whether the runtime is CUDA-like at all
+   - The two names are not the same string everywhere. On Ascend the driver
+     reports `GPUTarget(backend="npu", ...)` and `AscendBackend.supports_target`
+     accepts only `"npu"`, but the package key is `"ascend"`
+   - `is_cuda_like=False` (Ascend only) routes hardware queries, raw streams and
+     generated device snippets away from `torch.cuda`, which does not exist there
+
+3. **Device interface** (`torch_fl/compile/device_interface.py`)
+   - `DeviceInterface` subclass: device state always from `torch.flagos`;
+     hardware properties from `torch.cuda` on CUDA-like builds (the same physical
+     GPU), from `torch.flagos` plus the ACL runtime on Ascend
    - Adds `"flagos"` to inductor's `GPU_TYPES` so `is_gpu()` is True and the
      Triton codegen path is taken instead of C++/CPU
-   - Reports the underlying compiler target at the Triton boundary
-     (`DeviceProperties.create`): `cuda`/`nvidia` on CUDA-compatible builds and
-     `maca`/`metax` on MetaX
+   - Reports the hardware's backend name at the Triton boundary
+     (`DeviceProperties.create`), because each vendor backend hard-checks
+     `target.backend`. Target and package key per vendor: `cuda`/`nvidia` on
+     CUDA-compatible builds, `maca`/`metax` on MetaX, `npu`/`ascend` on Ascend
+   - On Ascend, `get_compute_capability` returns the SoC name (e.g.
+     `Ascend910_9382`) rather than a number, because that is what reaches Triton
+     as `GPUTarget.arch`
 
-3. **Codegen registration** (`torch_fl/compile/inductor_codegen.py`)
-   - Device op overrides (guards, streams, sync) inheriting the CUDA ones
-   - Scheduling + wrapper codegen: the stock CUDA/Triton pipeline
+4. **Codegen registration** (`torch_fl/compile/inductor_codegen.py`)
+   - CUDA-like builds: device op overrides inheriting the CUDA ones, and the
+     stock CUDA/Triton scheduling + wrapper pipeline
+   - Ascend: overrides that emit the ACL raw stream and `torch.flagos` device
+     calls, plain `TritonScheduling`, and *no* C++ wrapper — `CppWrapperGpu`
+     emits CUDA-runtime C++, so the slot is left unregistered rather than
+     pointing at something that cannot build. The C++ members raise
+     `NotImplementedError` instead of emitting a translation unit CANN rejects
 
 4. **Dispatch integration**
    - Ops inductor does not fuse fall back to eager flagos dispatch
@@ -353,6 +473,15 @@ pytest tests/integration/ops/test_clamp_dispatch.py -v
 
 # Test FlagTree compilation (requires a FlagTree-built env)
 FLAGOS_USE_FLAGTREE=1 pytest tests/integration/test_compile.py::test_flagtree_compiles_correct_results
+
+# Platform-profile selection and the vendor workarounds, on any platform
+# including plain CPU -- these test the selection logic, not the toolchain
+pytest tests/unit/test_compile_platform_profile.py -v
+
+# Ascend, on a real 910. Clear the inductor cache first: a warm cache hides the
+# compile-worker crash the serial-compile default exists for
+rm -rf /tmp/torchinductor_root
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest tests/integration/test_compile.py -v
 ```
 
 ### Codegen fixes this integration required
@@ -382,6 +511,11 @@ tests live alongside it:
 5. **FlagTree maturity**: Backend support varies by hardware; Hygon HCU is
    validated on `gfx936` and MetaX on C550/MACA 3.8.0, while other vendor
    backends remain untested here
+6. **Ascend is experimental**: compiles serially by default, has no C++ wrapper
+   codegen (`CppWrapperGpu` emits CUDA-runtime C++), and carries three
+   toolchain workarounds — see [Ascend](#ascend-triton-ascend) above. Only the
+   graphs in `tests/integration/test_compile.py` are validated; whole-model
+   compilation is not yet exercised there
 
 ## Roadmap
 
@@ -393,7 +527,23 @@ tests live alongside it:
       backward compile and match eager on NVIDIA and MetaX, with outputs and
       gradients remaining on `flagos`. The complete compile suite passes on both
       targets (the MetaX-specific event regression adds one case there).
+- [x] Ascend via triton-ascend — experimental, and **not** through FlagTree.
+      Forward, backward, fused elementwise and matmul+normalization compile and
+      match eager on a real 910 (`Ascend910_9382`, CANN 9.0.0, triton-ascend
+      3.2.0, torch 2.10.0+cpu); `test_compile.py` passes 30/32 with a cold cache,
+      the two skips being the FlagTree-only and MetaX-only cases
+- [ ] FlagTree on Ascend — partially unblocked. Not blocked by the Triton
+      version: that backend exists only on the 3.5 line and routes its host
+      runtime through `torch_npu`, which claims PrivateUse1 and locks `torch_fl`
+      out of `flagos`. `flagtree_ascend_policy.py` registers a torch_npu-free
+      backend policy for it; the emitted C++ compiles against ATen and every
+      strategy resolves through FlagTree's real registry, but end-to-end
+      execution is unverified because no FlagTree build with the Ascend backend
+      is installed. Needs a source build to finish
+      ([#1046](https://github.com/flagos-ai/FlagTree/issues/1046))
 - [ ] Benchmark fusion gains vs. stock inductor+triton on cuda
+- [ ] Benchmark Ascend compile vs. the aclnn eager path
+- [ ] Retire the Ascend workarounds as triton-ascend fixes land
 - [ ] Phase 3: FlagGems-aware fusion (recognize pre-optimized patterns)
 - [ ] Phase 4: Custom fusion patterns for flagos-specific ops
 
