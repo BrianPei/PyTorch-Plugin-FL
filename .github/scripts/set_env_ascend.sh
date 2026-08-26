@@ -176,7 +176,10 @@ if [[ "$VENV_ROOT" != "$PREBUILT_VENV" ]]; then
     # venv is self-contained for local runs. transformers is NOT installed:
     # the first-version ascend acceptance has no model-mounted test (Qwen3 is
     # deferred), so pulling it would only widen the CI failure surface.
-    "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest
+    # triton is required for torch.compile (the flagos backend imports
+    # triton_byte_loads). Ascend has no vendor triton bundled in the image
+    # (unlike CUDA which copies it from the vendor site), so install from PyPI.
+    "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest triton
   fi
 fi
 
