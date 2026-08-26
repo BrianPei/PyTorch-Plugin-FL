@@ -94,34 +94,81 @@ def _collect_manifest_ids(config_path: Path) -> list:
 
 
 def _check_platform(config_path: Path) -> list:
-    """Return a list of missing baseline IDs for one platform."""
-    ids = {name for name, _ in _collect_manifest_ids(config_path)}
+    """Return a list of missing baseline IDs and validation errors for one platform."""
+    manifest_entries = _collect_manifest_ids(config_path)
+    ids = {name for name, _ in manifest_entries}
     missing = []
+    errors = []
+
+    # Check for missing baseline IDs
     for canonical in CANONICAL_IDS:
         if not (ids & _accepted_names(canonical)):
             missing.append(canonical)
-    return missing
+
+    # Check each entry for required fields and pytest target validation
+    for name, entry in manifest_entries:
+        command = entry.get("command", "")
+
+        # Skip preflight checks (they are not pytest commands)
+        if entry.get("phase") == "preflight":
+            continue
+
+        # For functional test entries, validate pytest commands
+        if "pytest" in command:
+            # Check that pytest has a target (not just bare "pytest")
+            # Valid: "pytest tests/...", "python -m pytest tests/..."
+            # Invalid: "pytest" alone, or pytest with only flags
+            import re
+
+            # Match pytest followed by at least one non-flag argument
+            # Flags start with - or --, targets don't
+            if not re.search(r"pytest\s+(?:[^-\s]|--\w+\s+\S+)", command):
+                errors.append(
+                    f"Entry '{name}' has pytest command without explicit target path"
+                )
+
+            # Check for collection constraints (markers, paths, or explicit test selection)
+            # Valid markers: -m "...", paths: tests/..., specific tests: test_name.py::test_func
+            has_marker = "-m" in command or "--markers" in command
+            has_path = "tests/" in command or "test_" in command
+
+            if not (has_marker or has_path):
+                errors.append(
+                    f"Entry '{name}' has pytest command without collection constraint "
+                    "(missing -m marker or explicit test path)"
+                )
+
+    return missing, errors
 
 
 def validate(configs_dir: Path) -> int:
     failures = []
+    validation_errors = []
     for config_path in sorted(configs_dir.glob("*.yml")):
         # Only the 7 hardware platform manifests carry integration_tests.
         manifest_ids = _collect_manifest_ids(config_path)
         if not manifest_ids:
             continue
         platform = config_path.stem
-        missing = _check_platform(config_path)
+        missing, errors = _check_platform(config_path)
         if missing:
             for canonical in missing:
                 failures.append(f"{platform}: missing baseline ID '{canonical}'")
-        else:
+        if errors:
+            for error in errors:
+                validation_errors.append(f"{platform}: {error}")
+        if not (missing or errors):
             print(f"{platform}: OK ({len(manifest_ids)} integration groups)")
 
     if failures:
         print("\nCross-platform baseline failures:")
         for failure in failures:
             print(f"  - {failure}")
+    if validation_errors:
+        print("\nValidation errors:")
+        for error in validation_errors:
+            print(f"  - {error}")
+    if failures or validation_errors:
         return 1
     print("\nAll platform manifests export the full public baseline.")
     return 0

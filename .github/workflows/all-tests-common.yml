@@ -103,6 +103,17 @@ jobs:
             echo "::error::timeout_minutes must be a positive integer"
             exit 1
           fi
+          # Validate workflow input combinations. The valid combinations are:
+          #   run_build=true,  run_integration_tests=true   (full pipeline)
+          #   run_build=true,  run_integration_tests=false  (build only)
+          #   run_build=false, run_integration_tests=true   (test only, wheel from artifact)
+          # The invalid combination is:
+          #   run_build=false, run_integration_tests=false  (no work to do)
+          if [[ "${{ inputs.run_build }}" == "false" && "${{ inputs.run_integration_tests }}" == "false" ]]; then
+            echo "::error::Invalid workflow inputs: run_build=false and run_integration_tests=false. At least one must be true."
+            exit 1
+          fi
+
           VALIDATE_ARGS=(--validate-only)
           if [[ "${{ inputs.run_integration_tests }}" != "true" ]]; then
             VALIDATE_ARGS+=(--allow-empty)
