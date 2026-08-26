@@ -14,7 +14,7 @@
 
 """Verify every platform manifest exports the same public integration IDs.
 
-Every supported platform converges onto the same six public contract IDs so CI
+Every supported platform converges onto the same nine public contract IDs so CI
 enforces uniform capability coverage across hardware backends. Platform-specific
 groups (vendor dispatchers, FlagGems runtime paths, profiler parity, model
 smoke) are additive and are excluded from the baseline check: adding one does
@@ -28,6 +28,9 @@ Baseline test IDs (the public cross-platform contract):
     Run general tests
     Unified AMP contract
     Unified profiler contract
+    Run torch.compile tests
+    Run inference tests
+    Run training tests
 
 Some platforms express an equivalent step under a local name, or scope the
 operator step differently (e.g. an explicit file list instead of the whole
@@ -51,6 +54,9 @@ CANONICAL_IDS = (
     "Run general tests",
     "Unified AMP contract",
     "Unified profiler contract",
+    "Run torch.compile tests",
+    "Run inference tests",
+    "Run training tests",
 )
 
 # A platform may express one canonical ID under a different name; map each
