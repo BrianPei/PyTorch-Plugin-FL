@@ -38,37 +38,6 @@ wheel_artifact_name: wheel-metax
 # the Actions artifact service can exceed the self-hosted runner job timeout.
 
 integration_tests:
-  - name: Diagnose bundled MetaX ELF symbols (temporary)
-    command: |
-      python - <<'PY'
-      from pathlib import Path
-      import sysconfig
-
-      package_root = Path(sysconfig.get_paths()["purelib"]) / "torch_fl"
-      symbol = "_ZN2at6native6flagos29GetFlagosDefaultCudaGeneratorEl"
-      libraries = [package_root / "lib" / "libtorch_fl.so"]
-      libraries.extend(sorted((package_root / "lib_maca").glob("*.so*")))
-
-      print(f"package_root={package_root}")
-      print(f"symbol={symbol}")
-      for library in libraries:
-          print(f"--- {library}")
-          print(f"exists={library.is_file()}")
-      PY
-      SYM='_ZN2at6native6flagos29GetFlagosDefaultCudaGeneratorEl'
-      ROOT="$(python -c 'import sysconfig; from pathlib import Path; print(Path(sysconfig.get_paths()["purelib"]) / "torch_fl")')"
-      for lib in "$ROOT/lib/libtorch_fl.so" "$ROOT"/lib_maca/*.so*; do
-        [[ -f "$lib" ]] || continue
-        echo "--- $lib"
-        nm -D --defined-only "$lib" 2>/dev/null | grep "$SYM" || true
-      done
-      for lib in "$ROOT/lib"/libflagos.so* "$ROOT/lib"/libtorch_bindings.so* \
-                 /opt/maca/lib/*.so* /opt/maca/tools/cu-bridge/lib/*.so*; do
-        [[ -f "$lib" ]] || continue
-        nm -D --defined-only "$lib" 2>/dev/null | grep "$SYM" && echo "provider=$lib" || true
-      done
-      readelf -d "$ROOT/lib/libtorch_fl.so" | grep 'NEEDED\|RPATH\|RUNPATH' || true
-
   - name: Check device availability
     command: |
       python - <<'PY'
