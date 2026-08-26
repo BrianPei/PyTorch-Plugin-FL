@@ -108,6 +108,8 @@ integration_tests:
   # compile to a full recompile. Neither is visible from forward output alone,
   # so this step has to run the backward assertions to be worth anything.
   - name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: python -m pytest tests/integration/test_compile.py -v --tb=short
 
   # The profiler contract is a Required Contract (see profiler_support.py): the
@@ -118,27 +120,25 @@ integration_tests:
   # The failure and the observed report (profiler-observations.json) are the
   # evidence for the functional team; this step must not be skipped or xfailed.
   - name: Unified profiler contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
 
   - name: Run inference tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("GCU inference placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::GCU inference tests require model mount (not available)"
+      exit 1
 
   - name: Run training tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("GCU training placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::GCU training tests require model mount (not available)"
+      exit 1
 
   # ---------------------------------------------------------------------------
   # Follow-up (not part of first-version acceptance). Tracked here so the

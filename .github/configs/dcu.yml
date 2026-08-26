@@ -115,24 +115,22 @@ integration_tests:
       -v -m main_ops --tb=short
 
   - name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_compile.py
       -v -s --tb=short
 
   - name: Run inference tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("DCU inference placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::DCU inference tests require model mount (not available)"
+      exit 1
 
   - name: Run training tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("DCU training placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::DCU training tests require model mount (not available)"
+      exit 1

@@ -108,22 +108,20 @@ integration_tests:
       -v -m profiler --tb=short
 
   - name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: python -m pytest tests/integration/test_compile.py -v --tb=short
 
   - name: Run inference tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("MetaX inference placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::MetaX inference tests require model mount (not available)"
+      exit 1
 
   - name: Run training tests
+    phase: preflight
+    failure_policy: fail-fast
     command: |
-      python - <<'PY'
-      import torch
-      import torch_fl
-      print("MetaX training placeholder: model mount pending")
-      print("flagos.device_count():", torch_fl.flagos.device_count())
-      PY
+      echo "::error::MetaX training tests require model mount (not available)"
+      exit 1

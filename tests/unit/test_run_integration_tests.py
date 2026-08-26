@@ -39,9 +39,13 @@ def _run(main, monkeypatch, tmp_path, tests):
     Every entry command below uses ``bash`` truth values so the subprocess path
     is real: ``true`` exits 0, ``false`` exits 1.
     """
+    import sys
+
     monkeypatch.setenv("INTEGRATION_TESTS", json.dumps(tests))
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({"FOO": "bar"}))
     monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    # Clear sys.argv so parse_args() doesn't see pytest's command-line arguments
+    monkeypatch.setattr(sys, "argv", ["run_integration_tests.py"])
     return main()
 
 
@@ -116,7 +120,9 @@ def test_fail_fast_pass_continues(runner, monkeypatch, tmp_path):
 
 def test_continue_after_failure_runs_remaining(runner, monkeypatch, tmp_path):
     # 1/1: continue-after-failure entry fails -> later entries still run, exit 1.
+    # Add a fail-fast entry to satisfy the "at least one fail-fast" requirement.
     tests = [
+        _abort_test("check environment", "fail-fast", command="true"),
         _abort_test("check device", "continue-after-failure", command="false"),
         {"id": "do-stuff", "name": "do stuff", "command": "true"},
         {"id": "do-more", "name": "do more", "command": "true"},
@@ -126,10 +132,11 @@ def test_continue_after_failure_runs_remaining(runner, monkeypatch, tmp_path):
     assert code == 1
     summary = _summary(tmp_path)
     assert summary["success"] is False
-    assert summary["total"] == 3
+    assert summary["total"] == 4
     assert summary["failed"] == 1
-    assert summary["passed"] == 2
+    assert summary["passed"] == 3
     statuses = {entry["id"]: entry["status"] for entry in summary["entries"]}
+    assert statuses["check environment"] == "passed"
     assert statuses["check device"] == "failed"
     assert statuses["do-stuff"] == "passed"
     assert statuses["do-more"] == "passed"
@@ -137,8 +144,9 @@ def test_continue_after_failure_runs_remaining(runner, monkeypatch, tmp_path):
 
 def test_aggregate_failure_is_nonzero(runner, monkeypatch, tmp_path):
     # 1/0: all entries run (continue-after-failure), one fails -> aggregate nonzero.
+    # First entry has explicit fail-fast, satisfying the requirement.
     tests = [
-        {"id": "one", "name": "one", "command": "true"},
+        {"id": "one", "name": "one", "command": "true", "failure_policy": "fail-fast"},
         {
             "id": "two",
             "name": "two",
@@ -197,6 +205,8 @@ def test_functional_default_is_continue_after_failure(runner, monkeypatch, tmp_p
 def test_all_continue_after_failure_rejected(runner, monkeypatch, tmp_path):
     # A manifest where every entry is continue-after-failure (no fail-fast gate)
     # is rejected: preflight failures must abort, not run the entire suite.
+    import sys
+
     tests = [
         {
             "id": "one",
@@ -214,6 +224,7 @@ def test_all_continue_after_failure_rejected(runner, monkeypatch, tmp_path):
     monkeypatch.setenv("INTEGRATION_TESTS", json.dumps(tests))
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({}))
     monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run_integration_tests.py"])
 
     with pytest.raises(SystemExit) as exc:
         runner.main()
@@ -329,9 +340,12 @@ def test_validate_only_does_not_write_reports(runner, monkeypatch, tmp_path):
 
 
 def test_empty_tests_rejected_without_allow_empty(runner, monkeypatch, tmp_path):
+    import sys
+
     monkeypatch.setenv("INTEGRATION_TESTS", json.dumps([]))
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({}))
     monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run_integration_tests.py"])
 
     with pytest.raises(SystemExit) as exc:
         runner.main()
@@ -339,9 +353,12 @@ def test_empty_tests_rejected_without_allow_empty(runner, monkeypatch, tmp_path)
 
 
 def test_invalid_manifest_rejected(runner, monkeypatch, tmp_path):
+    import sys
+
     monkeypatch.setenv("INTEGRATION_TESTS", json.dumps([{"name": "x"}]))
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({}))
     monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run_integration_tests.py"])
 
     with pytest.raises(SystemExit) as exc:
         runner.main()

@@ -73,6 +73,8 @@ wheel_artifact_name: wheel-musa
 
 integration_tests:
   - name: Check device availability
+    phase: preflight
+    failure_policy: fail-fast
     command: |
       python - <<'PY'
       from pathlib import Path
@@ -97,36 +99,50 @@ integration_tests:
       PY
 
   - name: Run operator tests (vendor backend, main ops)
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/
       -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp"
       -v -s --tb=short
 
   - name: Run MUSA dispatcher capability tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/test_musa_dispatch.py
       -m musa -v --tb=long
 
   - name: Run unified RNG tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops" -v -s --tb=short
 
   - name: Run general tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest
       tests/integration/test_factory_ops.py
       -v -s --tb=short
 
   - name: Unified AMP contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: python -m pytest tests/integration/test_amp_contract.py -v -m amp --tb=short
 
   - name: Unified profiler contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
 
   - name: Check model availability
+    phase: preflight
+    failure_policy: fail-fast
     command: test -d "$MODEL_PATH"
 
   # torch.compile must be a real failure, not a comment or a skip. The CPU wheel
@@ -136,6 +152,8 @@ integration_tests:
   # compile is used (rather than test_compile.py, which self-skips without
   # Triton) so the missing stack cannot be silently ignored.
   - name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: |
       python - <<'PY'
       import torch
@@ -155,11 +173,15 @@ integration_tests:
       PY
 
   - name: Run inference tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py
       --model "$MODEL_PATH" -v -s --tb=short
 
   - name: Run training tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_train.py
       --model "$MODEL_PATH" -v -s --tb=short

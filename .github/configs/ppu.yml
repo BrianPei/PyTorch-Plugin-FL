@@ -73,6 +73,8 @@ wheel_artifact_name: wheel-ppu
 # The common workflow only executes this platform-provided test manifest.
 integration_tests:
   - name: Check model availability
+    phase: preflight
+    failure_policy: fail-fast
     command: test -d "$MODEL_PATH"
 
   # PPU is a CUDA-ABI boxing backend, so the CUDA dispatch key carries vendor
@@ -80,6 +82,8 @@ integration_tests:
   # Pod probe found 16 /dev/alixcu_ppu nodes; CI runner device count may
   # differ. Adjust the literal after the first green run.
   - name: Check device availability
+    phase: preflight
+    failure_policy: fail-fast
     command: |
       python - <<'PY'
       from pathlib import Path
@@ -116,6 +120,8 @@ integration_tests:
       PY
 
   - name: Run operator tests (vendor backend, main ops)
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/
       -m "main_ops and not flaggems_python and not flaggems_cpp"
@@ -128,6 +134,8 @@ integration_tests:
   # compilation. The remaining 13 flaggems main_ops pass. Follow-up: track PPU
   # triton alignment with upstream FlagGems _hygon mm op. No CPU fallback.
   - name: Run operator tests (FlagGems runtime path, main ops)
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       FLAGOS_USE_FLAGGEMS=1
       python -m pytest tests/integration/ops/
@@ -135,14 +143,20 @@ integration_tests:
       -v -s --tb=short
 
   - name: Run general tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
 
   - name: Run unified RNG tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops" -v -s --tb=short
 
   - name: Unified AMP contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_amp_contract.py
       -v -m amp --tb=short
@@ -154,6 +168,8 @@ integration_tests:
   # (profiler-observations.json) are the evidence for the functional team. This
   # step must not be skipped or xfailed.
   - name: Unified profiler contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
@@ -170,11 +186,15 @@ integration_tests:
   # This may not be unblocked by a CPU fallback or faking a pass.
   # ---------------------------------------------------------------------------
   - name: Run inference tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py
       --model "$MODEL_PATH" -v -s --tb=short
 
   - name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: |
       python - <<'PY'
       import torch
@@ -194,6 +214,8 @@ integration_tests:
       PY
 
   - name: Run training tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_train.py
       --model "$MODEL_PATH" -v -s --tb=short

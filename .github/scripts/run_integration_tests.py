@@ -16,7 +16,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -57,7 +56,12 @@ def _entry_id(entry, index):
 def _entry_phase(entry, index):
     phase = entry.get("phase")
     if isinstance(phase, str) and phase.strip():
-        return phase.strip()
+        normalized = phase.strip().lower()
+        if normalized not in ("preflight", "functional"):
+            raise SystemExit(
+                f"integration_tests[{index}].phase must be 'preflight' or 'functional', got: {phase}"
+            )
+        return normalized
     # Environment/preflight entries fail fast; functional groups continue.
     name = entry.get("name", "")
     lowered = name.lower()
@@ -70,7 +74,13 @@ def _entry_phase(entry, index):
 def _entry_failure_policy(entry, index):
     policy = entry.get("failure_policy")
     if isinstance(policy, str) and policy.strip():
-        return policy.strip()
+        normalized = policy.strip().lower()
+        if normalized not in ("fail-fast", "continue-after-failure"):
+            raise SystemExit(
+                f"integration_tests[{index}].failure_policy must be 'fail-fast' or "
+                f"'continue-after-failure', got: {policy}"
+            )
+        return normalized
     # Preflight entries default to fail-fast; functional entries default to
     # continue-after-failure so one functional group failing does not hide others.
     phase = _entry_phase(entry, index)
@@ -150,13 +160,26 @@ def _command_is_pytest(command):
     # Detect a pytest invocation so per-group JUnit can be emitted without
     # changing the manifest command text. Handles both the `pytest ...` form and
     # the `python -m pytest ...` form.
-    words = shlex.split(command)
-    for index, word in enumerate(words):
-        if word == "pytest" or word.endswith("/pytest"):
-            return True
-        if word == "-m" and index + 1 < len(words) and words[index + 1] == "pytest":
-            return True
-    return False
+    # DO NOT use shlex.split on arbitrary shell/heredoc commands: it breaks
+    # heredoc structure and multi-line shell scripts. Use safe pattern matching.
+    # Match: "pytest ...", "python -m pytest ...", "python3 -m pytest ...",
+    # paths ending in /pytest, but NOT heredoc or shell constructs.
+    if "<<" in command or "\n" in command:
+        # Heredoc or multi-line shell: do not attempt to parse
+        return False
+    # Safe heuristic: look for pytest as a standalone word boundary
+    # This handles: "pytest tests/", "python -m pytest", "python3 -m pytest"
+    # but not: "# pytest comment" or strings inside quotes
+    import re
+
+    # Match pytest as a word (not part of another word) after optional python -m
+    pattern = r"(?:^|\s)(?:python3?\s+-m\s+)?pytest(?:\s|$)"
+    return bool(re.search(pattern, command))
+
+
+def _has_junitxml(command):
+    # Safe check for --junitxml without parsing shell structure
+    return "--junitxml" in command or "--junit-xml" in command
 
 
 def run_entry(test, command_environment, workdir, report_root, index, total):
@@ -184,6 +207,7 @@ def run_entry(test, command_environment, workdir, report_root, index, total):
     with log_path.open("a", encoding="utf-8") as log_fh:
         log_fh.write(f"\n===== [{index}/{total}] {name} =====\n")
         log_fh.flush()
+        # Use subprocess.PIPE for stderr too, then tee to both log and stdout
         result = subprocess.run(
             ["bash", "-c", f"set -euo pipefail\n{run_command}"],
             check=False,
@@ -193,10 +217,17 @@ def run_entry(test, command_environment, workdir, report_root, index, total):
             stderr=subprocess.STDOUT,
         )
         output = result.stdout.decode("utf-8", errors="replace")
+        # Write to log file
         log_fh.write(output)
         if result.returncode:
             log_fh.write(f"\n--- {name} FAILED (exit code {result.returncode}) ---\n")
         log_fh.flush()
+        # Also print to stdout for real-time visibility
+        print(output, end="", flush=True)
+        if result.returncode:
+            print(
+                f"\n--- {name} FAILED (exit code {result.returncode}) ---\n", flush=True
+            )
 
     duration = time.monotonic() - start
     return {
@@ -209,14 +240,6 @@ def run_entry(test, command_environment, workdir, report_root, index, total):
         "duration_seconds": round(duration, 3),
         "status": "passed" if result.returncode == 0 else "failed",
     }
-
-
-def _has_junitxml(command):
-    words = shlex.split(command)
-    return any(
-        word.startswith("--junitxml") or word.startswith("--junit-xml")
-        for word in words
-    )
 
 
 def write_summary(results, success, out_dir):
