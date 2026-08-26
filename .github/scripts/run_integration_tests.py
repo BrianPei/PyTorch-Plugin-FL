@@ -86,7 +86,7 @@ def _require_field(entry, index, field, allowed):
 
 
 def _entry_meta(entry, index):
-    """Return (id, phase, failure_policy, allow_platform_marker_skips) from explicit manifest fields."""
+    """Return (id, phase, failure_policy) from explicit manifest fields."""
     entry_id = entry.get("id")
     if not isinstance(entry_id, str) or not ID_PATTERN.fullmatch(entry_id.strip()):
         raise SystemExit(
@@ -96,15 +96,7 @@ def _entry_meta(entry, index):
     phase = _require_field(entry, index, "phase", PHASES)
     policy = _require_field(entry, index, "failure_policy", POLICIES)
 
-    # Baseline groups using cross-platform marker selection (anyplatform) allow
-    # platform-specific marker skips. Platform-specific groups do not.
-    allow_skips = entry.get("allow_platform_marker_skips", False)
-    if not isinstance(allow_skips, bool):
-        raise SystemExit(
-            f"integration_tests[{index}].allow_platform_marker_skips must be boolean, got: {allow_skips!r}"
-        )
-
-    return entry_id.strip(), phase, policy, allow_skips
+    return entry_id.strip(), phase, policy
 
 
 def _validate_entries(tests):
@@ -129,20 +121,20 @@ def _validate_entries(tests):
             raise SystemExit(
                 f"integration_tests[{index}].command must be a non-empty string"
             )
-        entry_id, phase, policy, allow_skips = _entry_meta(test, index)
+        entry_id, phase, policy = _entry_meta(test, index)
         if entry_id in seen_ids:
             raise SystemExit(
                 f"integration_tests[{index}].id is a duplicate: {entry_id!r}. "
                 "Report file names are derived from the id, so it must be unique."
             )
         seen_ids.add(entry_id)
-        metas.append((entry_id, phase, policy, allow_skips))
+        metas.append((entry_id, phase, policy))
 
     # Preflight before functional. A functional group that runs ahead of the
     # model or device check reports a failure whose real cause is the missing
     # environment, which is the confusion this ordering rule prevents.
     seen_functional = False
-    for index, (entry_id, phase, _policy, _allow_skips) in enumerate(metas, start=1):
+    for index, (entry_id, phase, _policy) in enumerate(metas, start=1):
         if phase == "functional":
             seen_functional = True
         elif seen_functional:
@@ -154,7 +146,7 @@ def _validate_entries(tests):
     # At least one fail-fast entry, so a broken environment stops the run instead
     # of producing a full functional report of environment-induced failures.
     if metas and all(
-        policy == "continue-after-failure" for _i, _p, policy, _a in metas
+        policy == "continue-after-failure" for _i, _p, policy in metas
     ):
         raise SystemExit(
             "integration_tests must have at least one fail-fast entry "
@@ -232,15 +224,13 @@ def _parse_junit(junit_path):
     return counts
 
 
-def _judge_pytest_group(exit_code, junit_path, allow_platform_marker_skips=False):
+def _judge_pytest_group(exit_code, junit_path):
     """Return (violations, counts) for a pytest group.
 
     A zero exit code is not proof the group ran. Require real executed tests.
-
-    For baseline groups with cross-platform marker selection (anyplatform),
-    platform-specific marker skips (cuda/ascend/musa on other platforms) are
-    allowed and do not fail the group. For platform-specific groups or groups
-    with explicit capability assertions, any skip is a failure.
+    Any skip or xfail is a failure: a capability the platform does not have must
+    surface as a real test failure, not a skip that reports success while erasing
+    the evidence.
 
     Exit code 5 (no tests collected) and zero-execution groups always fail.
     Real test failures and errors always fail.
@@ -271,19 +261,17 @@ def _judge_pytest_group(exit_code, junit_path, allow_platform_marker_skips=False
             f"every collected test was skipped ({counts['skipped']} skipped); "
             "a group with zero executed tests is not evidence of support"
         )
-    elif counts["skipped"] and not allow_platform_marker_skips:
+    elif counts["skipped"]:
         violations.append(
             f"{counts['skipped']} test(s) were skipped "
             f"({counts['xfailed']} of them xfailed); an unsupported capability "
             "must fail rather than skip"
         )
-    # allow_platform_marker_skips=True: some skips are expected (cross-platform
-    # markers), but the group still needs at least one executed test.
     return violations, counts
 
 
 def run_entry(test, meta, command_environment, workdir, report_root, index, total):
-    entry_id, phase, policy, allow_skips = meta
+    entry_id, phase, policy = meta
     name = test["name"]
     command = test["command"]
 
@@ -321,9 +309,7 @@ def run_entry(test, meta, command_environment, workdir, report_root, index, tota
         violations = []
         counts = None
         if is_pytest:
-            violations, counts = _judge_pytest_group(
-                exit_code, junit_path, allow_platform_marker_skips=allow_skips
-            )
+            violations, counts = _judge_pytest_group(exit_code, junit_path)
 
         status = "passed" if exit_code == 0 and not violations else "failed"
         if status == "failed":
@@ -358,7 +344,7 @@ def run_entry(test, meta, command_environment, workdir, report_root, index, tota
 
 
 def _skipped_result(test, meta):
-    entry_id, phase, policy, _allow_skips = meta
+    entry_id, phase, policy = meta
     return {
         "id": entry_id,
         "name": test["name"],

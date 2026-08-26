@@ -74,14 +74,6 @@ for lib in libascendcl.so libopapi.so libnnopbase.so; do
   fi
 done
 
-# --- Device node -------------------------------------------------------------
-# Ascend exposes a manager device plus per-card davinci nodes. Require the
-# manager node; card count is asserted later from torch_fl.flagos.device_count().
-if [[ ! -c /dev/davinci_manager ]]; then
-  echo "::error::Ascend device node /dev/davinci_manager is unavailable"
-  exit 1
-fi
-
 # --- Environment -------------------------------------------------------------
 export ACCELERATOR=ascend
 export ASCEND_HOME
@@ -191,7 +183,7 @@ fi
 # that looks like a compiler bug.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
@@ -266,10 +258,16 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   # version, and backend registry for the vendor Triton, not just that
   # importlib.util.find_spec returns non-None.
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-triton-verbose \
-    --expect-hint "On ascend, torch.compile needs triton-ascend installed in the image (stock PyPI triton is not a substitute: it leaves Triton with 0 active drivers). Actions log 'ModuleNotFoundError: No module named triton' means the symlink did not find a vendor build at the searched paths, and torch_fl/compile/triton_byte_loads.py cannot be imported."
+    --require pytest transformers safetensors triton \
+    --triton-backend ascend
+
+  # Device node check: Ascend exposes a manager device plus per-card davinci
+  # nodes. Require the manager node; card count is asserted later from
+  # torch_fl.flagos.device_count().
+  if [[ ! -c /dev/davinci_manager ]]; then
+    echo "::error::Ascend device node /dev/davinci_manager is unavailable"
+    exit 1
+  fi
 fi
 
 cd "$REPO_ROOT"

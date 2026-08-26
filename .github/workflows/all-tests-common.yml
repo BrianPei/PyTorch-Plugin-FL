@@ -251,10 +251,6 @@ jobs:
           print(f"wheel metadata RECORD OK: {len(names)} files")
           PY
 
-      - name: Install test dependencies
-        if: inputs.run_integration_tests
-        run: python -m pip install pytest
-
       # Tests run against the installed wheel, not the source tree: only tests/
       # and pyproject.toml (for pytest configuration) are copied out of the repo.
       - name: Prepare wheel-only test workspace

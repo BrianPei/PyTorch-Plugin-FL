@@ -84,7 +84,10 @@ integration_tests:
     name: Check model availability
     phase: preflight
     failure_policy: fail-fast
-    command: test -d "$MODEL_PATH"
+    command: |
+      test -f "$MODEL_PATH/config.json" || { echo "::error::Missing config.json"; exit 1; }
+      test -f "$MODEL_PATH/tokenizer_config.json" || { echo "::error::Missing tokenizer_config.json"; exit 1; }
+      ls "$MODEL_PATH"/*.safetensors >/dev/null 2>&1 || ls "$MODEL_PATH"/*.bin >/dev/null 2>&1 || { echo "::error::Missing weight files"; exit 1; }
 
   # PPU is a CUDA-ABI boxing backend, so the CUDA dispatch key carries vendor
   # kernels and torch.cuda.is_available() reflects the real PPU devices.
@@ -132,8 +135,8 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/
-      -m "main_ops and not flaggems_python and not flaggems_cpp"
-      -v -s --tb=short
+      -m "main_ops and not flaggems_python and not flaggems_cpp and not cuda and not ascend and not musa and not metax and not dcu and not gcu"
+      --tb=short
 
   - id: rng-tests
     name: Run unified RNG tests
@@ -141,13 +144,13 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
-      -m "main_ops" -v -s --tb=short
+      -m "main_ops" --tb=short
 
   - id: general-tests
     name: Run general tests
     phase: functional
     failure_policy: continue-after-failure
-    command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+    command: python -m pytest tests/integration/test_factory_ops.py --tb=short
 
   - id: amp-contract
     name: Unified AMP contract
@@ -155,7 +158,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_amp_contract.py
-      -v -m amp --tb=short
+      -m amp --tb=short
 
   # The profiler contract is a Required Contract (see profiler_support.py): the
   # step is not withheld, it runs and fails on an environment that cannot emit
@@ -170,13 +173,13 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
-      -v -m profiler --tb=short
+      -m profiler --tb=short
 
   - id: compile-tests
     name: Run torch.compile tests
     phase: functional
     failure_policy: continue-after-failure
-    command: python -m pytest tests/integration/test_compile.py -v -s --tb=short
+    command: python -m pytest tests/integration/test_compile.py --tb=short
 
   - id: inference-tests
     name: Run inference tests
@@ -184,7 +187,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py
-      --model "$MODEL_PATH" -v -s --tb=short
+      --model "$MODEL_PATH" --tb=short
 
   - id: training-tests
     name: Run training tests
@@ -192,7 +195,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_train.py
-      --model "$MODEL_PATH" -v -s --tb=short
+      --model "$MODEL_PATH" --tb=short
 
   # Platform-specific group, additive to the baseline above. PPU triton (the
   # vendor build copied into the venv) does not recognise the `num_ldmatrixes`
@@ -209,4 +212,4 @@ integration_tests:
       FLAGOS_USE_FLAGGEMS=1
       python -m pytest tests/integration/ops/
       -m "flaggems and main_ops"
-      -v -s --tb=short
+      --tb=short

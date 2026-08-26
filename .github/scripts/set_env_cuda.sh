@@ -186,7 +186,7 @@ fi
 # Triton is carried in from VENDOR_SITE below.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 fi
 
 # Keep the vendor FlagGems/FlagCX Python packages available without copying the
@@ -299,10 +299,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 fi
 
 # Report the integration stack once, here, rather than letting a group fail on a
-# missing import and read as a platform defect.
+# missing import and read as a platform defect. Triton is carried in from the
+# vendor site-packages by this script.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-hint "On CUDA, Triton is carried in from the vendor site-packages by this script."
+    --require pytest transformers safetensors triton
 fi

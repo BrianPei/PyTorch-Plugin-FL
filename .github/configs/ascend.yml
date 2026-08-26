@@ -70,7 +70,10 @@ integration_tests:
     name: Check model availability
     phase: preflight
     failure_policy: fail-fast
-    command: test -d "$MODEL_PATH"
+    command: |
+      test -f "$MODEL_PATH/config.json" || { echo "::error::Missing config.json"; exit 1; }
+      test -f "$MODEL_PATH/tokenizer_config.json" || { echo "::error::Missing tokenizer_config.json"; exit 1; }
+      ls "$MODEL_PATH"/*.safetensors >/dev/null 2>&1 || ls "$MODEL_PATH"/*.bin >/dev/null 2>&1 || { echo "::error::Missing weight files"; exit 1; }
 
   - id: device-availability
     name: Check device availability
@@ -106,7 +109,7 @@ integration_tests:
     command: >-
       python -m pytest tests/integration/ops/
       -m "ascend"
-      -v -s --tb=short
+      --tb=short
 
   # The full RNG dispatch suite is exercised, not an allowlist. Upstream #70
   # implemented the remaining Ascend RNG overloads (normal_ / uniform_ /
@@ -120,13 +123,13 @@ integration_tests:
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops"
-      -v -s --tb=short
+      --tb=short
 
   - id: general-tests
     name: Run general tests
     phase: functional
     failure_policy: continue-after-failure
-    command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+    command: python -m pytest tests/integration/test_factory_ops.py --tb=short
 
   - id: amp-contract
     name: Unified AMP contract
@@ -134,7 +137,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_amp_contract.py
-      -v -m amp --tb=short
+      -m amp --tb=short
 
   # The Ascend tracer currently exposes CPU/Trace records only, so the
   # device-side cases of this contract fail. That failure is the record of the
@@ -145,7 +148,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
-      -v -m profiler --tb=short
+      -m profiler --tb=short
 
   # torch.compile through triton-ascend (upstream #189). The vendor Triton is
   # installed by set_env_ascend.sh; a generic PyPI triton is not a substitute and
@@ -154,7 +157,7 @@ integration_tests:
     name: Run torch.compile tests
     phase: functional
     failure_policy: continue-after-failure
-    command: python -m pytest tests/integration/test_compile.py -v -s --tb=short
+    command: python -m pytest tests/integration/test_compile.py --tb=short
 
   - id: inference-tests
     name: Run inference tests
@@ -162,7 +165,7 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py
-      --model "$MODEL_PATH" -v -s --tb=short
+      --model "$MODEL_PATH" --tb=short
 
   - id: training-tests
     name: Run training tests
@@ -170,4 +173,4 @@ integration_tests:
     failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_qwen3_train.py
-      --model "$MODEL_PATH" -v -s --tb=short
+      --model "$MODEL_PATH" --tb=short

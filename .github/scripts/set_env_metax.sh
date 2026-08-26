@@ -132,12 +132,12 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   # numpy stays on 1.x so the +cpu torch C extensions keep importing. triton is
   # excluded on purpose: it must stay the vendor triton-metax linked above.
   python -m pip install \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 
+  # Verify triton-metax is available (searched /opt/conda, /opt/vendor-torch,
+  # /usr and /usr/local site-packages). Stock PyPI triton is not a substitute.
   python .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-hint "On MetaX, torch.compile needs triton-metax in the image (searched /opt/conda, /opt/vendor-torch, /usr and /usr/local site-packages); stock PyPI triton is not a substitute."
+    --require pytest transformers safetensors triton
 fi
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then

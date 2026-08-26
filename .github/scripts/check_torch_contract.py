@@ -63,7 +63,7 @@ def _load_contract():
     return contract
 
 
-def _identity():
+def _identity(state_file):
     """Probe torch identity in an isolated subprocess to prevent SIGABRT.
 
     Native backend registration can trigger abort() when the setup environment
@@ -71,9 +71,9 @@ def _identity():
     the probe in a subprocess with TORCH_DEVICE_BACKEND_AUTOLOAD=0 prevents
     the backend from initializing while still allowing version/path checks.
 
-    If the subprocess exits with SIGABRT (exit code 134 or negative signal),
-    report the failure with diagnostic context but still raise SystemExit so
-    the contract check fails visibly rather than silently continuing.
+    If the subprocess fails, write a structured failure record to state_file
+    (executable, return code, signal, stderr excerpt) so the job artifact
+    preserves full diagnostic context. Print only a summary to the console.
     """
     import subprocess
 
@@ -101,24 +101,40 @@ print(json.dumps(identity))
     )
     if result.returncode != 0:
         signal_desc = ""
+        signal_num = None
         if result.returncode == 134:
-            signal_desc = " (SIGABRT: likely native backend double-registration)"
+            signal_desc = "SIGABRT"
+            signal_num = 6
         elif result.returncode < 0:
-            signal_desc = f" (signal {-result.returncode})"
+            signal_num = -result.returncode
+            signal_desc = f"signal {signal_num}"
 
-        print(
-            f"::error::Failed to probe torch identity (rc={result.returncode}{signal_desc})"
+        # Write structured failure record for artifact analysis
+        failure_record = {
+            "success": False,
+            "executable": sys.executable,
+            "returncode": result.returncode,
+            "signal": signal_num,
+            "signal_desc": signal_desc,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(
+            json.dumps(failure_record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
-        print(f"stdout: {result.stdout}")
-        print(f"stderr: {result.stderr}")
+
+        # Print only summary to console, full stderr is in artifact
+        print(f"::error::Torch probe failed: rc={result.returncode} ({signal_desc})")
+        stderr_lines = result.stderr.strip().split("\n")
+        if stderr_lines:
+            print(f"::error::First stderr line: {stderr_lines[0][:200]}")
         print(
-            "\nDiagnostic: set TORCH_DEVICE_BACKEND_AUTOLOAD=0 was passed to the subprocess, "
-            "but the import still triggered a fatal signal. This typically means vendor "
-            "libraries were loaded before the isolation environment took effect, or the "
-            "backend registration path does not respect TORCH_DEVICE_BACKEND_AUTOLOAD."
+            f"::error::Full diagnostic context saved to artifact: {state_file.name}"
         )
         raise SystemExit(
-            f"Cannot probe torch identity: subprocess exited {result.returncode}{signal_desc}"
+            f"Cannot probe torch identity: subprocess exited {result.returncode} ({signal_desc})"
         )
     return json.loads(result.stdout)
 
@@ -188,7 +204,7 @@ def main():
     args = parser.parse_args()
 
     contract = _load_contract()
-    identity = _identity()
+    identity = _identity(args.state_file)
     _report(args.stage, identity)
 
     errors = _contract_errors(contract, identity)

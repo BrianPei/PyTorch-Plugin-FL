@@ -186,7 +186,7 @@ fi
 # it (see _vendor_supplies_triton in setup.py for the same rule on dcu/ascend).
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
@@ -253,10 +253,10 @@ if [[ "$CI_STAGE" == "integration" ]]; then
     done
   fi
 
+  # Verify triton is available through vendor stack (triton_gcu/flagtree).
+  # Stock PyPI triton targets NVIDIA and is not a substitute.
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-hint "On GCU, torch.compile needs the vendor triton_gcu/flagtree build in the image (stock PyPI triton targets NVIDIA and is not a substitute)."
+    --require pytest transformers safetensors triton
 fi
 
 cd "$REPO_ROOT"

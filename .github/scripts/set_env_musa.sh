@@ -186,7 +186,7 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   # inference and training groups into an environment failure that looks like a
   # platform failure. pip is a no-op when they are already present.
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
@@ -222,14 +222,13 @@ if command -v mthreads-gmi >/dev/null 2>&1; then
 fi
 
 # Report the integration stack once, here, rather than letting a group fail on a
-# missing import and read as a platform defect. Triton is expected-but-absent on
-# this line: the image ships no MThreads flagtree build and stock PyPI triton
-# targets NVIDIA, so compile-tests fails and that failure is the record.
+# missing import and read as a platform defect. Triton is absent on this line:
+# the image ships no MThreads flagtree build and stock PyPI triton targets NVIDIA,
+# so compile-tests will fail when torch.compile is invoked, and that failure is
+# the environment-gap record the platform owners act on.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-hint "On MUSA, torch.compile needs the vendor flagtree wheel (flagtree-0.5.0+mthreads3.1); stock PyPI triton is not a substitute."
+    --require pytest transformers safetensors
 fi
 
 # --- Export to later workflow steps ------------------------------------------

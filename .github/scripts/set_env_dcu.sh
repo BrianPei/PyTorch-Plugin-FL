@@ -223,7 +223,7 @@ fi
 # setup.py), and the vendor package is carried into the venv below.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" -m pip install \
-    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
 fi
 
 # Carry the vendor FlagGems/FlagCX Python packages into the venv so the DTK
@@ -369,10 +369,9 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
 fi
 
 # Report the integration stack once, here, rather than letting a group fail on a
-# missing import and read as a platform defect.
+# missing import and read as a platform defect. Triton comes from DTK and is
+# carried into the venv by this script.
 if [[ "$CI_STAGE" == "integration" ]]; then
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors \
-    --expect triton \
-    --expect-hint "On DCU, Triton comes from DTK and is carried into the venv by this script."
+    --require pytest transformers safetensors triton
 fi
