@@ -210,16 +210,6 @@ assert "/opt/conda/" not in str(torch_path), torch_path
 # The 2.9.1 vendor ABI must not be reachable from this interpreter.
 assert importlib.util.find_spec("torch_musa") is None, "torch_musa leaked into the isolated venv"
 
-if os.environ["CI_STAGE"] == "integration":
-    # A prebuilt venv missing these turns the functional groups into an
-    # environment failure, so require them before any test runs.
-    missing = [
-        name
-        for name in ("pytest", "transformers", "safetensors")
-        if importlib.util.find_spec(name) is None
-    ]
-    assert not missing, f"integration dependencies missing from the venv: {missing}"
-
 print(f"Isolated Python: {sys.executable}")
 print(f"CPU PyTorch: {torch.__version__}")
 print(f"CPU torch path: {torch_path}")
@@ -229,6 +219,17 @@ PY
 
 if command -v mthreads-gmi >/dev/null 2>&1; then
   mthreads-gmi
+fi
+
+# Report the integration stack once, here, rather than letting a group fail on a
+# missing import and read as a platform defect. Triton is expected-but-absent on
+# this line: the image ships no MThreads flagtree build and stock PyPI triton
+# targets NVIDIA, so compile-tests fails and that failure is the record.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
+    --require pytest transformers safetensors \
+    --expect triton \
+    --expect-hint "On MUSA, torch.compile needs the vendor flagtree wheel (flagtree-0.5.0+mthreads3.1); stock PyPI triton is not a substitute."
 fi
 
 # --- Export to later workflow steps ------------------------------------------

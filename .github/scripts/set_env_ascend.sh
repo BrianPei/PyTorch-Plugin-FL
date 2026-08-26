@@ -171,13 +171,27 @@ if [[ "$VENV_ROOT" != "$PREBUILT_VENV" ]]; then
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" --upgrade pip setuptools wheel cmake
   "$VENV_PYTHON" -m pip install --index-url "$CPU_TORCH_INDEX_URL" \
     "torch==${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
-  if [[ "$CI_STAGE" == "integration" ]]; then
-    # pytest is also installed by the common workflow; mirrored here so the
-    # venv is self-contained for local runs. transformers is NOT installed:
-    # the first-version ascend acceptance has no model-mounted test (Qwen3 is
-    # deferred), so pulling it would only widen the CI failure surface.
-    "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" pytest
-  fi
+fi
+
+# Test dependencies, installed whether or not the venv was prebuilt: a venv baked
+# without them makes the inference and training groups fail as an environment
+# problem that reads as an ACLNN problem. pip is a no-op when they are present.
+#
+# transformers is pinned to [4.51, 5): 4.51 is where Qwen3 model_type support
+# landed, and 5.x carries a TokenizersBackend regression that breaks the Qwen3
+# slow-to-fast tokenizer conversion. sentencepiece/tiktoken/protobuf are what
+# that conversion needs, since the mounted model dir has no tokenizer.json.
+# numpy stays on 1.x: transformers pulls 2.x, which breaks the +cpu torch C
+# extensions at import.
+#
+# triton is deliberately absent from this list. On ascend it must come from
+# triton-ascend (see _vendor_supplies_triton in setup.py); stock PyPI triton
+# installs over it and then every Triton entry point dies with "0 active
+# drivers", which converts a missing-stack failure into a wrong-stack failure
+# that looks like a compiler bug.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL" \
+    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
@@ -214,23 +228,48 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   done
 fi
 
-cd "$REPO_ROOT"
+# Expose the vendor Triton (triton-ascend) to the CPU torch venv, the way
+# set_env_metax.sh exposes triton-metax. torch.compile needs it: the active torch
+# is the CPU wheel, which ships no Triton, and triton-ascend has no PyPI release
+# satisfying torch's pin, so it is installed into the image out of band rather
+# than resolved by pip.
+#
+# A missing vendor Triton is a warning, not a setup failure. Exiting here would
+# take the other nine groups down over a torch.compile gap and leave the run with
+# no evidence at all; instead compile-tests fails on its own and the operator,
+# RNG, AMP, profiler, inference and training groups still report.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  VENV_SITE="$("$VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  if [[ ! -e "$VENV_SITE/triton" ]]; then
+    for candidate in /usr/local/lib/python3.*/site-packages \
+                     /usr/local/lib/python3.*/dist-packages \
+                     /usr/lib/python3.*/site-packages \
+                     /usr/lib/python3.*/dist-packages \
+                     /opt/conda/lib/python3.*/site-packages; do
+      if [[ -d "$candidate/triton" ]]; then
+        ln -s "$candidate/triton" "$VENV_SITE/triton"
+        for metadata in "$candidate"/triton*-*.dist-info; do
+          [[ -e "$metadata" ]] || continue
+          [[ -e "$VENV_SITE/$(basename "$metadata")" ]] || ln -s "$metadata" "$VENV_SITE/"
+        done
+        echo "Vendor Triton linked from $candidate/triton"
+        break
+      fi
+    done
+  fi
 
-if [[ "$CI_STAGE" == "build" ]]; then
-  # Prebuild so package_data sees libtorch_fl.so before the common workflow
-  # invokes python -m build. The following wheel build is incremental. The
-  # integration job downloads this artifact and must not rebuild from source.
-  python setup.py build_ext --inplace
-
-  # Build-stage availability check. Integration repeats this after installing
-  # the artifact wheel from an isolated test workspace.
-  python - <<'PY'
-import torch_fl
-import torch
-
-assert torch_fl.flagos.is_available(), "flagos device is unavailable"
-n = torch_fl.flagos.device_count()
-assert n >= 1, f"expected >=1 flagos device, got {n}"
-print(f"flagos devices: {n}")
-PY
+  # Verify against the interpreter that will run the tests, including when the
+  # venv above was adopted prebuilt.
+  "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
+    --require pytest transformers safetensors \
+    --expect triton \
+    --expect-hint "On ascend, torch.compile needs triton-ascend installed in the image (stock PyPI triton is not a substitute: it leaves Triton with 0 active drivers)."
 fi
+
+cd "$REPO_ROOT"
+# build_ext runs in both stages. It produces the libtorch_fl.so that package_data
+# stages into the wheel, and build and test share one container job, so gating it
+# to the build stage would leave the integration stage building a wheel with no
+# native library. No device is needed here; the card is checked above for the
+# integration stage and again by the device-availability preflight.
+python setup.py build_ext --inplace

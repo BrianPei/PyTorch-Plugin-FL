@@ -206,11 +206,24 @@ if [[ "$VENV_ROOT" != "$PREBUILT_VENV" ]]; then
   "$VENV_PYTHON" -m pip install \
     --index-url "$CPU_TORCH_INDEX_URL" \
     "torch==$CPU_TORCH_VERSION"
-  if [[ "$CI_STAGE" == "integration" ]]; then
-    # Pin numpy<2: the CPU torch wheel is built against the NumPy 1.x ABI, and
-    # transformers pulls numpy 2.x which breaks torch's C extensions at import.
-    "$VENV_PYTHON" -m pip install pytest transformers "numpy<2"
-  fi
+fi
+
+# Test dependencies, installed whether or not the venv came prebuilt: a prebuilt
+# venv missing them makes the inference and training groups fail as an environment
+# problem that reads as a DTK problem.
+#
+# transformers is pinned to [4.51, 5): 4.51 is where Qwen3 model_type support
+# landed, and 5.x carries a TokenizersBackend regression that breaks the Qwen3
+# slow-to-fast tokenizer conversion. sentencepiece/tiktoken/protobuf drive that
+# conversion when the mounted model dir has no tokenizer.json. numpy stays on 1.x:
+# the CPU torch wheel is built against the NumPy 1.x ABI and transformers
+# otherwise pulls 2.x, which breaks torch's C extensions at import.
+#
+# triton is excluded: on dcu it comes from DTK (see _vendor_supplies_triton in
+# setup.py), and the vendor package is carried into the venv below.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" -m pip install \
+    pytest "transformers>=4.51,<5" "numpy<2" sentencepiece tiktoken protobuf
 fi
 
 # Carry the vendor FlagGems/FlagCX Python packages into the venv so the DTK
@@ -349,4 +362,13 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     CMAKE_PREFIX_PATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
+fi
+
+# Report the integration stack once, here, rather than letting a group fail on a
+# missing import and read as a platform defect.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
+    --require pytest transformers safetensors \
+    --expect triton \
+    --expect-hint "On DCU, Triton comes from DTK and is carried into the venv by this script."
 fi

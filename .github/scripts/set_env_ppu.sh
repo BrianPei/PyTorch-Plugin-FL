@@ -412,3 +412,12 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
+
+# Report the integration stack once, here, rather than letting a group fail on a
+# missing import and read as a platform defect.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
+    --require pytest transformers safetensors \
+    --expect triton \
+    --expect-hint "On PPU, Triton is the vendor build copied into the venv by this script."
+fi
