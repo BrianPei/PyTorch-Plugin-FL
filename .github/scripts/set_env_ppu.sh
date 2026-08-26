@@ -377,11 +377,15 @@ fi
 # bundle is idempotent and must run after build_ext so libtorch_fl.so exists.
 bash scripts/bundle_ppu_libtorch.sh
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "::error::nvidia-smi is unavailable"
-  exit 1
+# Device probes only run during integration tests. Build-only runs do not need
+# the device, and manifests have a more complete device-availability check.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "::error::nvidia-smi is unavailable"
+    exit 1
+  fi
+  nvidia-smi
 fi
-nvidia-smi
 
 python - <<'PY'
 from pathlib import Path

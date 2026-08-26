@@ -329,11 +329,15 @@ fi
 DTK_ROOT="$DTK_ROOT" FLAGOS_DCU_TORCH_LIB="$FLAGOS_DCU_TORCH_LIB" \
   bash scripts/bundle_dcu_libtorch.sh
 
-if ! command -v rocm-smi >/dev/null 2>&1; then
-  echo "::error::rocm-smi is unavailable"
-  exit 1
+# Device probes only run during integration tests. Build-only runs do not need
+# the device, and manifests have a more complete device-availability check.
+if [[ "$CI_STAGE" == "integration" ]]; then
+  if ! command -v rocm-smi >/dev/null 2>&1; then
+    echo "::error::rocm-smi is unavailable"
+    exit 1
+  fi
+  rocm-smi
 fi
-rocm-smi
 
 python - <<'PY'
 import os

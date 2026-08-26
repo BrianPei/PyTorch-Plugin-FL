@@ -64,14 +64,63 @@ def _load_contract():
 
 
 def _identity():
-    import torch
+    """Probe torch identity in an isolated subprocess to prevent SIGABRT.
 
-    return {
-        "executable": sys.executable,
-        "torch_path": str(Path(torch.__file__).resolve()),
-        "version": torch.__version__,
-        "cuda": torch.version.cuda,
-    }
+    Native backend registration can trigger abort() when the setup environment
+    already loaded vendor libraries, and Python cannot catch SIGABRT. Running
+    the probe in a subprocess with TORCH_DEVICE_BACKEND_AUTOLOAD=0 prevents
+    the backend from initializing while still allowing version/path checks.
+
+    If the subprocess exits with SIGABRT (exit code 134 or negative signal),
+    report the failure with diagnostic context but still raise SystemExit so
+    the contract check fails visibly rather than silently continuing.
+    """
+    import subprocess
+
+    probe = """
+import sys
+import json
+from pathlib import Path
+import torch
+
+identity = {
+    "executable": sys.executable,
+    "torch_path": str(Path(torch.__file__).resolve()),
+    "version": torch.__version__,
+    "cuda": torch.version.cuda,
+}
+print(json.dumps(identity))
+"""
+    env = {**__import__("os").environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        signal_desc = ""
+        if result.returncode == 134:
+            signal_desc = " (SIGABRT: likely native backend double-registration)"
+        elif result.returncode < 0:
+            signal_desc = f" (signal {-result.returncode})"
+
+        print(
+            f"::error::Failed to probe torch identity (rc={result.returncode}{signal_desc})"
+        )
+        print(f"stdout: {result.stdout}")
+        print(f"stderr: {result.stderr}")
+        print(
+            "\nDiagnostic: set TORCH_DEVICE_BACKEND_AUTOLOAD=0 was passed to the subprocess, "
+            "but the import still triggered a fatal signal. This typically means vendor "
+            "libraries were loaded before the isolation environment took effect, or the "
+            "backend registration path does not respect TORCH_DEVICE_BACKEND_AUTOLOAD."
+        )
+        raise SystemExit(
+            f"Cannot probe torch identity: subprocess exited {result.returncode}{signal_desc}"
+        )
+    return json.loads(result.stdout)
 
 
 def _report(stage, identity):
@@ -156,11 +205,19 @@ def main():
         errors.extend(_drift_errors(before, identity))
 
     if errors:
+        print("\n=== Torch Contract Violation ===")
+        print(f"Stage: {args.stage}")
+        if args.stage == "post-install":
+            print("\nBefore install:")
+            print(json.dumps(before, indent=2, sort_keys=True))
+        print("\nAfter install:")
+        print(json.dumps(identity, indent=2, sort_keys=True))
+        print("\nErrors:")
         for error in errors:
             print(f"::error::Torch contract ({args.stage}): {error}")
         if args.stage == "post-install":
             print(
-                "::error::Install the wheel with "
+                "\n::error::Install the wheel with "
                 "`pip install --force-reinstall --no-deps` so the wheel's torch pin "
                 "is not re-resolved against the default index."
             )

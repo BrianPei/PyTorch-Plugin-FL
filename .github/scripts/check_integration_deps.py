@@ -32,9 +32,18 @@ Two classes of dependency, because they fail differently:
            record for the platform owners, while the other groups still run.
            Exiting here would erase all of that evidence over one gap.
 
+For triton specifically, --expect-triton-verbose requests a deeper probe:
+importability, version, backend registry, and the path it resolves to. Stock
+PyPI triton can be imported but has 0 active drivers, so an import-only check
+would pass on the wrong Triton. The verbose check exposes that gap while still
+treating the absence as a warning rather than a hard failure.
+
 Usage:
     python .github/scripts/check_integration_deps.py --require pytest transformers
     python .github/scripts/check_integration_deps.py --expect triton \
+        --expect-hint "vendor triton-ascend provides torch.compile on this line"
+    python .github/scripts/check_integration_deps.py --expect triton \
+        --expect-triton-verbose \
         --expect-hint "vendor triton-ascend provides torch.compile on this line"
 """
 
@@ -83,12 +92,51 @@ def main():
         default="",
         help="Text appended to the warning, naming the vendor package to install",
     )
+    parser.add_argument(
+        "--expect-triton-verbose",
+        action="store_true",
+        help="When triton is in --expect, probe version/backends/path in addition to importability",
+    )
     args = parser.parse_args()
 
     print(f"Dependency check interpreter: {sys.executable}")
 
     expected_missing = _missing(args.expect)
     _report_present("Expected", args.expect, expected_missing)
+
+    # Verbose triton check: import it, show version/backends/path, warn if 0 drivers
+    if (
+        "triton" in args.expect
+        and "triton" not in expected_missing
+        and args.expect_triton_verbose
+    ):
+        try:
+            import triton
+
+            print(f"triton: {triton.__file__}")
+            print(f"triton version: {triton.__version__}")
+            # triton.runtime.driver exposes get_active_drivers() or get_drivers()
+            # depending on version; stock PyPI triton returns an empty list
+            if hasattr(triton.runtime, "driver"):
+                drivers = getattr(
+                    triton.runtime.driver, "get_active_drivers", lambda: []
+                )()
+                if not drivers:
+                    drivers = getattr(
+                        triton.runtime.driver, "get_drivers", lambda: []
+                    )()
+                print(f"triton active drivers: {drivers if drivers else '(none)'}")
+                if not drivers:
+                    print(
+                        "::warning::triton is importable but has 0 active drivers; "
+                        "stock PyPI triton is not a substitute for a vendor build "
+                        "(triton-ascend, triton-metax, flagtree). torch.compile will fail."
+                    )
+            else:
+                print("triton.runtime.driver not found; cannot probe backends")
+        except Exception as error:
+            print(f"::warning::triton import succeeded but inspection failed: {error}")
+
     if expected_missing:
         hint = f" {args.expect_hint}" if args.expect_hint else ""
         print(

@@ -64,7 +64,9 @@ for path in \
   fi
 done
 
-if [[ ! -c /dev/mxcd ]]; then
+# Device probes only run during integration tests. Build-only runs do not need
+# the device, and manifests have a more complete device-availability check.
+if [[ "$CI_STAGE" == "integration" && ! -c /dev/mxcd ]]; then
   echo "::error::MetaX device node /dev/mxcd is unavailable"
   exit 1
 fi

@@ -234,10 +234,13 @@ fi
 # satisfying torch's pin, so it is installed into the image out of band rather
 # than resolved by pip.
 #
-# A missing vendor Triton is a warning, not a setup failure. Exiting here would
-# take the other nine groups down over a torch.compile gap and leave the run with
-# no evidence at all; instead compile-tests fails on its own and the operator,
-# RNG, AMP, profiler, inference and training groups still report.
+# The image at manual-20260816-ascend-ci did not bake triton-ascend at a
+# discoverable site, so the symlink strategy fails. Install a real vendor Triton
+# or skip torch.compile until the image is updated. A missing vendor Triton is a
+# warning, not a setup failure: exiting here would take the other nine groups
+# down and leave the run with no evidence at all; instead compile-tests fails on
+# its own and the operator, RNG, AMP, profiler, inference and training groups
+# still report.
 if [[ "$CI_STAGE" == "integration" ]]; then
   VENV_SITE="$("$VENV_PYTHON" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
   if [[ ! -e "$VENV_SITE/triton" ]]; then
@@ -259,11 +262,14 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   fi
 
   # Verify against the interpreter that will run the tests, including when the
-  # venv above was adopted prebuilt.
+  # venv above was adopted prebuilt. The check must confirm importability,
+  # version, and backend registry for the vendor Triton, not just that
+  # importlib.util.find_spec returns non-None.
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
     --require pytest transformers safetensors \
     --expect triton \
-    --expect-hint "On ascend, torch.compile needs triton-ascend installed in the image (stock PyPI triton is not a substitute: it leaves Triton with 0 active drivers)."
+    --expect-triton-verbose \
+    --expect-hint "On ascend, torch.compile needs triton-ascend installed in the image (stock PyPI triton is not a substitute: it leaves Triton with 0 active drivers). Actions log 'ModuleNotFoundError: No module named triton' means the symlink did not find a vendor build at the searched paths, and torch_fl/compile/triton_byte_loads.py cannot be imported."
 fi
 
 cd "$REPO_ROOT"

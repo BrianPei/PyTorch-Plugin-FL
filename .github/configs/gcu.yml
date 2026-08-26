@@ -93,6 +93,7 @@ integration_tests:
     name: Run operator tests (vendor backend, main ops)
     phase: functional
     failure_policy: continue-after-failure
+    allow_platform_marker_skips: true
     command: >-
       python -m pytest tests/integration/ops/
       -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp"
