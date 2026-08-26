@@ -111,6 +111,9 @@ jobs:
           INTEGRATION_ENVIRONMENT="$INTEGRATION_ENVIRONMENT" \
             python .github/scripts/run_integration_tests.py "${VALIDATE_ARGS[@]}"
 
+          python .github/scripts/validate_integration_manifests.py \
+            --configs-dir .github/configs
+
           printf '%s=%s\n' display_name "$DISPLAY_NAME" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' setup_script "$SETUP_SCRIPT" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' ci_image "$CI_IMAGE" >> "$GITHUB_OUTPUT"

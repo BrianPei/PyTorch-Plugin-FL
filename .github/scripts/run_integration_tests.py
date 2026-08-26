@@ -225,8 +225,17 @@ def write_summary(results, success, out_dir):
         "total": len(results),
         "passed": sum(1 for r in results if r["status"] == "passed"),
         "failed": sum(1 for r in results if r["status"] == "failed"),
+        "skipped": sum(1 for r in results if r["status"] == "skipped"),
         "entries": results,
     }
+
+    # Detect all-skipped: every entry is skipped (none passed, none failed).
+    # This happens when a fail-fast preflight aborts the entire suite.
+    if summary["total"] > 0 and summary["skipped"] == summary["total"]:
+        summary["all_skipped"] = True
+    else:
+        summary["all_skipped"] = False
+
     (out_dir / "integration-summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -236,7 +245,11 @@ def write_summary(results, success, out_dir):
             fh.write("## Integration test results\n\n")
             fh.write(f"- Total: {summary['total']}\n")
             fh.write(f"- Passed: {summary['passed']}\n")
-            fh.write(f"- Failed: {summary['failed']}\n\n")
+            fh.write(f"- Failed: {summary['failed']}\n")
+            fh.write(f"- Skipped: {summary['skipped']}\n")
+            if summary["all_skipped"]:
+                fh.write("\n**WARNING: All integration tests were skipped** (preflight abort).\n")
+            fh.write("\n")
             if summary["failed"]:
                 fh.write("| Entry | Phase | Exit | Duration (s) |\n")
                 fh.write("| --- | --- | ---: | ---: |\n")

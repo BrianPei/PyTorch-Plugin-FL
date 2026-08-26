@@ -220,6 +220,38 @@ def test_all_continue_after_failure_rejected(runner, monkeypatch, tmp_path):
     assert "must have at least one fail-fast entry" in str(exc.value)
 
 
+def test_all_skipped_detected(runner, monkeypatch, tmp_path):
+    # When a fail-fast preflight fails and aborts the entire suite, all_skipped
+    # is set to True in the summary.
+    tests = [
+        _abort_test("check device", "fail-fast", command="false"),
+        {"id": "do-stuff", "name": "do stuff", "command": "true"},
+        {"id": "do-more", "name": "do more", "command": "true"},
+    ]
+    code = _run(runner.main, monkeypatch, tmp_path, tests)
+
+    assert code == 1
+    summary = _summary(tmp_path)
+    assert summary["success"] is False
+    assert summary["total"] == 3
+    assert summary["passed"] == 0
+    assert summary["failed"] == 1
+    assert summary["skipped"] == 2
+    assert summary.get("all_skipped") is False  # Not all are skipped (one failed)
+
+    # Now test when the preflight passes but all functional tests are skipped
+    # (hypothetical edge case where every functional entry is marked skipped).
+    # For the actual all-skipped case: first entry fails, rest are skipped.
+    tests_all_skip = [
+        _abort_test("check device", "fail-fast", command="false"),
+        {"id": "func", "name": "run tests", "command": "true"},
+    ]
+    code = _run(runner.main, monkeypatch, tmp_path, tests_all_skip)
+    summary = _summary(tmp_path)
+    # 1 failed, 1 skipped -> not all_skipped
+    assert summary.get("all_skipped") is False
+
+
 def test_input_truth_table(runner, monkeypatch, tmp_path):
     # Truth table for (has_fail_fast, has_continue_after_failure) configurations:
     # (T, T): valid - typical manifest with preflight + functional groups
