@@ -145,9 +145,7 @@ def _validate_entries(tests):
 
     # At least one fail-fast entry, so a broken environment stops the run instead
     # of producing a full functional report of environment-induced failures.
-    if metas and all(
-        policy == "continue-after-failure" for _i, _p, policy in metas
-    ):
+    if metas and all(policy == "continue-after-failure" for _i, _p, policy in metas):
         raise SystemExit(
             "integration_tests must have at least one fail-fast entry "
             "(preflight checks should abort on failure)"

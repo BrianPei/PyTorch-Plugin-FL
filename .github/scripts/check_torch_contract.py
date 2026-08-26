@@ -130,9 +130,7 @@ print(json.dumps(identity))
         stderr_lines = result.stderr.strip().split("\n")
         if stderr_lines:
             print(f"::error::First stderr line: {stderr_lines[0][:200]}")
-        print(
-            f"::error::Full diagnostic context saved to artifact: {state_file.name}"
-        )
+        print(f"::error::Full diagnostic context saved to artifact: {state_file.name}")
         raise SystemExit(
             f"Cannot probe torch identity: subprocess exited {result.returncode} ({signal_desc})"
         )
