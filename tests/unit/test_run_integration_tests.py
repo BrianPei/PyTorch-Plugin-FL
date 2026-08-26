@@ -160,16 +160,128 @@ def test_aggregate_failure_is_nonzero(runner, monkeypatch, tmp_path):
 
 
 def test_preflight_policy_default(runner):
-    # A name containing a preflight marker defaults to fail-fast; anything else
-    # defaults to the script-level fail-fast constant.
+    # Preflight entries default to fail-fast; functional entries default to
+    # continue-after-failure.
     assert (
         runner._entry_failure_policy({"name": "check isolated environment"}, 0)
         == "fail-fast"
     )
     assert (
         runner._entry_failure_policy({"name": "run operator tests"}, 0)
-        == runner.DEFAULT_FAILURE_POLICY
+        == "continue-after-failure"
     )
+
+
+def test_functional_default_is_continue_after_failure(runner, monkeypatch, tmp_path):
+    # Functional entries without explicit failure_policy default to
+    # continue-after-failure, so one failing functional group does not hide others.
+    tests = [
+        {"id": "preflight", "name": "check device", "command": "true"},
+        {"id": "func-a", "name": "run operator tests", "command": "false"},
+        {"id": "func-b", "name": "run general tests", "command": "true"},
+    ]
+    code = _run(runner.main, monkeypatch, tmp_path, tests)
+
+    assert code == 1
+    summary = _summary(tmp_path)
+    assert summary["success"] is False
+    assert summary["total"] == 3
+    assert summary["passed"] == 2
+    assert summary["failed"] == 1
+    statuses = {entry["id"]: entry["status"] for entry in summary["entries"]}
+    assert statuses["preflight"] == "passed"
+    assert statuses["func-a"] == "failed"
+    assert statuses["func-b"] == "passed"
+
+
+def test_all_continue_after_failure_rejected(runner, monkeypatch, tmp_path):
+    # A manifest where every entry is continue-after-failure (no fail-fast gate)
+    # is rejected: preflight failures must abort, not run the entire suite.
+    tests = [
+        {
+            "id": "one",
+            "name": "run tests",
+            "command": "true",
+            "failure_policy": "continue-after-failure",
+        },
+        {
+            "id": "two",
+            "name": "run more tests",
+            "command": "true",
+            "failure_policy": "continue-after-failure",
+        },
+    ]
+    monkeypatch.setenv("INTEGRATION_TESTS", json.dumps(tests))
+    monkeypatch.setenv("INTEGRATION_ENVIRONMENT", json.dumps({}))
+    monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+    assert "must have at least one fail-fast entry" in str(exc.value)
+
+
+def test_input_truth_table(runner, monkeypatch, tmp_path):
+    # Truth table for (has_fail_fast, has_continue_after_failure) configurations:
+    # (T, T): valid - typical manifest with preflight + functional groups
+    # (T, F): valid - all entries abort on failure (conservative)
+    # (F, T): INVALID - rejected by all_continue_after_failure check
+    # (F, F): impossible - empty manifest rejected earlier
+
+    # Case (T, T): typical manifest
+    tests_tt = [
+        {"id": "preflight", "name": "check device", "command": "true"},
+        {"id": "func", "name": "run tests", "command": "true"},
+    ]
+    assert _run(runner.main, monkeypatch, tmp_path, tests_tt) == 0
+
+    # Case (T, F): all fail-fast
+    tests_tf = [
+        {
+            "id": "one",
+            "name": "check device",
+            "command": "true",
+            "failure_policy": "fail-fast",
+        },
+        {
+            "id": "two",
+            "name": "check environment",
+            "command": "true",
+            "failure_policy": "fail-fast",
+        },
+    ]
+    assert _run(runner.main, monkeypatch, tmp_path, tests_tf) == 0
+
+    # Case (F, T): all continue-after-failure - rejected
+    tests_ft = [
+        {
+            "id": "one",
+            "name": "run tests",
+            "command": "true",
+            "failure_policy": "continue-after-failure",
+        },
+    ]
+    monkeypatch.setenv("INTEGRATION_TESTS", json.dumps(tests_ft))
+    monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    with pytest.raises(SystemExit) as exc:
+        runner.main()
+    assert "must have at least one fail-fast entry" in str(exc.value)
+
+
+def test_default_failure_policy_is_phase_aware(runner, monkeypatch, tmp_path):
+    # Without explicit failure_policy, the default depends on phase:
+    # preflight -> fail-fast, functional -> continue-after-failure.
+    tests = [
+        {"id": "check", "name": "check device", "command": "false"},
+        {"id": "func", "name": "run operator tests", "command": "true"},
+    ]
+    code = _run(runner.main, monkeypatch, tmp_path, tests)
+
+    assert code == 1
+    summary = _summary(tmp_path)
+    statuses = {entry["id"]: entry["status"] for entry in summary["entries"]}
+    # Preflight defaulted to fail-fast, aborted remaining entries
+    assert statuses["check"] == "failed"
+    assert statuses["func"] == "skipped"
 
 
 def test_validate_only_does_not_write_reports(runner, monkeypatch, tmp_path):

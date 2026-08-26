@@ -71,7 +71,12 @@ def _entry_failure_policy(entry, index):
     policy = entry.get("failure_policy")
     if isinstance(policy, str) and policy.strip():
         return policy.strip()
-    return DEFAULT_FAILURE_POLICY
+    # Preflight entries default to fail-fast; functional entries default to
+    # continue-after-failure so one functional group failing does not hide others.
+    phase = _entry_phase(entry, index)
+    if phase == "functional":
+        return "continue-after-failure"
+    return "fail-fast"
 
 
 def load_configuration(allow_empty):
@@ -124,6 +129,19 @@ def load_configuration(allow_empty):
             raise SystemExit(
                 f"integration_environment[{key}] must be a single-line string"
             )
+
+    # Reject configurations where every entry uses continue-after-failure (no
+    # fail-fast gate). At least one entry must abort on failure so preflight
+    # failures (missing device, broken wheel) do not run the entire functional
+    # suite and produce misleading aggregate results.
+    if tests and all(
+        _entry_failure_policy(test, idx) == "continue-after-failure"
+        for idx, test in enumerate(tests, start=1)
+    ):
+        raise SystemExit(
+            "integration_tests must have at least one fail-fast entry "
+            "(preflight checks should abort on failure)"
+        )
 
     return tests, environment
 
