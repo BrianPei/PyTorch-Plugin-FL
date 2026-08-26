@@ -248,7 +248,9 @@ def write_summary(results, success, out_dir):
             fh.write(f"- Failed: {summary['failed']}\n")
             fh.write(f"- Skipped: {summary['skipped']}\n")
             if summary["all_skipped"]:
-                fh.write("\n**WARNING: All integration tests were skipped** (preflight abort).\n")
+                fh.write(
+                    "\n**WARNING: All integration tests were skipped** (preflight abort).\n"
+                )
             fh.write("\n")
             if summary["failed"]:
                 fh.write("| Entry | Phase | Exit | Duration (s) |\n")
