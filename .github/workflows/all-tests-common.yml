@@ -211,3 +211,11 @@ jobs:
         with:
           name: ${{ needs.configuration.outputs.wheel_artifact_name }}
           path: ${{ env.WHEEL_PATH }}
+
+      - name: Upload integration reports
+        if: always() && inputs.run_integration_tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-reports-${{ inputs.platform }}
+          path: integration-reports/
+          if-no-files-found: warn

@@ -34,7 +34,6 @@ public contract still leaves evidence instead of being whitelisted out:
 import inspect
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -213,13 +212,11 @@ def profile_result():
         torch.sort(small)
         z.sum().item()  # force sync so device activity lands inside the window
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as trace_file:
-        trace_path = Path(trace_file.name)
-    try:
-        prof.export_chrome_trace(str(trace_path))
-        trace = json.loads(trace_path.read_text())
-    finally:
-        trace_path.unlink(missing_ok=True)
+    report_dir = _observation_path().parent
+    report_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = report_dir / f"profiler-trace-{_consumer_module().split('.')[-1]}.json"
+    prof.export_chrome_trace(str(trace_path))
+    trace = json.loads(trace_path.read_text())
     submit_observation(_consumer_module(), trace)
     return prof, trace
 
