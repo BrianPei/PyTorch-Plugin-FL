@@ -54,15 +54,18 @@ integration_tests:
       torch_path = Path(torch.__file__).resolve()
       package_root = Path(torch_fl.__file__).resolve().parent
 
-      assert torch.__version__.split("+", 1)[0] == "2.10.0", torch.__version__
-      assert torch.version.cuda is None, torch.version.cuda
+      # GCU is native, not CUDA boxing: builds against CPU PyTorch 2.10.
+      # Already checks base version correctly; add descriptive error messages.
+      base_version = torch.__version__.split("+", 1)[0]
+      assert base_version == "2.10.0", f"expected PyTorch 2.10.0, got {torch.__version__}"
+      assert torch.version.cuda is None, f"expected CPU wheel (cuda=None), got cuda={torch.version.cuda}"
       assert "/usr/local/lib/python3.12/dist-packages" not in str(torch_path), torch_path
       assert not (package_root / "lib" / "libtorch_cuda.so").is_file(), package_root
       assert torch_fl.flagos.is_available(), "flagos device is unavailable"
       count = torch_fl.flagos.device_count()
       assert count >= 8, f"expected at least 8 GCU devices, got {count}"
 
-      print(f"CPU PyTorch: {torch.__version__}")
+      print(f"PyTorch: {torch.__version__} (base: {base_version}, cuda: {torch.version.cuda})")
       print(f"torch path: {torch_path}")
       print(f"torch_fl path: {torch_fl.__file__}")
       print(f"GCU devices: {count}")

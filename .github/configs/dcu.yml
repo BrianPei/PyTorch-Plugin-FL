@@ -70,12 +70,16 @@ integration_tests:
       torch_path = Path(torch.__file__).resolve()
       package_lib = Path(torch_fl.__file__).resolve().parent / "lib"
 
-      assert torch.version.cuda is None, torch.version.cuda
+      # DCU is native, not CUDA boxing: builds against CPU PyTorch 2.10.
+      # The version string may vary depending on packaging; check base version.
+      base_version = torch.__version__.split("+")[0]
+      assert base_version == "2.10.0", f"expected PyTorch 2.10.0, got {torch.__version__}"
+      assert torch.version.cuda is None, f"expected CPU wheel (cuda=None), got cuda={torch.version.cuda}"
       assert "/opt/conda/" not in str(torch_path), torch_path
       assert (package_lib / "libtorch_fl.so").is_file(), package_lib
       assert torch_fl.flagos.is_available(), "flagos device is unavailable"
       assert torch_fl.flagos.device_count() > 0, torch_fl.flagos.device_count()
-      print(f"CPU PyTorch: {torch.__version__}")
+      print(f"PyTorch: {torch.__version__} (base: {base_version}, cuda: {torch.version.cuda})")
       print(f"torch path: {torch_path}")
       print(f"DCU assets: {package_lib}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
