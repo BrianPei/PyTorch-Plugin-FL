@@ -254,9 +254,11 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   fi
 
   # Verify triton is available through vendor stack (triton_gcu/flagtree).
-  # Stock PyPI triton targets NVIDIA and is not a substitute.
+  # Stock PyPI triton targets NVIDIA and is not a substitute. triton is not in
+  # the --require list: a missing vendor Triton is a warning, not a setup
+  # failure (the compile-tests group will fail on its own, documenting the gap).
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors triton
+    --require pytest transformers safetensors
 fi
 
 cd "$REPO_ROOT"
