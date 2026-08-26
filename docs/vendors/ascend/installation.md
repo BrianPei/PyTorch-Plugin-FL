@@ -182,6 +182,87 @@ With `FLAGOS_USE_FLAGGEMS=1`, the runtime loads `backends_ascend_flagos_py.conf`
 
 Without `FLAGOS_USE_FLAGGEMS`, all ops use the pure ACLNN backend.
 
+## Optional: torch.compile via triton-ascend
+
+`torch.compile(backend="flagos")` compiles inductor's fused Triton kernels with
+`triton-ascend`. It needs the same environment as the FlagGems route above — the
+patched `triton-ascend` and its `libstdc++` preload — but not `FLAGOS_USE_FLAGGEMS`
+and not `FLAGOS_USE_FLAGTREE`; the profile is picked from the `ACCELERATOR=ascend`
+build. Eager ACLNN keeps working unchanged if `triton-ascend` is absent.
+
+FlagTree is not the recommended route here, and is not required. Its Ascend
+backend exists only on the 3.5-line branches (`triton_v3.5.x` /
+`v0.6.0-rc2-triton3.5`; it is absent from `main` and the 3.6/3.7 branches), there
+is no `flagtree` wheel on PyPI so it must be built from source, and installing it
+*replaces* the `triton` package — taking `triton-ascend` and the FlagGems path
+down with it. Use a separate environment if you want to try it.
+
+That backend is also coupled to `torch_npu`, which claims PrivateUse1 and would
+leave `torch_fl` unable to register `flagos`. The coupling is at the C++ and link
+level, not just a Python import: upstream's `torch_npu` backend policy emits
+`-ltorch_npu`, includes `<torch_npu/csrc/core/npu/NPUWorkspaceAllocator.h>`, and
+generates `at_npu::native::` calls. A stub `torch_npu` module therefore cannot
+work — the launcher would fail to compile.
+
+`torch_fl/compile/flagtree_ascend_policy.py` works around this by registering a
+third backend policy, `flagos`, on FlagTree's strategy registry. It answers the
+same strategy names from torch_fl's own runtime: device and stream come from
+`torch.flagos` and the ACL stream registry, and the generated C++ uses plain ATen
+against PrivateUse1 (which under `torch_fl` *is* flagos) instead of `at_npu::`.
+It installs automatically when `FLAGOS_USE_FLAGTREE=1` on an Ascend build, and
+also forces `TRITON_ENABLE_TASKQUEUE=false`, because the task queue is
+torch_npu-only (`at_npu::native::OpCommand`) and defaults to on upstream.
+
+Status: the policy is verified only up to the boundary that can be checked
+without a FlagTree build — the emitted C++ compiles against real ATen headers
+using just the flags the policy emits, and every strategy FlagTree's driver
+dispatches resolves through FlagTree's real registry class with `flagos` owning
+PrivateUse1. End-to-end kernel compilation and execution through FlagTree has not
+been run, because no FlagTree build carrying the Ascend backend is installed in
+this environment. Treat it as unvalidated until that exists.
+
+Upstream request to remove the need for this shim:
+https://github.com/flagos-ai/FlagTree/issues/1046
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "
+import torch, torch_fl
+
+def f(x):
+    return torch.nn.functional.relu(x + 1.0) * 2.0
+
+x = torch.randn(64, 64, device='flagos:0')
+print('compile matches eager:', torch.allclose(torch.compile(f, backend='flagos')(x), f(x)))
+"
+```
+
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` matters if `torch_npu` is installed in the same
+environment: `import torch` autoloads it, it claims PrivateUse1, and `torch_fl`
+then refuses to register `flagos`.
+
+Support is **experimental**. Measured on a real 910 (`Ascend910_9382`, CANN 9.0.0,
+triton-ascend 3.2.0, torch 2.10.0+cpu, Python 3.10):
+`tests/integration/test_compile.py` passes 30 of 32 with a cold inductor cache,
+the two remaining cases being FlagTree-only and MetaX-only. Run it with the cache
+cleared —
+
+```bash
+rm -rf /tmp/torchinductor_root
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 pytest tests/integration/test_compile.py -v
+```
+
+— because a warm cache hides the compile-worker crash described below.
+
+Three triton-ascend defects are worked around in
+`torch_fl/compile/`, each documented with its measured evidence in
+[`docs/architecture/torch-compile-integration.md`](../../architecture/torch-compile-integration.md):
+a masked 2-D byte load that silently reads wrong data (this produced incorrect
+`relu` gradients), `ub overflow` raised as a hard compile error rather than a
+resource limit, and a segfault when the parent process launches a kernel built in
+an inductor compile worker. The last one makes Ascend default to
+`compile_threads=1`; an explicit `compile_threads` option or
+`TORCHINDUCTOR_COMPILE_THREADS` still wins.
+
 ## Limitations
 
 ### No model mount in CI
@@ -191,6 +272,13 @@ Without `FLAGOS_USE_FLAGGEMS`, all ops use the pure ACLNN backend.
 ### No device-side profiler parity yet
 
 The Ascend profiler path does not yet emit device-side event categories (kernel, gpu_memcpy, gpu_memset, runtime, ac2g flows). The flagos trace has only `['Trace', 'cpu_op']` versus the torch-cuda baseline. `test_profiler_parity.py` is excluded from CI until device/runtime events are implemented (`.github/configs/ascend.yml` lines 112-117).
+
+### torch.compile is not covered in CI
+
+The Ascend CI runner image does not carry `triton-ascend`, so
+`tests/integration/test_compile.py` has no CI step and the compile path is
+validated only by hand on hardware that has the toolchain installed. The results
+quoted above are point measurements, not a continuously enforced gate.
 
 ### Distributed support is architectural only
 
