@@ -34,8 +34,10 @@ runner_labels:
 # standard layout as any DCU box, so the source path is portable across hosts.
 container_volumes:
   - /usr/local/hyhal:/usr/local/hyhal:ro
+  - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
-integration_environment: {}
+integration_environment:
+  MODEL_PATH: /models/Qwen3-0.6B
 
 # DCU is non-NVIDIA: expose the /dev/kfd and /dev/dri device nodes through
 # --privileged (mirrors the MetaX layout) instead of --gpus all.
@@ -48,19 +50,31 @@ container_options: >-
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-dcu
-# Keep DCU integration self-contained; transferring the bundled libtorch wheel
-# through the Actions artifact service can exceed the self-hosted runner job
-# timeout.
-integration_wheel_source: local-build
+
+# DTK Torch is hipified but reports no CUDA version, and the HIP kernels reach
+# the process through the wheel's own assets rather than a CUDA-variant Torch.
+torch_contract:
+  base_version: "2.10.0"
+  cuda: none
+  forbidden_torch_paths:
+    - /opt/conda/
 
 # The common workflow only executes this platform-provided test manifest.
 # DCU is a boxing build (DTK torch is hipified, HIP kernels live under the CUDA
 # dispatch key), so the vendor backend path and the FlagGems runtime path
 # (backends_dcu_flaggems.conf, DTK triton hcu + cuda boxing fallback) mirror
-# CUDA's manifest. Inference/training are deferred until the runner has a model
-# mount and the first CI run confirms the card count.
+# CUDA's manifest.
 integration_tests:
-  - name: Check device availability
+  - id: model-availability
+    name: Check model availability
+    phase: preflight
+    failure_policy: fail-fast
+    command: test -d "$MODEL_PATH"
+
+  - id: device-availability
+    name: Check device availability
+    phase: preflight
+    failure_policy: fail-fast
     command: |
       python - <<'PY'
       from pathlib import Path
@@ -81,36 +95,84 @@ integration_tests:
       print(f"DCU assets: {package_lib}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
-  - name: Run operator tests (vendor backend, main ops)
+
+  - id: operator-tests
+    name: Run operator tests (vendor backend, main ops)
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/
       -m "main_ops and not flaggems_python and not flaggems_cpp"
       -v -s --tb=short
-  - name: Run operator tests (FlagGems runtime path, main ops)
-    command: >-
-      FLAGOS_USE_FLAGGEMS=1
-      python -m pytest tests/integration/ops/
-      -m "flaggems and main_ops" -v -s --tb=short
-  - name: Run unified RNG tests
+
+  - id: rng-tests
+    name: Run unified RNG tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops" -v -s --tb=short
-  - name: Run general tests
+
+  - id: general-tests
+    name: Run general tests
+    phase: functional
+    failure_policy: continue-after-failure
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
-  - name: Unified AMP contract
+
+  - id: amp-contract
+    name: Unified AMP contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_amp_contract.py
       -v -m amp --tb=short
-  - name: Unified profiler contract
+
+  - id: profiler-contract
+    name: Unified profiler contract
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
       -v -m profiler --tb=short
 
+  - id: compile-tests
+    name: Run torch.compile tests
+    phase: functional
+    failure_policy: continue-after-failure
+    command: python -m pytest tests/integration/test_compile.py -v -s --tb=short
+
+  - id: inference-tests
+    name: Run inference tests
+    phase: functional
+    failure_policy: continue-after-failure
+    command: >-
+      python -m pytest tests/integration/test_qwen3_infer.py
+      --model "$MODEL_PATH" -v -s --tb=short
+
+  - id: training-tests
+    name: Run training tests
+    phase: functional
+    failure_policy: continue-after-failure
+    command: >-
+      python -m pytest tests/integration/test_qwen3_train.py
+      --model "$MODEL_PATH" -v -s --tb=short
+
+  # Platform-specific groups, additive to the baseline above.
+  - id: operator-tests-flaggems
+    name: Run operator tests (FlagGems runtime path, main ops)
+    phase: functional
+    failure_policy: continue-after-failure
+    command: >-
+      FLAGOS_USE_FLAGGEMS=1
+      python -m pytest tests/integration/ops/
+      -m "flaggems and main_ops" -v -s --tb=short
+
   # Structural comparison against tests/data/profiler_cuda_baseline.json, which
-  # the shared contract does not cover: it asserts the public API surface, while
-  # this checks tracer output against stock torch+cuda. Carried over from the
-  # inline step this manifest replaces.
-  - name: Profiler parity test
+  # the shared contract does not cover.
+  - id: profiler-parity
+    name: Profiler parity test
+    phase: functional
+    failure_policy: continue-after-failure
     command: >-
       python -m pytest tests/integration/test_profiler_parity.py
       -v -m main_ops --tb=short
