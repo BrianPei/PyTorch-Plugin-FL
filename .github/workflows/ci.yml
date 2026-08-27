@@ -93,3 +93,8 @@ jobs:
     uses: ./.github/workflows/all-tests-common.yml
     with:
       platform: ${{ matrix.platform }}
+      # Debug-phase toggle: skip wheel artifact upload while iterating on the
+      # integration tests -- green-run wheels are unused during debugging and
+      # only consume storage. Flip to true (or drop this line) at final
+      # delivery so release/provenance wheels are retained again.
+      upload_artifact: false
