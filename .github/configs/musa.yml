@@ -87,9 +87,25 @@ integration_tests:
   # carry @pytest.mark.anyplatform. The platform gate (conftest.py) skips the
   # cuda/metax/ascend/dcu/flaggems_python-marked cases on MUSA, so this selects
   # the anyplatform/main_ops subset that routes to the native mudnn backend.
+  #
+  # test_rng_dispatch.py is explicitly ignored here even though its tests carry
+  # @pytest.mark.(anyplatform + main_ops) and would otherwise be collected:
+  #   1. It has its own dedicated group (Run unified RNG tests) where a murand
+  #      failure is isolated and --tb=line capped.
+  #   2. murand's seed-source / multi-device generator path is broken on this
+  #      runner (err 700, illegal memory access). The first such failure poisons
+  #      the MUSA context for the rest of the pytest session, so every later
+  #      kernel -- rsqrt, silu, sin, softmax, sum, where, zeros, ... -- fails
+  #      with the same illegal-memory-access symptom even though those ops are
+  #      healthy (they pass before the poisoning and in isolation). Running RNG
+  #      here would inflate the group from ~1 real failure to ~80 collateral
+  #      ones and, because run_integration_tests.py stops on the first non-zero
+  #      group, block groups 4-7 entirely.
+  # Restore this ignore only after murand's seed-source path is fixed.
   - name: Run operator tests (native mudnn, main ops)
     command: >-
       python -m pytest tests/integration/ops/
+      --ignore=tests/integration/ops/test_rng_dispatch.py
       -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp and not cuda and not ascend and not metax and not dcu and not gcu and not ppu"
       -v -s --tb=short
 
