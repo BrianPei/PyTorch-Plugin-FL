@@ -170,6 +170,14 @@ integration_tests:
       python -m pytest tests/integration/ops/
       -m "flaggems and main_ops" --tb=short
 
+  - id: dcu-lowp-matrix-tests
+    name: Run DCU low-precision matrix tests
+    phase: functional
+    failure_policy: continue-after-failure
+    command: >-
+      python -m pytest tests/integration/ops/test_soft_lowp_gate_dispatch.py
+      -m "dcu" --tb=short
+
   # Structural comparison against tests/data/profiler_cuda_baseline.json, which
   # the shared contract does not cover.
   - id: profiler-parity

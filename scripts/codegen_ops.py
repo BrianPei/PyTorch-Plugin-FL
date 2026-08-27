@@ -586,29 +586,6 @@ FLAGGEMS_PYTHON_SKIP = {
     "i0_",
     "zero",
     "zero.out",
-    # Same CUDA-device assert family (measured on the 5060 survey): the gems
-    # kernels raise on flagos and fall back to the boxed CUDA kernels.
-    "i0",
-    "i0.out",
-    "special_i0e",
-    "special_i0e.out",
-    "special_i1",
-    "upsample_bicubic2d",
-    "soft_margin_loss",
-    # _FULL_CONFIG spells these out variants with underscores, so the dotted
-    # names above would not match on their own.
-    "special_i0e_out",
-    "special_i1_out",
-    # Same device guard, found by re-running the survey and by source review.
-    "special_modified_bessel_k0",
-    "special_modified_bessel_k0.out",
-    "special_scaled_modified_bessel_k1",
-    "special_scaled_modified_bessel_k1.out",
-    "reflection_pad3d",
-    "reflection_pad3d.out",
-    "replication_pad2d",
-    "replication_pad2d.out",
-    "_embedding_bag_dense_backward",
     # rand/randn/rand_like/randn_like/randperm/multinomial are now ROUTED (not
     # skipped). gems' internal philox_backend_seed_offset(increment) reads
     # torch_device_fn.default_generators[device] (torch.cuda for the nvidia/metax
@@ -629,6 +606,23 @@ FLAGGEMS_PYTHON_SKIP = {
     "normal.Tensor_float",
     "normal.float_Tensor",
 }
+
+
+def _normalize_flaggems_qualname(fn):
+    """Return a portable FlagGems qualname for a discovered function.
+
+    FlagGems exposes the same operator through generic modules and vendor
+    aliases. The active backend can therefore make ``fn.__module__`` point at a
+    bare package such as ``gcu300.ops.count_nonzero`` or ``_nvidia.ops.mm``.
+    Embedding that runtime-selected alias in generated C++ would make the
+    artifact hardware-specific and fail when loaded on another backend. Every
+    discovered ``*.ops.*`` alias is consequently mapped to the canonical
+    ``flag_gems.ops.*`` package; already-canonical names are left unchanged.
+    """
+    module = getattr(fn, "__module__", "") or ""
+    if not module.startswith("flag_gems.") and ".ops." in module:
+        module = f"flag_gems.ops.{module.split('.ops.', 1)[1]}"
+    return f"{module}.{fn.__name__}"
 
 
 def discover_flaggems_ops(codegen_ops, funcs):
@@ -654,22 +648,6 @@ def discover_flaggems_ops(codegen_ops, funcs):
         rejected.
       - every arg passed to the gems function has a generic-caller-covered type.
     """
-
-    def _normalize_gems_qualname(fn):
-        """Normalize vendor-specific module names to canonical flag_gems.ops.*
-
-        FlagGems exposes ops via vendor aliases (_hygon.ops.*, _nvidia.ops.*, etc)
-        that resolve to the same underlying flag_gems.ops.* implementation. Using
-        fn.__module__ directly captures whichever alias was active at codegen time,
-        breaking imports on other vendors. This strips the vendor prefix so the
-        generated C++ always uses the canonical flag_gems.ops.* path.
-        """
-        module = fn.__module__
-        # Vendor aliases: _hygon, _nvidia, _metax, etc.
-        if module.startswith("_") and ".ops." in module:
-            # Strip vendor prefix: "_hygon.ops.mm" -> "flag_gems.ops.mm"
-            return f"flag_gems.ops.{module.split('.ops.', 1)[1]}.{fn.__name__}"
-        return f"{module}.{fn.__name__}"
 
     try:
         # torch_fl activates the torch.cuda shim (CPU-torch reports no CUDA
@@ -743,7 +721,7 @@ def discover_flaggems_ops(codegen_ops, funcs):
                 continue
             if not all(_flaggems_type_ok(t) for t, _ in positional):
                 continue
-            qualname = _normalize_gems_qualname(fn)
+            qualname = _normalize_flaggems_qualname(fn)
             result[op] = (qualname, "like_factory", positional)
             continue
         # Random in-place: whitelisted inplace op with a trailing Generator? arg.
@@ -766,7 +744,7 @@ def discover_flaggems_ops(codegen_ops, funcs):
                 continue
             if not all(_flaggems_type_ok(t) for t, _ in positional):
                 continue
-            qualname = _normalize_gems_qualname(fn)
+            qualname = _normalize_flaggems_qualname(fn)
             result[op] = (qualname, "random_inplace", positional)
             continue
         # RNG functional with a trailing Generator? the caller can't express:
@@ -783,7 +761,7 @@ def discover_flaggems_ops(codegen_ops, funcs):
                 or not all(_flaggems_type_ok(t) for t, _ in positional)
             ):
                 continue
-            qualname = _normalize_gems_qualname(fn)
+            qualname = _normalize_flaggems_qualname(fn)
             result[op] = (qualname, "rng_dropgen", positional)
             continue
         if cat == "factory":
@@ -814,7 +792,7 @@ def discover_flaggems_ops(codegen_ops, funcs):
                 continue
             if not all(_flaggems_type_ok(t) for t, _ in positional):
                 continue
-            qualname = _normalize_gems_qualname(fn)
+            qualname = _normalize_flaggems_qualname(fn)
             result[op] = (qualname, "factory", positional)
             continue
         # Required keyword-only gems params. Every arity gate below counts
@@ -936,7 +914,7 @@ def discover_flaggems_ops(codegen_ops, funcs):
         # already forwarded by name).
         if not req_kwonly <= {name for _t, name in kwargs}:
             continue
-        qualname = _normalize_gems_qualname(fn)
+        qualname = _normalize_flaggems_qualname(fn)
         result[op] = (qualname, resolved_cat, kwargs)
     return result
 
@@ -2005,6 +1983,48 @@ CATEGORY_GENERATORS = {
 # ============================================================================
 
 
+# Matrix operators whose vendor routes must not receive unsupported low-precision
+# tensors. Keep the list schema-specific because the generated wrapper is also used
+# for dtype/out variants whose names do not share one dispatcher signature.
+_SOFT_LOWP_DIRECT_CALLS = {
+    "addmm": "at::native::flagos::soft_lowp::Addmm(self, mat1, mat2, beta, alpha)",
+    "addmm.dtype": "at::native::flagos::soft_lowp::AddmmDtype(self, mat1, mat2, out_dtype, beta, alpha)",
+    "addmm.dtype_out": "at::native::flagos::soft_lowp::AddmmDtypeOut(self, mat1, mat2, out_dtype, beta, alpha, out)",
+    "addmm.out": "at::native::flagos::soft_lowp::AddmmOut(self, mat1, mat2, beta, alpha, out)",
+    "addmm_": "at::native::flagos::soft_lowp::AddmmInplace(self, mat1, mat2, beta, alpha)",
+    "bmm": "at::native::flagos::soft_lowp::Bmm(self, mat2)",
+    "bmm.dtype": "at::native::flagos::soft_lowp::BmmDtype(self, mat2, out_dtype)",
+    "bmm.dtype_out": "at::native::flagos::soft_lowp::BmmDtypeOut(self, mat2, out_dtype, out)",
+    "bmm.out": "at::native::flagos::soft_lowp::BmmOut(self, mat2, out)",
+    "mm": "at::native::flagos::soft_lowp::Mm(self, mat2)",
+    "mm.dtype": "at::native::flagos::soft_lowp::MmDtype(self, mat2, out_dtype)",
+    "mm.dtype_out": "at::native::flagos::soft_lowp::MmDtypeOut(self, mat2, out_dtype, out)",
+    "mm.out": "at::native::flagos::soft_lowp::MmOut(self, mat2, out)",
+}
+
+_SOFT_LOWP_GATE_OPS = {
+    "_scaled_grouped_mm",
+    "_scaled_grouped_mm_v2",
+    "_scaled_mm",
+    "_scaled_mm.out",
+    "_scaled_mm_v2",
+    *_SOFT_LOWP_DIRECT_CALLS,
+}
+
+
+def _plain_tensor_ref_names(args: List[Tuple[str, str]]) -> List[str]:
+    """Return non-optional Tensor references usable by the lowp dtype gate."""
+    return [
+        name
+        for cpp_type, name in args
+        if "at::Tensor" in cpp_type
+        and "const" in cpp_type
+        and "optional" not in cpp_type
+        and "TensorList" not in cpp_type
+        and "ArrayRef" not in cpp_type
+    ]
+
+
 def gen_wrapper(op, fn_type, dispatcher, ret_type, args):
     """Wrapper<Name> that forwards into the dispatcher (used by TORCH_LIBRARY_IMPL)."""
     wname = "Wrapper" + fn_type[:-2]
@@ -2014,6 +2034,47 @@ def gen_wrapper(op, fn_type, dispatcher, ret_type, args):
         body = f"  {call};"
     else:
         body = f"  return {call};"
+
+    # Vendor libraries generally do not accept PyTorch's FP8/FP4 scalar types.
+    # Keep the generated wrapper as the single dtype-aware gate so a future
+    # software-lowp implementation can bypass the static backend cache without
+    # changing every vendor configuration file. The gate must never allow a
+    # covered low-precision operation to reach the generic CPU fallback.
+    lowp_args = _plain_tensor_ref_names(args)
+    if op in _SOFT_LOWP_DIRECT_CALLS and lowp_args:
+        checks = " || ".join(
+            f"at::native::flagos::soft_lowp::IsLowPrecision({name}.scalar_type())"
+            for name in lowp_args
+        )
+        body = (
+            "#if defined(USE_DCU)\n"
+            f"  if ({checks}) {{\n"
+            f"    return {_SOFT_LOWP_DIRECT_CALLS[op]};\n"
+            "  }\n"
+            "#endif\n" + body
+        )
+    elif op in _SOFT_LOWP_GATE_OPS and lowp_args:
+        checks = " || ".join(
+            f"at::native::flagos::soft_lowp::IsLowPrecision({name}.scalar_type())"
+            for name in lowp_args
+        )
+        body = (
+            "#if defined(USE_DCU)\n"
+            f"  if ({checks}) {{\n"
+            f'    TORCH_CHECK(false, "soft-lowp {op} requires a device kernel for '
+            'the requested dtype; CPU fallback is disabled");\n'
+            "  }\n"
+            "#endif\n" + body
+        )
+    elif op in _SOFT_LOWP_GATE_OPS:
+        # A covered schema with no plain Tensor input (for example an out-only
+        # signature) must not silently fall through to the generic fallback.
+        body = (
+            "#if defined(USE_DCU)\n"
+            f'  TORCH_CHECK(false, "soft-lowp {op} requires Tensor inputs; '
+            'CPU fallback is disabled");\n'
+            "#endif\n" + body
+        )
     return f"{ret_type} {wname}({args_decl(args)}) {{\n{body}\n}}", wname
 
 
@@ -2475,61 +2536,13 @@ def main():
             "im2col",
             "smooth_l1_loss",
             "smooth_l1_loss_backward",
-            # special_i1.out has no kernel under flag_gems 7fb49bad (its parent
-            # is skipped above); the out variant routes to cuda via plain conf.
+            "special_i1.out",
             "_upsample_bilinear2d_aa",
             "_upsample_nearest_exact2d_backward",
             "upsample_trilinear3d",
             # (3) DTK triton cannot compile the gems kernel
             "gcd",
             "gcd.out",
-            # (3b) kernel dtype/value limits, measured on the 5060 survey:
-            # tl.dot rejects int64, tl.atomic_add rejects bool, cummax/cummin
-            # bool loop types clash, randint high=1 hits a gems constexpr gap.
-            "mm",
-            "mm.out",
-            "addmm",
-            "addmm.out",
-            "addmm_",
-            "index_add",
-            "index_add_",
-            "cummax",
-            "cummin",
-            "randint",
-            "randint_like",
-            # (3c) regressions of the 7fb49bad regeneration: these routes were
-            # cuda on main and fail on the gems path (nan, wrong shape, ...).
-            "_batch_norm_no_update",
-            "_cdist_forward",
-            "_pdist_backward",
-            "dequantize.self",
-            "igamma_",
-            "igammac_",
-            "linalg_lstsq",
-            "lu_unpack.out",
-            "mse_loss_backward",
-            "nansum.out",
-            "norm.Scalar",
-            "norm.ScalarOpt_dim",
-            "range",
-            "special_chebyshev_polynomial_u",
-            "special_chebyshev_polynomial_w",
-            "special_hermite_polynomial_h",
-            "special_shifted_chebyshev_polynomial_u",
-            "special_shifted_chebyshev_polynomial_w",
-            # (3d) rest of the tl.dot int64 family; view-vs-copy and rstd
-            # shape bugs in gems kernels.
-            "addbmm",
-            "bmm",
-            "bmm.out",
-            "baddbmm",
-            "mv",
-            "dot",
-            "addmm.dtype",
-            "addmm.dtype_out",
-            "_fused_rms_norm",
-            "_conj",
-            "_pdist_forward",
             # (4) wrong numerics or memory safety on the gems path
             "adaptive_max_pool3d_backward",
             "leaky_relu_",
@@ -2706,9 +2719,6 @@ def main():
         dcu_triton_fallback = flaggems_forced_cuda | {
             "slice_backward",
             "silu_backward",
-            # gcd/gcd.out fail DTK triton compile (see runtime_broken); the
-            # in-place twin shares the kernel family on DCU.
-            "gcd_",
         }
         dfg_conf_path = repo_root / "torch_fl/configs/backends_dcu_flaggems.conf"
         dfg_lines = conf_license + [
