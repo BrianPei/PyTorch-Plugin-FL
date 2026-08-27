@@ -253,12 +253,14 @@ if [[ "$CI_STAGE" == "integration" ]]; then
     done
   fi
 
-  # Verify against the interpreter that will run the tests, including when the
-  # venv above was adopted prebuilt. The check must confirm importability,
-  # version, and backend registry for the vendor Triton, not just that
-  # importlib.util.find_spec returns non-None.
+  # Verify the mandatory test deps against the interpreter that will run the
+  # tests, including when the venv above was adopted prebuilt. Triton is probed
+  # advisorially (--triton-backend ascend): a missing or misconfigured vendor
+  # triton only breaks torch.compile (compile-tests), so it emits ::warning::
+  # rather than aborting setup -- see check_integration_deps.py. triton is
+  # intentionally absent from --require for the same reason.
   "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors triton \
+    --require pytest transformers safetensors \
     --triton-backend ascend
 
   # Device node check: Ascend exposes a manager device plus per-card davinci
