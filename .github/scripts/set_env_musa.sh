@@ -221,15 +221,12 @@ if command -v mthreads-gmi >/dev/null 2>&1; then
   mthreads-gmi
 fi
 
-# Report the integration stack once, here, rather than letting a group fail on a
-# missing import and read as a platform defect. Triton is absent on this line:
-# the image ships no MThreads flagtree build and stock PyPI triton targets NVIDIA,
-# so compile-tests will fail when torch.compile is invoked, and that failure is
-# the environment-gap record the platform owners act on.
-if [[ "$CI_STAGE" == "integration" ]]; then
-  "$VENV_PYTHON" .github/scripts/check_integration_deps.py \
-    --require pytest transformers safetensors
-fi
+# Integration deps (pytest, transformers, numpy<2, safetensors, sentencepiece,
+# tiktoken, protobuf) are pip-installed above. Triton is deliberately absent on
+# this line: the image ships no MThreads flagtree build and stock PyPI triton
+# targets NVIDIA, so torch.compile will fail when invoked -- that failure is the
+# environment-gap record the platform owners act on (compile-tests is withheld in
+# the manifest until the image bakes the vendor triton stack).
 
 # --- Export to later workflow steps ------------------------------------------
 if [[ -n "${GITHUB_PATH:-}" ]]; then
