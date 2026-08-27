@@ -83,11 +83,6 @@ integration_tests:
       python -m pytest tests/integration/ops/test_musa_dispatch.py
       -m musa -v -s --tb=short
 
-  - name: Run unified RNG tests
-    command: >-
-      python -m pytest tests/integration/ops/test_rng_dispatch.py
-      -m "main_ops" -v -s --tb=short
-
   # Marker selection, not a file allowlist: the generic per-op dispatch files
   # carry @pytest.mark.anyplatform. The platform gate (conftest.py) skips the
   # cuda/metax/ascend/dcu/flaggems_python-marked cases on MUSA, so this selects
@@ -110,6 +105,20 @@ integration_tests:
     command: >-
       python -m pytest tests/integration/test_math_bits_contract.py
       -v -m math_bits --tb=short
+
+  # Triage phase: ordered last so a murand failure cannot block the functional
+  # groups above. As of 2026-08-27 the CI runner's murand (vendor RNG library)
+  # is broken -- murandGenerateUniform/Normal fail with LAUNCH_FAILURE and
+  # randperm returns garbage (illegal memory access), while mudnn compute is
+  # healthy (the 89 MUSA dispatch tests pass). docs/vendors/musa/installation.md
+  # recorded the RNG suite passing on S5000 on 2026-08-17, so this is a
+  # driver/toolkit/image regression on this runner, not a torch_fl code defect.
+  # --tb=line keeps the log from being flooded by the 2000-element randperm
+  # assert diff. Restore --tb=short and move this back up once murand is fixed.
+  - name: Run unified RNG tests
+    command: >-
+      python -m pytest tests/integration/ops/test_rng_dispatch.py
+      -m "main_ops" -v -s --tb=line
 
   # ---------------------------------------------------------------------------
   # Deliberately not included yet, so the gap is recorded rather than implied:
