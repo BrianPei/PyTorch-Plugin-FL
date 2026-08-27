@@ -160,8 +160,12 @@ if ! venv_is_usable; then
 fi
 
 if (( USING_PREBUILT == 0 )); then
+  # build (pypa/build) is the PEP 517 frontend the common "Build wheel" step
+  # invokes via `python -m build --wheel --no-isolation`. MetaX gets it from the
+  # prebuilt /opt/venv; this fresh venv must ship it itself. A derived CI image
+  # that bakes a prebuilt musa venv must bake `build` into it too.
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
-    --upgrade pip setuptools wheel cmake ninja
+    --upgrade pip setuptools wheel cmake ninja build
   "$VENV_PYTHON" -m pip install \
     --index-url "$CPU_TORCH_INDEX_URL" \
     "torch==$CPU_TORCH_VERSION"
