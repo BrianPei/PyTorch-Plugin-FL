@@ -51,9 +51,10 @@ integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
 # Scope is limited to the paths measured on P800 in
-# docs/vendors/kunlun/installation.md: device discovery and AMP. Operator
-# main_ops, FlagGems runtime routes, profiler parity, model inference/training,
-# and the runtime smoke harness are not yet validated on this stack and are
+# docs/vendors/kunlun/installation.md: device discovery, basic operator
+# correctness on flagos:0, and AMP. Operator main_ops full sweep, FlagGems
+# runtime routes, profiler parity, model inference/training, and the runtime
+# smoke harness (flagos:1) are not yet validated on this stack and are
 # intentionally omitted (see PR body "Explicitly Not Included").
 integration_tests:
   - name: Check device availability
@@ -73,5 +74,12 @@ integration_tests:
       print(f"torch_fl lib: {package_lib}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
+  - name: Run basic operator suite
+    # Basic operator correctness on flagos:0 (creation, arithmetic, matmul,
+    # reduction, indexing, activations, grad, sync). Uses flagos:0 like the
+    # AMP suite -- the smoke harness abort was on flagos:1's first context init,
+    # not on tensor allocation in general. 57 tests; if a single op aborts or
+    # poisons the device context, the CI log pinpoints it for per-op deselect.
+    command: python -m pytest tests/integration/test_ops.py -v --tb=short
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
