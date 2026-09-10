@@ -50,11 +50,12 @@ wheel_artifact_name: wheel-kunlunxin
 integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
-# Scope mirrors the cuda/dcu five-part pattern (device + basic ops + general
-# factory + vendor main_ops + AMP), skipping FlagGems main_ops (4 broken routes),
-# profiler parity (CUPTI vendor defect), and inference/training (Qwen3 mount).
-# The runtime smoke harness (flagos:1) is omitted pending vendor XDNN fix --
-# see PR body "Explicitly Not Included".
+# Scope mirrors the cuda/dcu six-part pattern (device + basic ops + general
+# factory + AMP + runtime smoke + vendor main_ops), skipping FlagGems main_ops
+# (4 broken routes), profiler parity (CUPTI vendor defect), and
+# inference/training (Qwen3 mount). The runtime smoke harness (flagos:1) is
+# enabled via XPU_CUPTI_ENABLE_DEVICE=0..7 set by set_env_kunlun.sh, which
+# prevents the vendor XDNN fp64 min probe from aborting the process.
 integration_tests:
   - name: Check device availability
     command: |
@@ -84,6 +85,13 @@ integration_tests:
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
+  - name: Run runtime smoke
+    # Runtime smoke harness (tests/manual/kunlun_runtime_smoke.py) exercises
+    # device context init, H2D/D2H copy, boxed_mm, stream_create, and
+    # empty_cache on flagos:1. Requires XPU_CUPTI_ENABLE_DEVICE=0..7 (set by
+    # set_env_kunlun.sh) -- without it the vendor XDNN fp64 min probe aborts
+    # the process on the first device context init.
+    command: python tests/manual/kunlun_runtime_smoke.py
   - name: Run operator tests (vendor backend, main ops)
     # main_ops dispatch tests on flagos:0, vendor (cuda boxing) backend. RNG
     # dispatch is ignored -- pre-existing Kunlun RNG gap poisons the device

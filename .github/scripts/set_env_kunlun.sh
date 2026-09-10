@@ -77,6 +77,12 @@ export XCUDART_ROOT="${XCUDART_ROOT:-/usr/local/xcudart}"
 # XPU-RT 5.37.1 requires this to be set before the first import of torch or
 # torch_fl, otherwise import exits with "Runtime profiler is disabled".
 export XPU_ENABLE_PROFILER_TRACING="${XPU_ENABLE_PROFILER_TRACING:-1}"
+# Bind the XPU profiler to devices 0-7 before the first device context is
+# created. Without this, the vendor XDNN library runs an internal fp64 min
+# probe during the first device context init and hard-exits (exit(1)) at
+# min.cpp:41 -- un-catchable from Python. The comma list matches the 8 P800
+# devices; the runtime smoke harness and AMP both pass with this set.
+export XPU_CUPTI_ENABLE_DEVICE="${XPU_CUPTI_ENABLE_DEVICE:-0,1,2,3,4,5,6,7}"
 
 if [[ ! -f "$XPU_ROOT/include/cuda_runtime.h" ]]; then
   echo "::error::cuda_runtime.h not found at $XPU_ROOT/include"
@@ -134,7 +140,7 @@ PY
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
-    ACCELERATOR XPU_ROOT XCUDART_ROOT XPU_ENABLE_PROFILER_TRACING; do
+    ACCELERATOR XPU_ROOT XCUDART_ROOT XPU_ENABLE_PROFILER_TRACING XPU_CUPTI_ENABLE_DEVICE; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
