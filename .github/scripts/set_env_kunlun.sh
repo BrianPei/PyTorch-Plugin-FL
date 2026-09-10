@@ -58,6 +58,19 @@ echo "Vendor Python: $VENDOR_PYTHON"
 echo "Vendor PyTorch: $VENDOR_TORCH_VERSION"
 echo "Vendor torch CUDA runtime: $VENDOR_CUDA_VERSION"
 
+# The image ships a system cmake at /usr/bin/cmake but not the cmake pip
+# package. pyproject.toml lists cmake>=3.18 in [build-system] requires, and
+# python -m build --no-isolation checks those requires at the pip-package
+# level, so the system binary alone is not enough. Install only the cmake
+# wheel -- the image already has pip/setuptools/wheel/build -- so the
+# no-isolation build dependency check passes; setup.py still invokes the
+# system cmake on PATH.
+# NOTE: listing cmake in [build-system] requires is a cross-line smell -- it
+# forces every platform to pip-install cmake even when a system cmake exists.
+# Fixing it (dropping cmake from requires) touches all platforms and belongs
+# in a separate PR; this line mirrors set_env_cuda.sh's approach.
+python -m pip install cmake
+
 export ACCELERATOR=kunlun
 export XPU_ROOT="${XPU_ROOT:-/usr/local/xpu}"
 export XCUDART_ROOT="${XCUDART_ROOT:-/usr/local/xcudart}"
