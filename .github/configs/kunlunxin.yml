@@ -50,12 +50,11 @@ wheel_artifact_name: wheel-kunlunxin
 integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
-# Scope is limited to the paths measured on P800 in
-# docs/vendors/kunlun/installation.md: device discovery, basic operator
-# correctness on flagos:0, and AMP. Operator main_ops full sweep, FlagGems
-# runtime routes, profiler parity, model inference/training, and the runtime
-# smoke harness (flagos:1) are not yet validated on this stack and are
-# intentionally omitted (see PR body "Explicitly Not Included").
+# Scope mirrors the cuda/dcu five-part pattern (device + basic ops + general
+# factory + vendor main_ops + AMP), skipping FlagGems main_ops (4 broken routes),
+# profiler parity (CUPTI vendor defect), and inference/training (Qwen3 mount).
+# The runtime smoke harness (flagos:1) is omitted pending vendor XDNN fix --
+# see PR body "Explicitly Not Included".
 integration_tests:
   - name: Check device availability
     command: |
@@ -75,11 +74,20 @@ integration_tests:
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
   - name: Run basic operator suite
-    # Basic operator correctness on flagos:0 (creation, arithmetic, matmul,
-    # reduction, indexing, activations, grad, sync). Uses flagos:0 like the
-    # AMP suite -- the smoke harness abort was on flagos:1's first context init,
-    # not on tensor allocation in general. 57 tests; if a single op aborts or
-    # poisons the device context, the CI log pinpoints it for per-op deselect.
+    # 57 basic-op tests on flagos:0 (creation, arithmetic, matmul, reduction,
+    # indexing, activations, grad, sync). flagos:0 is the validated path -- the
+    # smoke harness abort was on flagos:1's first context init, not on tensor
+    # allocation in general.
     command: python -m pytest tests/integration/test_ops.py -v --tb=short
+  - name: Run general factory tests
+    # Factory/tensor tests (46), the "general tests" item every other line runs.
+    command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
+  - name: Run operator tests (vendor backend, main ops)
+    # main_ops dispatch tests on flagos:0, vendor (cuda boxing) backend. RNG
+    # dispatch is ignored -- pre-existing Kunlun RNG gap poisons the device
+    # context (see ci-vendor-kernel-poisons-device-context). Ordered last so a
+    # red op does not block the validated suites above; if mm/pow red or poison,
+    # the CI log pinpoints them for per-op deselect.
+    command: python -m pytest tests/integration/ops/ -m "main_ops and not flaggems_python and not flaggems_cpp" --ignore=tests/integration/ops/test_rng_dispatch.py -v -s --tb=short
