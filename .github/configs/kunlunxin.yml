@@ -51,10 +51,10 @@ integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
 # Scope is limited to the paths measured on P800 in
-# docs/vendors/kunlun/installation.md: device discovery, host/device copies,
-# streams, cache release, boxed mm, and AMP. Operator main_ops, FlagGems
-# runtime routes, profiler parity, and model inference/training are not yet
-# validated on this stack and are intentionally omitted.
+# docs/vendors/kunlun/installation.md: device discovery and AMP. Operator
+# main_ops, FlagGems runtime routes, profiler parity, model inference/training,
+# and the runtime smoke harness are not yet validated on this stack and are
+# intentionally omitted (see PR body "Explicitly Not Included").
 integration_tests:
   - name: Check device availability
     command: |
@@ -73,7 +73,5 @@ integration_tests:
       print(f"torch_fl lib: {package_lib}")
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
-  - name: Run runtime smoke
-    command: python tests/manual/kunlun_runtime_smoke.py
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
