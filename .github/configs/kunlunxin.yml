@@ -86,12 +86,27 @@ integration_tests:
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
   - name: Run runtime smoke
-    # Runtime smoke harness (tests/manual/kunlun_runtime_smoke.py) exercises
-    # device context init, H2D/D2H copy, boxed_mm, stream_create, and
-    # empty_cache on flagos:1. Requires XPU_CUPTI_ENABLE_DEVICE=0..7 (set by
-    # set_env_kunlun.sh) -- without it the vendor XDNN fp64 min probe aborts
-    # the process on the first device context init.
-    command: python tests/manual/kunlun_runtime_smoke.py
+    # The standalone smoke script has no conftest, so its first device op
+    # (torch.empty) hits the vendor XDNN fp64 min probe (min.cpp:41, exit(1)).
+    # pytest avoids this: conftest runs is_available()+init() and test_randn
+    # establishes the device context before any empty. This command mirrors
+    # that path in the SAME process (randn on device 0 and device 1, which the
+    # smoke uses) before invoking the smoke source via runpy, so the context is
+    # already initialized when the smoke's first empty runs. The smoke file
+    # itself is not modified.
+    command: |
+      python - <<'PY'
+      import torch, torch_fl
+      assert torch_fl.flagos.is_available(), "flagos device unavailable"
+      torch_fl.flagos.init()
+      print("init done", flush=True)
+      torch.randn(1024, 1024, device="flagos:0")
+      print("device0 randn done", flush=True)
+      torch.randn(1024, 1024, device="flagos:1")
+      print("device1 randn done", flush=True)
+      import runpy
+      runpy.run_path("tests/manual/kunlun_runtime_smoke.py", run_name="__main__")
+      PY
   - name: Run operator tests (vendor backend, main ops)
     # main_ops dispatch tests on flagos:0, vendor (cuda boxing) backend. RNG
     # dispatch is ignored -- pre-existing Kunlun RNG gap poisons the device
