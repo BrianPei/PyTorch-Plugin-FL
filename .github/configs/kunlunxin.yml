@@ -86,15 +86,17 @@ integration_tests:
   - name: Run AMP suite
     command: python -m pytest tests/integration/test_amp.py -v -s --tb=short
   - name: Run runtime smoke
-    # The standalone smoke script has no conftest, so its first device op
-    # (torch.empty) hits the vendor XDNN fp64 min probe (min.cpp:41, exit(1)).
-    # pytest avoids this: conftest runs is_available()+init() and test_randn
-    # establishes the device context before any empty. This command mirrors
-    # that path in the SAME process (randn on device 0 and device 1, which the
-    # smoke uses) before invoking the smoke source via runpy, so the context is
-    # already initialized when the smoke's first empty runs. The smoke file
-    # itself is not modified.
+    # The standalone smoke script's torch.empty hits the vendor XDNN fp64 min
+    # probe (min.cpp:41, exit(1)). CI isolated three requirements via controlled
+    # runs: env alone aborts, init alone aborts, env+init together pass. randn
+    # does NOT trigger the probe (only empty does), so the dispatch subprocesses
+    # (first op randn) do not need env. env is therefore exported LOCALLY here
+    # only -- it must NOT be global, because the same env on 8 devices makes
+    # cuptiActivityEnable fail with error 17 in every dispatch subprocess. This
+    # command: local export env + in-process is_available/init/randn warm-up
+    # (device 0 and 1) + runpy to run the smoke source unmodified.
     command: |
+      export XPU_CUPTI_ENABLE_DEVICE=0,1,2,3,4,5,6,7
       python - <<'PY'
       import torch, torch_fl
       assert torch_fl.flagos.is_available(), "flagos device unavailable"
