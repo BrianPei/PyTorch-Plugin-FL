@@ -170,10 +170,10 @@ at::Tensor ToCopyKernel(
 REGISTER_IMPL_TO_DISPATCHER(
     LocalScalarDenseFn,
     local_scalar_dense_dispatcher,
-    Backend::kFlagOs,
+    Backend::kFlagGemsCpp,
     LocalScalarDenseKernel);
 REGISTER_IMPL_TO_DISPATCHER(
-    ToCopyFn, to_copy_dispatcher, Backend::kFlagOs, ToCopyKernel);
+    ToCopyFn, to_copy_dispatcher, Backend::kFlagGemsCpp, ToCopyKernel);
 
 at::Tensor _copy_from(
     const at::Tensor& self,

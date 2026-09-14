@@ -224,11 +224,11 @@ export FLAGOS_USE_FLAGGEMS=1
 
 `GEMS_VENDOR=hygon` is set automatically on a DCU build, so you no longer need to export it manually. This matters beyond FlagGems: `GEMS_VENDOR` also selects the comm profile (see `torch_fl/comm/process_group.py`), and DCU is a CUDA-ABI vendor whose `ProcessGroupNCCL` is RCCL underneath.
 
-A DCU build records `ACCELERATOR=dcu` in `torch_fl/_build_config.py`, so `FLAGOS_USE_FLAGGEMS=1` alone selects `backends_dcu_flaggems.conf` — no need to re-export `ACCELERATOR` at runtime.
+A DCU build records `ACCELERATOR=dcu` in `torch_fl/_build_config.py`, so `FLAGOS_USE_FLAGGEMS=1` alone selects `backends_dcu.conf` — no need to re-export `ACCELERATOR` at runtime.
 
 ### FlagGems Configuration
 
-`backends_dcu_flaggems.conf` is `backends_flaggems.conf` with ops `hcu` Triton cannot compile or run routed back to the cuda boxing kernel:
+`backends_dcu.conf` is `backends_flaggems.conf` with ops `hcu` Triton cannot compile or run routed back to the cuda boxing kernel:
 
 - `silu_backward`: `tl.math.div_rn` has no `create_precise_divf` lowering
 - `slice_backward`: output is correct standalone, but feeding that grad to MIOpen's `convolution_backward` triggers a hardware VMFault
@@ -297,7 +297,7 @@ PyTorch's `register_privateuse1_backend` makes `at::getAccelerator()` return `Pr
 
 **Cause:** `hcu` Triton backend limitation or MIOpen interaction bug.
 
-**Expected behavior.** `backends_dcu_flaggems.conf` already routes these ops to the cuda boxing kernel. If you see crashes, verify `FLAGOS_USE_FLAGGEMS=1` is set and the config is being selected.
+**Expected behavior.** `backends_dcu.conf` already routes these ops to the cuda boxing kernel. If you see crashes, verify `FLAGOS_USE_FLAGGEMS=1` is set and the config is being selected.
 
 ### Multi-card: GPU VMFault or device-side hang
 

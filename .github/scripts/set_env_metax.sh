@@ -39,7 +39,7 @@ export FLAGOS_METAX_CUDART_SHIM=1
 export FLAGOS_DISABLE_CUDA_ASSETS=1
 export FLAGOS_USE_FLAGGEMS=0
 export FLAGGEMS_KERNEL=0
-export FLAGGEMS_PYTHON=0
+export FLAGGEMS_PYTHON=1
 export FLAGOS_WHEEL_LOCAL=metax3.8.0
 export FLAGOS_MACA_TORCH_LIB=/opt/vendor-libtorch/lib
 
@@ -84,49 +84,124 @@ print(f"Build PyTorch: {torch.__version__}")
 print(f"Build torch path: {torch_path}")
 PY
 
-# Expose the vendor Triton (triton-metax) to the CPU torch venv. torch.compile
-# needs it: the active torch is the CPU wheel, which ships no Triton, so
-# inductor raises TritonMissing without this. The vendor package lives in the
-# image's MetaX torch install, which we otherwise deliberately do not use --
-# only libtorch is consumed, from /opt/vendor-libtorch.
+# Expose the vendor Triton (triton-metax) and FlagGems to the CPU torch venv.
+# torch.compile needs Triton: the active torch is the CPU wheel, which ships no
+# Triton, so inductor raises TritonMissing without this. FlagGems is required
+# because backends_metax.conf routes 451 ops to the Python FlagGems path by
+# default (FLAGGEMS_PYTHON=1 above compiles the dispatcher slot).
+#
+# The vendor packages live in the image's MetaX torch install, which we
+# otherwise deliberately do not use -- only libtorch is consumed, from
+# /opt/vendor-libtorch.
 #
 # Linked rather than copied: the metax backend carries ~2.4GB of device
 # libraries and a cp -a of that is pure CI wall time. set_env_cuda.sh copies
-# because it also relocates FlagGems/FlagCX; here only Triton is needed.
+# because it also relocates FlagCX; here only Triton and FlagGems are needed.
 if [[ "$CI_STAGE" == "integration" ]]; then
   VENV_SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-  VENDOR_TRITON=""
+
+  # Install FlagGems' runtime dependencies into the venv. flag_gems imports
+  # packaging, yaml (PyYAML), sqlalchemy and numpy at or shortly after import.
+  # Use --no-deps to protect the torch ABI (same rationale as test-dependencies).
+  # numpy<2 because numpy 2.x breaks the stock +cpu torch C extensions at import
+  # (documented in set_env_musa.sh:176-178).
+  python -m pip install --no-deps 'packaging>=20.0' 'PyYAML>=5.0' 'sqlalchemy>=1.4' 'numpy>=1.20,<2.0'
+
+  VENDOR_SITE=""
   for candidate in /opt/conda/lib/python3.*/site-packages \
                    /opt/vendor-torch/lib/python3.*/site-packages \
                    /usr/lib/python3.*/site-packages \
                    /usr/local/lib/python3.*/site-packages; do
     if [[ -d "$candidate/triton" ]]; then
-      VENDOR_TRITON="$candidate/triton"
+      VENDOR_SITE="$candidate"
       break
     fi
   done
 
-  if [[ -z "$VENDOR_TRITON" ]]; then
+  if [[ -z "$VENDOR_SITE" ]]; then
     echo "::error::Vendor Triton (triton-metax) was not found in the image;" \
          "torch.compile tests cannot run. Searched /opt/conda, /opt/vendor-torch," \
          "/usr and /usr/local site-packages."
     exit 1
   fi
 
+  # Link triton
   if [[ ! -e "$VENV_SITE/triton" ]]; then
-    ln -s "$VENDOR_TRITON" "$VENV_SITE/triton"
+    ln -s "$VENDOR_SITE/triton" "$VENV_SITE/triton"
   fi
-  for metadata in "$(dirname "$VENDOR_TRITON")"/triton-*.dist-info; do
+  for metadata in "$VENDOR_SITE"/triton-*.dist-info; do
     [[ -e "$metadata" ]] || continue
     [[ -e "$VENV_SITE/$(basename "$metadata")" ]] || ln -s "$metadata" "$VENV_SITE/"
   done
 
-  # Confirm the vendor Triton actually imports against the CPU torch wheel,
-  # rather than discovering it at test time.
+  # Discover flag_gems via interpreter query, not directory probe. FlagGems is
+  # normally an editable install, so there is no site-packages/flag_gems directory
+  # to test -- only a .pth file and a finder module pointing at a source tree.
+  VENDOR_FLAGGEMS_ROOT=""
+  for candidate_python in /opt/conda/bin/python3 /opt/conda/bin/python \
+                          /opt/vendor-torch/bin/python3 /opt/vendor-torch/bin/python \
+                          /usr/bin/python3 /usr/local/bin/python3; do
+    [[ -x "$candidate_python" ]] || continue
+    VENDOR_FLAGGEMS_ROOT="$("$candidate_python" - <<'PY'
+import importlib.util
+from pathlib import Path
+spec = importlib.util.find_spec("flag_gems")
+if spec is None or not spec.submodule_search_locations:
+    print("")
+else:
+    root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    print(root if (root / "__init__.py").is_file() else "")
+PY
+)"
+    [[ -n "$VENDOR_FLAGGEMS_ROOT" ]] && break
+  done
+
+  if [[ -z "$VENDOR_FLAGGEMS_ROOT" ]]; then
+    echo "FlagGems not found in vendor interpreters. Installing from source..."
+    # FlagGems is not available on PyPI. Install from GitHub.
+    # Use a pinned ref for reproducibility (matching the baseline from docs/reference/operator-support.md).
+    python -m pip install --no-deps git+https://github.com/FlagOpen/FlagGems.git@7fb49bad
+
+    # After installation, resolve the package location in the venv itself
+    VENDOR_FLAGGEMS_ROOT="$(python - <<'PY'
+import importlib.util
+from pathlib import Path
+spec = importlib.util.find_spec("flag_gems")
+if spec is None or not spec.submodule_search_locations:
+    print("")
+else:
+    root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    print(root if (root / "__init__.py").is_file() else "")
+PY
+)"
+
+    if [[ -z "$VENDOR_FLAGGEMS_ROOT" ]]; then
+      echo "::error::Failed to install FlagGems from source. The MetaX backend" \
+           "requires FlagGems because backends_metax.conf routes 451 ops to the" \
+           "Python FlagGems path."
+      exit 1
+    fi
+  fi
+
+  # Link the resolved flag_gems root (if from vendor) or use directly (if pip installed)
+  if [[ ! -e "$VENV_SITE/flag_gems" && "$VENDOR_FLAGGEMS_ROOT" != "$VENV_SITE"* ]]; then
+    ln -s "$VENDOR_FLAGGEMS_ROOT" "$VENV_SITE/flag_gems"
+  fi
+  # Link dist-info metadata if it exists alongside the package (for non-editable installs)
+  VENDOR_FLAGGEMS_PARENT="$(dirname "$VENDOR_FLAGGEMS_ROOT")"
+  for metadata in "$VENDOR_FLAGGEMS_PARENT"/flag_gems-*.dist-info; do
+    [[ -e "$metadata" ]] || continue
+    [[ -e "$VENV_SITE/$(basename "$metadata")" ]] || ln -s "$metadata" "$VENV_SITE/"
+  done
+
+  # Confirm the vendor packages actually import against the CPU torch wheel,
+  # rather than discovering failures at test time.
   python - <<'PY'
 import triton
+import flag_gems
 
 print(f"Vendor Triton: {triton.__version__} ({triton.__file__})")
+print(f"FlagGems: {flag_gems.__version__} ({flag_gems.__file__})")
 PY
 fi
 

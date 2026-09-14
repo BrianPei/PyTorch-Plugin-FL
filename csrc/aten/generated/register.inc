@@ -1825,7 +1825,7 @@ at::Tensor & WrapperAddcmulInplace(at::Tensor & self, const at::Tensor & tensor1
 }
 at::Tensor WrapperAddmm(const at::Tensor & self, const at::Tensor & mat1, const at::Tensor & mat2, const at::Scalar & beta, const at::Scalar & alpha) {
 #if defined(FLAGOS_SOFT_LOWP)
-  if (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type())) {
+  if (!at::native::flagos::soft_lowp::IsDispatchSuppressed() && (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type()))) {
     return at::native::flagos::soft_lowp::Addmm(self, mat1, mat2, beta, alpha);
   }
 #endif
@@ -1833,7 +1833,7 @@ at::Tensor WrapperAddmm(const at::Tensor & self, const at::Tensor & mat1, const 
 }
 at::Tensor WrapperAddmmDtype(const at::Tensor & self, const at::Tensor & mat1, const at::Tensor & mat2, at::ScalarType out_dtype, const at::Scalar & beta, const at::Scalar & alpha) {
 #if defined(FLAGOS_SOFT_LOWP)
-  if (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type())) {
+  if (!at::native::flagos::soft_lowp::IsDispatchSuppressed() && (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type()))) {
     return at::native::flagos::soft_lowp::AddmmDtype(self, mat1, mat2, out_dtype, beta, alpha);
   }
 #endif
@@ -1841,7 +1841,7 @@ at::Tensor WrapperAddmmDtype(const at::Tensor & self, const at::Tensor & mat1, c
 }
 at::Tensor & WrapperAddmmDtypeOut(const at::Tensor & self, const at::Tensor & mat1, const at::Tensor & mat2, at::ScalarType out_dtype, const at::Scalar & beta, const at::Scalar & alpha, at::Tensor & out) {
 #if defined(FLAGOS_SOFT_LOWP)
-  if (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type())) {
+  if (!at::native::flagos::soft_lowp::IsDispatchSuppressed() && (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type()))) {
     return at::native::flagos::soft_lowp::AddmmDtypeOut(self, mat1, mat2, out_dtype, beta, alpha, out);
   }
 #endif
@@ -1849,7 +1849,7 @@ at::Tensor & WrapperAddmmDtypeOut(const at::Tensor & self, const at::Tensor & ma
 }
 at::Tensor & WrapperAddmmOut(const at::Tensor & self, const at::Tensor & mat1, const at::Tensor & mat2, const at::Scalar & beta, const at::Scalar & alpha, at::Tensor & out) {
 #if defined(FLAGOS_SOFT_LOWP)
-  if (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type())) {
+  if (!at::native::flagos::soft_lowp::IsDispatchSuppressed() && (at::native::flagos::soft_lowp::IsLowPrecision(self.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat1.scalar_type()) || at::native::flagos::soft_lowp::IsLowPrecision(mat2.scalar_type()))) {
     return at::native::flagos::soft_lowp::AddmmOut(self, mat1, mat2, beta, alpha, out);
   }
 #endif

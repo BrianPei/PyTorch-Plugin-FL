@@ -16,7 +16,7 @@
 FlagGems routing consistency (full coverage)
 
 Every op that ``backends_flaggems.conf`` routes to ``flagos_python`` must have a
-real ``Backend::kFlagOsPython`` kernel generated in the C++ layer. Generated
+real ``Backend::kFlagGems`` kernel generated in the C++ layer. Generated
 kernels intentionally retained for explicit per-op overrides are also allowed
 when the code generator lists them in ``flaggems_recursive_fallback``. This
 guards the whole FlagGems Python surface against drift between the runtime
@@ -32,7 +32,7 @@ The op-name -> kernel bridge is:
       -> register.inc  ``m.impl("op", WrapperFoo);``
       -> WrapperFoo body ``... foo_dispatcher(...)``
       -> flaggems_python_kernels.cc
-         ``REGISTER_IMPL_TO_DISPATCHER(_, foo_dispatcher, Backend::kFlagOsPython, _)``
+         ``REGISTER_IMPL_TO_DISPATCHER(_, foo_dispatcher, Backend::kFlagGems, _)``
 
 so we compare the set of ``*_dispatcher`` names on each side.
 
@@ -154,11 +154,11 @@ def _wrapper_to_dispatcher() -> dict[str, str]:
 
 
 def _cc_flagos_python_dispatchers() -> set[str]:
-    """Dispatcher names registered with Backend::kFlagOsPython in the kernels cc."""
+    """Dispatcher names registered with Backend::kFlagGems in the kernels cc."""
     return set(
         re.findall(
             r"REGISTER_IMPL_TO_DISPATCHER\(\s*\w+\s*,\s*(\w+)\s*,"
-            r"\s*Backend::kFlagOsPython",
+            r"\s*Backend::kFlagGems",
             _read(_KERNELS_CC),
         )
     )
@@ -194,7 +194,7 @@ def _override_only_dispatchers() -> tuple[set[str], list[str]]:
 
 
 class TestFlagGemsConfConsistency:
-    """backends_flaggems.conf <-> generated kFlagOsPython kernels must agree."""
+    """backends_flaggems.conf <-> generated kFlagGems kernels must agree."""
 
     @pytest.mark.anyplatform
     def test_conf_has_flagos_python_ops(self):
@@ -215,13 +215,13 @@ class TestFlagGemsConfConsistency:
 
     @pytest.mark.anyplatform
     def test_conf_ops_have_flagos_python_kernels(self):
-        """Each flagos_python op must have a real kFlagOsPython C++ kernel."""
+        """Each flagos_python op must have a real kFlagGems C++ kernel."""
         conf_disp, _ = _conf_dispatchers()
         cc_disp = _cc_flagos_python_dispatchers()
         missing = sorted(conf_disp - cc_disp)
         assert not missing, (
             "these ops are routed to flagos_python in "
-            f"{_CONF.name} but have NO kFlagOsPython kernel in "
+            f"{_CONF.name} but have NO kFlagGems kernel in "
             f"{_KERNELS_CC.name} (conf/codegen drift): {missing}"
         )
 
@@ -244,7 +244,7 @@ class TestFlagGemsConfConsistency:
         cc_disp = _cc_flagos_python_dispatchers()
         orphans = sorted(cc_disp - conf_disp - override_disp)
         assert not orphans, (
-            f"these kFlagOsPython kernels in {_KERNELS_CC.name} are not routed "
+            f"these kFlagGems kernels in {_KERNELS_CC.name} are not routed "
             f"by {_CONF.name} and are not listed as override-only kernels: {orphans}"
         )
 

@@ -9,6 +9,23 @@
 
 namespace at::native::flagos::soft_lowp {
 
+// Suppress the low-precision wrapper while a decoded operation invokes its
+// original ATen composite. This preserves the single fused addmm operation
+// without recursively re-entering the software low-precision implementation.
+bool IsDispatchSuppressed();
+
+class DispatchSuppressionGuard {
+ public:
+  DispatchSuppressionGuard();
+  ~DispatchSuppressionGuard();
+
+  DispatchSuppressionGuard(const DispatchSuppressionGuard&) = delete;
+  DispatchSuppressionGuard& operator=(const DispatchSuppressionGuard&) = delete;
+
+ private:
+  bool previous_;
+};
+
 at::Tensor Mm(const at::Tensor& self, const at::Tensor& mat2);
 at::Tensor MmDtype(
     const at::Tensor& self,

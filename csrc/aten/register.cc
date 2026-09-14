@@ -374,31 +374,6 @@ static std::tuple<at::Tensor, at::Tensor> WrapperMatmulBackward(
 }
 #endif
 
-#if defined(USE_MUSA) && defined(FLAGOS_FLAGGEMS_PYTHON)
-bool MusaFlagGemsEnabled() {
-  const char* value = std::getenv("FLAGOS_USE_FLAGGEMS");
-  if (value != nullptr) {
-    std::string normalized(value);
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (normalized != "" && normalized != "0" && normalized != "off" &&
-        normalized != "false") {
-      return true;
-    }
-  }
-
-  // FLAGOS_BACKEND_CONFIG is an advanced override that wins over the convenience
-  // switch in Python. Register the narrow hybrid schema set when that config is
-  // selected explicitly too, otherwise its flagos_python routes have no kernel.
-  const char* config = std::getenv("FLAGOS_BACKEND_CONFIG");
-  if (config == nullptr) return false;
-  std::string path(config);
-  auto slash = path.find_last_of("/\\");
-  auto filename = slash == std::string::npos ? path : path.substr(slash + 1);
-  return filename == "backends_musa_flagos_py.conf";
-}
-#endif
-
 bool HasCompatibleShallowCopyType(
     const at::Tensor& self, const at::Tensor& from) {
   const auto self_keys = self.key_set();
@@ -462,7 +437,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // without a kernel behind it turns into the dispatcher's "backend not
   // registered" error, whereas leaving it unregistered reaches the cpu_fallback
   // below. FlagGems Python kernels are compiled alongside GCU, but only wrappers
-  // in this coverage set may select their kFlagOsPython dispatcher slot.
+  // in this coverage set may select their kFlagGems dispatcher slot.
   //
   // MUSA is the same story: musa_register.inc lists exactly the ops with a mudnn
   // kernel behind them, and no CUDA boxing kernels are compiled in
@@ -470,18 +445,29 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // be claimed. The two convolution `*_overrideable` ops are the exception that
   // proves the rule -- ATen's default for them raises instead of being boxable,
   // so they get real kernels in backends/musa/mudnn_conv.cc.
+  //
+  // Ascend joined them: it used to fall through to the full register.inc below,
+  // claiming every generated op while owning aclnn kernels for a few hundred.
+  // That made `none` in backends_ascend.conf unreachable as a fallback -- the op
+  // was registered, so the call reached the dispatcher and raised on the empty
+  // slot instead of boxing to CPU. ascend_register.inc lists exactly the aclnn
+  // coverage set, generated and handwritten.
   #if defined(USE_GCU)
     #if defined(FLAGOS_GCU_KERNEL)
     #include "backends/gcu/generated/gcu_register.inc"
     #endif
+  #elif defined(USE_ASCEND)
+    #include "backends/ascend/generated/ascend_register.inc"
   #elif defined(USE_MUSA)
     #if defined(FLAGOS_MUSA_KERNEL)
     #include "backends/musa/generated/musa_register.inc"
     #endif
+    // Registered unconditionally: backends_musa.conf routes ops to FlagGems by
+    // default, so these kFlagGems dispatcher slots must exist or those
+    // routes raise "backend not registered". Gating them on an opt-in env var
+    // was correct only while the default conf was mudnn-only.
     #if defined(FLAGOS_FLAGGEMS_PYTHON)
-    if (MusaFlagGemsEnabled()) {
     #include "backends/musa/generated/musa_flaggems_register.inc"
-    }
     #endif
   #elif defined(USE_BPU)
     // BPU registers no compute ops. The BPU's unit of execution is a whole

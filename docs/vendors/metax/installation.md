@@ -276,7 +276,7 @@ export FLAGOS_METAX_BOXING=1
 export FLAGOS_USE_FLAGGEMS=1  # Opt into FlagGems; unset = pure boxing
 ```
 
-`import torch_fl` then auto-selects `backends_metax_flaggems.conf`, which routes most ops to FlagGems' Triton kernels and falls back to the CUDA boxing kernel for ops `triton-metax` cannot compile (`mm`/`bmm`/`mean.dim` — FlagGems uses a SPLIT_K kwarg or CUDA-context path `triton-metax` rejects).
+`import torch_fl` then auto-selects `backends_metax.conf`, which routes most ops to FlagGems' Triton kernels and falls back to the CUDA boxing kernel for ops `triton-metax` cannot compile (`mm`/`bmm`/`mean.dim` — FlagGems uses a SPLIT_K kwarg or CUDA-context path `triton-metax` rejects).
 
 ### FlagGems Verification
 

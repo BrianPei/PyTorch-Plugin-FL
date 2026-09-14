@@ -56,7 +56,7 @@ integration_wheel_source: local-build
 # The common workflow only executes this platform-provided test manifest.
 # DCU is a boxing build (DTK torch is hipified, HIP kernels live under the CUDA
 # dispatch key), so the vendor backend path and the FlagGems runtime path
-# (backends_dcu_flaggems.conf, DTK triton hcu + cuda boxing fallback) mirror
+# (backends_dcu.conf, DTK triton hcu + cuda boxing fallback) mirror
 # CUDA's manifest. Inference/training are deferred until the runner has a model
 # mount and the first CI run confirms the card count.
 integration_tests:

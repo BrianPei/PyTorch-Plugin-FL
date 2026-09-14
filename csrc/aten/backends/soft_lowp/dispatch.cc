@@ -113,32 +113,32 @@ at::Tensor& AddmmInplaceKernel(
 
 } // namespace
 
-REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kFlagOs, MmKernel)
-REGISTER_IMPL_TO_DISPATCHER(MmDtypeFn, mm_dtype_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kFlagGemsCpp, MmKernel)
+REGISTER_IMPL_TO_DISPATCHER(MmDtypeFn, mm_dtype_dispatcher, Backend::kFlagGemsCpp,
                             MmDtypeKernel)
 REGISTER_IMPL_TO_DISPATCHER(
-    MmDtypeOutFn, mm_dtype_out_dispatcher, Backend::kFlagOs, MmDtypeOutKernel)
-REGISTER_IMPL_TO_DISPATCHER(MmOutFn, mm_out_dispatcher, Backend::kFlagOs, MmOutKernel)
+    MmDtypeOutFn, mm_dtype_out_dispatcher, Backend::kFlagGemsCpp, MmDtypeOutKernel)
+REGISTER_IMPL_TO_DISPATCHER(MmOutFn, mm_out_dispatcher, Backend::kFlagGemsCpp, MmOutKernel)
 
-REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kFlagOs, BmmKernel)
-REGISTER_IMPL_TO_DISPATCHER(BmmDtypeFn, bmm_dtype_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kFlagGemsCpp, BmmKernel)
+REGISTER_IMPL_TO_DISPATCHER(BmmDtypeFn, bmm_dtype_dispatcher, Backend::kFlagGemsCpp,
                             BmmDtypeKernel)
 REGISTER_IMPL_TO_DISPATCHER(
-    BmmDtypeOutFn, bmm_dtype_out_dispatcher, Backend::kFlagOs, BmmDtypeOutKernel)
-REGISTER_IMPL_TO_DISPATCHER(BmmOutFn, bmm_out_dispatcher, Backend::kFlagOs, BmmOutKernel)
+    BmmDtypeOutFn, bmm_dtype_out_dispatcher, Backend::kFlagGemsCpp, BmmDtypeOutKernel)
+REGISTER_IMPL_TO_DISPATCHER(BmmOutFn, bmm_out_dispatcher, Backend::kFlagGemsCpp, BmmOutKernel)
 
 REGISTER_IMPL_TO_DISPATCHER(
-    AddmmFn, addmm_dispatcher, Backend::kFlagOs, AddmmKernel)
+    AddmmFn, addmm_dispatcher, Backend::kFlagGemsCpp, AddmmKernel)
 REGISTER_IMPL_TO_DISPATCHER(
-    AddmmDtypeFn, addmm_dtype_dispatcher, Backend::kFlagOs, AddmmDtypeKernel)
+    AddmmDtypeFn, addmm_dtype_dispatcher, Backend::kFlagGemsCpp, AddmmDtypeKernel)
 REGISTER_IMPL_TO_DISPATCHER(
     AddmmDtypeOutFn,
     addmm_dtype_out_dispatcher,
-    Backend::kFlagOs,
+    Backend::kFlagGemsCpp,
     AddmmDtypeOutKernel)
 REGISTER_IMPL_TO_DISPATCHER(
-    AddmmOutFn, addmm_out_dispatcher, Backend::kFlagOs, AddmmOutKernel)
+    AddmmOutFn, addmm_out_dispatcher, Backend::kFlagGemsCpp, AddmmOutKernel)
 REGISTER_IMPL_TO_DISPATCHER(
-    AddmmInplaceFn, addmm_inplace_dispatcher, Backend::kFlagOs, AddmmInplaceKernel)
+    AddmmInplaceFn, addmm_inplace_dispatcher, Backend::kFlagGemsCpp, AddmmInplaceKernel)
 
 } // namespace at::native::flagos::soft_lowp

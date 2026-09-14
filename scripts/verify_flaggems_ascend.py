@@ -55,7 +55,7 @@ def candidates():
     gen = REPO / "csrc/aten/generated/flaggems_python_kernels.cc"
     for line in gen.read_text().splitlines():
         m = re.search(
-            r"REGISTER_IMPL_TO_DISPATCHER\(\w+,\s*(\w+),\s*Backend::kFlagOsPython", line
+            r"REGISTER_IMPL_TO_DISPATCHER\(\w+,\s*(\w+),\s*Backend::kFlagGems", line
         )
         if m and m.group(1) in disp_to_op:
             have_kernel.add(disp_to_op[m.group(1)])
@@ -94,7 +94,7 @@ def qualname_map():
             kern_to_qn.setdefault(cur, m2.group(1))
     out = {}
     for disp, kern in re.findall(
-        r"REGISTER_IMPL_TO_DISPATCHER\(\w+,\s*(\w+),\s*Backend::kFlagOsPython,\s*(\w+)\)",
+        r"REGISTER_IMPL_TO_DISPATCHER\(\w+,\s*(\w+),\s*Backend::kFlagGems,\s*(\w+)\)",
         gen,
     ):
         if disp in disp_to_op and kern in kern_to_qn:

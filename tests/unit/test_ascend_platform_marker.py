@@ -23,12 +23,16 @@ the CUDA config if /dev enumeration fails for any reason (permissions, a
 sandboxed container, etc). See issue #192.
 
 These tests exercise torch_fl._select_backend_config() directly against a
-fake install tree (no real ACL device needed), and pin the exact regression
-this fix must not reintroduce: the marker branch runs *before* the
-/dev/davinci* branch, so it must special-case the Ascend FlagGems opt-in
-(FLAGOS_USE_FLAGGEMS=1 -> backends_ascend_flagos_py.conf) itself, the same way
-it already does for MUSA. Without that, installing the marker would silently
-shadow the FlagGems opt-in on real Ascend hardware.
+fake install tree (no real ACL device needed), and pin the regression this fix
+must not reintroduce: the marker branch runs *before* the /dev/davinci* branch,
+so whatever conf the /dev probe would have chosen, the marker must choose too.
+
+The per-platform FlagGems opt-in the marker originally had to replicate
+(FLAGOS_USE_FLAGGEMS=1 -> backends_ascend_flagos_py.conf) is gone: the generated
+backends_ascend.conf is now itself FlagGems-first, stating flaggems /
+flaggems_cpp / ascend / none per op, so there is one conf per platform and
+nothing left to opt into. The shadowing hazard remains worth pinning because the
+branch order that caused it is unchanged.
 """
 
 import os
@@ -47,7 +51,6 @@ def fake_ascend_install(tmp_path, monkeypatch):
     conf_dir.mkdir()
     (lib_dir / "flagos_platform").write_text("ascend\n")
     (conf_dir / "backends_ascend.conf").write_text("")
-    (conf_dir / "backends_ascend_flagos_py.conf").write_text("")
 
     monkeypatch.setattr(torch_fl, "__file__", str(tmp_path / "__init__.py"))
     monkeypatch.delenv("FLAGOS_BACKEND_CONFIG", raising=False)
@@ -64,22 +67,23 @@ def test_ascend_marker_selects_native_conf_by_default(fake_ascend_install):
     assert os.environ["FLAGOS_BACKEND_CONFIG"] == str(conf_dir / "backends_ascend.conf")
 
 
-def test_ascend_marker_honors_flaggems_opt_in(monkeypatch, fake_ascend_install):
-    """Regression guard: the marker branch must not shadow the Ascend FlagGems
-    conf that the /dev/davinci* branch would otherwise pick."""
-    conf_dir = fake_ascend_install
-    monkeypatch.setenv("FLAGOS_USE_FLAGGEMS", "1")
-    torch_fl._select_backend_config()
-    assert os.environ["FLAGOS_BACKEND_CONFIG"] == str(
-        conf_dir / "backends_ascend_flagos_py.conf"
-    )
-
-
-def test_ascend_marker_falls_back_to_native_conf_if_flaggems_conf_missing(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("env", ["FLAGOS_USE_FLAGGEMS", "FLAGOS_USE_VENDOR_OPS"])
+def test_ascend_marker_ignores_retired_opt_in_vars(
+    monkeypatch, fake_ascend_install, env
 ):
-    """If a wheel ships the marker but not the flagos_py conf (old install
-    layout), the native conf must still be usable rather than raising."""
+    """The old per-platform opt-in vars are retained as no-ops for backward
+    compat. Setting one must not divert the selection to a second conf, since
+    backends_ascend.conf is now the only Ascend conf and already states the
+    FlagGems-first routing those vars used to switch between."""
+    conf_dir = fake_ascend_install
+    monkeypatch.setenv(env, "1")
+    torch_fl._select_backend_config()
+    assert os.environ["FLAGOS_BACKEND_CONFIG"] == str(conf_dir / "backends_ascend.conf")
+
+
+def test_ascend_marker_selects_conf_that_is_the_only_one_shipped(monkeypatch, tmp_path):
+    """The install tree carries exactly one conf per platform; the marker must
+    resolve against it without depending on a second hybrid file existing."""
     lib_dir = tmp_path / "lib"
     conf_dir = tmp_path / "configs"
     lib_dir.mkdir()
@@ -89,7 +93,6 @@ def test_ascend_marker_falls_back_to_native_conf_if_flaggems_conf_missing(
 
     monkeypatch.setattr(torch_fl, "__file__", str(tmp_path / "__init__.py"))
     monkeypatch.delenv("FLAGOS_BACKEND_CONFIG", raising=False)
-    monkeypatch.setenv("FLAGOS_USE_FLAGGEMS", "1")
 
     torch_fl._select_backend_config()
     assert os.environ["FLAGOS_BACKEND_CONFIG"] == str(conf_dir / "backends_ascend.conf")

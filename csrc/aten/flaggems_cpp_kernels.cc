@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// FlagGems C++ dispatch kernels (kFlagOs).
+// FlagGems C++ dispatch kernels (kFlagGemsCpp).
 //
 // Thin wrappers that box PrivateUse1 (flagos) tensors to CUDA device-type
 // metadata (zero-copy, via DeviceBoxingGuard), call the corresponding
@@ -21,7 +21,7 @@
 // to flagos.
 //
 // This file is compiled only when FLAGGEMS_KERNEL=ON (csrc/CMakeLists.txt
-// defines FLAGOS_FLAGGEMS_CPP). kFlagOs is registered here; kFlagOsPython is
+// defines FLAGOS_FLAGGEMS_CPP). kFlagGemsCpp is registered here; kFlagGems is
 // registered by generated/flaggems_python_kernels.cc. Activating this path
 // requires building torch_fl against FlagGems' liboperators.so and setting
 // FLAGOS_USE_FLAGGEMS_CPP=1 at runtime (loads backends_flaggems_cpp.conf).
@@ -42,7 +42,7 @@ at::Tensor MmKernelCpp(const at::Tensor& mat1, const at::Tensor& mat2) {
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kFlagGemsCpp,
                             MmKernelCpp);
 
 // ---- bmm -------------------------------------------------------
@@ -53,7 +53,7 @@ at::Tensor BmmKernelCpp(const at::Tensor& self, const at::Tensor& mat2) {
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kFlagGemsCpp,
                             BmmKernelCpp);
 
 // ---- bmm.out ---------------------------------------------------
@@ -66,7 +66,7 @@ at::Tensor& BmmOutKernelCpp(
   out.copy_(result);
   return out;
 }
-REGISTER_IMPL_TO_DISPATCHER(BmmOutFn, bmm_out_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(BmmOutFn, bmm_out_dispatcher, Backend::kFlagGemsCpp,
                             BmmOutKernelCpp);
 
 // ---- addmm -----------------------------------------------------
@@ -84,7 +84,7 @@ at::Tensor AddmmKernelCpp(
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(AddmmFn, addmm_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(AddmmFn, addmm_dispatcher, Backend::kFlagGemsCpp,
                             AddmmKernelCpp);
 
 // ---- addmm.out -------------------------------------------------
@@ -103,7 +103,7 @@ at::Tensor& AddmmOutKernelCpp(
   return out;
 }
 REGISTER_IMPL_TO_DISPATCHER(AddmmOutFn, addmm_out_dispatcher,
-                            Backend::kFlagOs, AddmmOutKernelCpp);
+                            Backend::kFlagGemsCpp, AddmmOutKernelCpp);
 
 // ---- embedding -------------------------------------------------
 // EmbeddingFn = at::Tensor (*)(const at::Tensor&, const at::Tensor&,
@@ -122,7 +122,7 @@ at::Tensor EmbeddingKernelCpp(
   return result;
 }
 REGISTER_IMPL_TO_DISPATCHER(EmbeddingFn, embedding_dispatcher,
-                            Backend::kFlagOs, EmbeddingKernelCpp);
+                            Backend::kFlagGemsCpp, EmbeddingKernelCpp);
 
 // ---- _softmax --------------------------------------------------
 // PrivSoftmaxFn = at::Tensor (*)(const at::Tensor&, int64_t, bool)
@@ -134,7 +134,7 @@ at::Tensor PrivSoftmaxKernelCpp(
   return result;
 }
 REGISTER_IMPL_TO_DISPATCHER(PrivSoftmaxFn, priv_softmax_dispatcher,
-                            Backend::kFlagOs, PrivSoftmaxKernelCpp);
+                            Backend::kFlagGemsCpp, PrivSoftmaxKernelCpp);
 
 // ---- _softmax_backward_data ------------------------------------
 // PrivSoftmaxBackwardDataFn = at::Tensor (*)(const at::Tensor&,
@@ -152,7 +152,7 @@ at::Tensor PrivSoftmaxBackwardDataKernelCpp(
 }
 REGISTER_IMPL_TO_DISPATCHER(PrivSoftmaxBackwardDataFn,
                             priv_softmax_backward_data_dispatcher,
-                            Backend::kFlagOs,
+                            Backend::kFlagGemsCpp,
                             PrivSoftmaxBackwardDataKernelCpp);
 
 // ---- sum -------------------------------------------------------
@@ -164,7 +164,7 @@ at::Tensor SumKernelCpp(
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(SumFn, sum_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(SumFn, sum_dispatcher, Backend::kFlagGemsCpp,
                             SumKernelCpp);
 
 // ---- sum.dim_IntList -------------------------------------------
@@ -181,7 +181,7 @@ at::Tensor SumDimIntlistKernelCpp(
   return result;
 }
 REGISTER_IMPL_TO_DISPATCHER(SumDimIntlistFn, sum_dim_intlist_dispatcher,
-                            Backend::kFlagOs, SumDimIntlistKernelCpp);
+                            Backend::kFlagGemsCpp, SumDimIntlistKernelCpp);
 
 // ---- max -------------------------------------------------------
 // MaxFn = at::Tensor (*)(const at::Tensor&)
@@ -191,7 +191,7 @@ at::Tensor MaxKernelCpp(const at::Tensor& self) {
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(MaxFn, max_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(MaxFn, max_dispatcher, Backend::kFlagGemsCpp,
                             MaxKernelCpp);
 
 // ---- max.dim ---------------------------------------------------
@@ -205,7 +205,7 @@ REGISTER_IMPL_TO_DISPATCHER(MaxFn, max_dispatcher, Backend::kFlagOs,
   UnboxToFlagos(indices);
   return {values, indices};
 }
-REGISTER_IMPL_TO_DISPATCHER(MaxDimFn, max_dim_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(MaxDimFn, max_dim_dispatcher, Backend::kFlagGemsCpp,
                             MaxDimKernelCpp);
 
 // ---- argmax ----------------------------------------------------
@@ -219,7 +219,7 @@ at::Tensor ArgmaxKernelCpp(
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(ArgmaxFn, argmax_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(ArgmaxFn, argmax_dispatcher, Backend::kFlagGemsCpp,
                             ArgmaxKernelCpp);
 
 // ---- nonzero ---------------------------------------------------
@@ -230,7 +230,7 @@ at::Tensor NonzeroKernelCpp(const at::Tensor& self) {
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(NonzeroFn, nonzero_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(NonzeroFn, nonzero_dispatcher, Backend::kFlagGemsCpp,
                             NonzeroKernelCpp);
 
 // ---- sort ------------------------------------------------------
@@ -244,7 +244,7 @@ REGISTER_IMPL_TO_DISPATCHER(NonzeroFn, nonzero_dispatcher, Backend::kFlagOs,
   UnboxToFlagos(indices);
   return {values, indices};
 }
-REGISTER_IMPL_TO_DISPATCHER(SortFn, sort_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(SortFn, sort_dispatcher, Backend::kFlagGemsCpp,
                             SortKernelCpp);
 
 // ---- sort.stable -----------------------------------------------
@@ -263,7 +263,7 @@ REGISTER_IMPL_TO_DISPATCHER(SortFn, sort_dispatcher, Backend::kFlagOs,
   return {values, indices};
 }
 REGISTER_IMPL_TO_DISPATCHER(SortStableFn, sort_stable_dispatcher,
-                            Backend::kFlagOs, SortStableKernelCpp);
+                            Backend::kFlagGemsCpp, SortStableKernelCpp);
 
 // ---- topk ------------------------------------------------------
 // TopkFn = std::tuple<at::Tensor, at::Tensor> (*)(const at::Tensor&,
@@ -280,7 +280,7 @@ REGISTER_IMPL_TO_DISPATCHER(SortStableFn, sort_stable_dispatcher,
   UnboxToFlagos(indices);
   return {values, indices};
 }
-REGISTER_IMPL_TO_DISPATCHER(TopkFn, topk_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(TopkFn, topk_dispatcher, Backend::kFlagGemsCpp,
                             TopkKernelCpp);
 
 // ---- zeros -----------------------------------------------------
@@ -305,7 +305,7 @@ at::Tensor ZerosKernelCpp(
   UnboxToFlagos(result);
   return result;
 }
-REGISTER_IMPL_TO_DISPATCHER(ZerosFn, zeros_dispatcher, Backend::kFlagOs,
+REGISTER_IMPL_TO_DISPATCHER(ZerosFn, zeros_dispatcher, Backend::kFlagGemsCpp,
                             ZerosKernelCpp);
 
 }  // namespace at::native::flagos

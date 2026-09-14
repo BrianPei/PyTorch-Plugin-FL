@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-FlagGems C++ dispatch (kFlagOs) integration tests.
+FlagGems C++ dispatch (kFlagGemsCpp) integration tests.
 
 Verifies that torch_fl built with FLAGGEMS_KERNEL=ON routes ops to the C++
 FlagGems path (backend label "flagos") when FLAGOS_USE_FLAGGEMS_CPP=1, and
@@ -72,7 +72,7 @@ def _assert_routes_cpp(result: subprocess.CompletedProcess, op_name: str) -> Non
 
 class TestFlaggemsCppDispatchLog:
     """Each test verifies that FLAGOS_USE_FLAGGEMS_CPP=1 routes the op to
-    the C++ FlagGems backend (kFlagOs, logged as '-> flagos')."""
+    the C++ FlagGems backend (kFlagGemsCpp, logged as '-> flagos')."""
 
     @pytest.mark.flaggems_cpp
     def test_mm_routes_cpp(self):

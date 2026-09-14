@@ -20,11 +20,14 @@ hardware. Only genuine route differences select or skip individual cases,
 through the capabilities in `amp_support`.
 """
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from amp_support import require
+from platform_support import detect_platform
 
 
 AMP_DTYPES = (torch.float16, torch.bfloat16)
@@ -132,6 +135,12 @@ def test_autocast_fp32_policy(dtype, amp_capabilities, amp_device):
     """Numerically sensitive ops are promoted to float32."""
     require(amp_capabilities, "device")
 
+    if detect_platform() == "dcu" and dtype == torch.bfloat16:
+        pytest.skip(
+            "FlagGems/Triton-DCU: bf16+f64 scalar add triggers compiler crash "
+            "(PassManager::run failed) -- FlagGems issue #6220"
+        )
+
     x = torch.rand(64, device=amp_device, dtype=dtype) + 0.5
     normalized = torch.randn(4, 16, device=amp_device, dtype=dtype)
 
@@ -224,6 +233,11 @@ def test_amp_unscale_out_variant(amp_capabilities, amp_device):
 
 @pytest.mark.amp_device
 @pytest.mark.amp_grad_scaler
+@pytest.mark.xfail(
+    detect_platform() == "dcu" and os.getenv("FLAGOS_USE_FLAGGEMS") == "1",
+    reason="FlagGems missing mse_loss_backward operator on DCU",
+    strict=False,
+)
 def test_autocast_grad_scaler_training_step(amp_capabilities, amp_device):
     """A full autocast plus GradScaler training step keeps parameters finite."""
     require(amp_capabilities, "grad_scaler")

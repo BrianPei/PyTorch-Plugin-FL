@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verify the FlagGems C++ dispatch path (kFlagOs) on MetaX.
+"""Verify the FlagGems C++ dispatch path (kFlagGemsCpp) on MetaX.
 
 This is the MetaX counterpart of tests/integration/ops/test_flaggems_cpp_dispatch.py.
 
@@ -112,7 +112,7 @@ print("CONF=" + os.environ.get("FLAGOS_BACKEND_CONFIG", "<unset>"))
     for line in proc.stdout.splitlines():
         if line.startswith("CONF="):
             conf = line[len("CONF=") :]
-    ok = conf.endswith("backends_metax_flaggems_cpp.conf")
+    ok = conf.endswith("backends_metax.conf")
     check("CPP+boxing selects metax cpp conf", ok, conf or proc.stderr[-300:])
 
 
@@ -172,7 +172,7 @@ print("MM_OK=" + str(bool(torch.allclose(c.cpu(), ref, atol=1e-2, rtol=1e-2))))
 
 
 def test_routing():
-    """Each C++-backed op must log '-> flagos' (the kFlagOs backend)."""
+    """Each C++-backed op must log '-> flagos' (the kFlagGemsCpp backend)."""
     _routing_case(
         "bmm", "a = torch.randn(4, 32, 32, device=dev)\nc = torch.bmm(a, a)\n", "bmm"
     )

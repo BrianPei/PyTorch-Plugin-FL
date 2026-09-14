@@ -35,48 +35,89 @@ def _build_accelerator() -> str:
     return str(built).strip().lower()
 
 
+def _is_ppu_build() -> bool:
+    """True for a PPU wheel, which needs backends_ppu.conf rather than CUDA's.
+
+    PPU cannot be told apart by _build_accelerator() the way DCU can: it is a
+    CUDA-ABI boxing backend whose CI deliberately reports ACCELERATOR=cuda, and
+    torch.version.hip is unreadable here anyway (this runs before `import
+    torch`). Use the same signal setup.py bundles the wheel on -- PPU_SDK /
+    PPU_HOME, else the lib_ppu/ bundle directory the wheel ships.
+
+    Without this, PPU read backends_cuda.conf and inherited its FlagGems routes.
+    That is what sent mm/bmm through the _hygon kernel PPU's triton cannot
+    compile: 28 minutes inside a single test_mm and a SIGSEGV at interpreter
+    exit, on a runner where every assertion still passed.
+    """
+    if os.environ.get("PPU_SDK") or os.environ.get("PPU_HOME"):
+        return True
+    return os.path.isdir(os.path.join(os.path.dirname(__file__), "lib_ppu"))
+
+
 def _select_backend_config() -> None:
-    """Pick the op-routing config file based on the FLAGOS_USE_FLAGGEMS switch.
+    """Pick the op-routing config file for this build.
 
-    The C++ dispatcher (csrc/aten/common.cc) reads FLAGOS_BACKEND_CONFIG to
-    decide, per op, whether to run the CUDA boxing kernel or the FlagGems
-    Python-path kernel. Both kernel sets are compiled into the wheel, so the
-    choice is purely runtime:
+    Every conf is backends_<platform>.conf -- one file per platform, no per-mode
+    suffix -- so the selection is a property of the build, not of an env var:
 
-      * FLAGOS_USE_TILEOPS=1                   -> backends_tileops.conf
-      * FLAGOS_USE_FLAGGEMS_CPP=1              -> backends_flaggems_cpp.conf
-      * FLAGOS_USE_FLAGGEMS_CPP=1 + METAX_BOXING=1
-                                               -> backends_metax_flaggems_cpp.conf
-      * FLAGOS_USE_FLAGGEMS=1                  -> backends_flaggems.conf
-      * FLAGOS_USE_FLAGGEMS=1 + METAX_BOXING=1 -> backends_metax_flaggems.conf
-      * FLAGOS_USE_FLAGGEMS=1 + ACCELERATOR=dcu -> backends_dcu_flaggems.conf
-      * unset / 0                              -> backends_cuda.conf (pure boxing)
+      * a native-kernel vendor marker  -> backends_<that platform>.conf
+      * FLAGOS_METAX_BOXING=1          -> backends_metax.conf
+      * ACCELERATOR=dcu               -> backends_dcu.conf
+      * otherwise                     -> backends_cuda.conf
 
-    FLAGOS_USE_FLAGGEMS_CPP=1 activates the C++ FlagGems path (kFlagOs,
-    backends_flaggems_cpp.conf): 18 ops route to the flag_gems C++ runtime
-    (liboperators.so, no GIL), the remainder fall back to flagos_python.
-    Only valid when torch_fl was built with FLAGGEMS_KERNEL=ON.
+    There is no FlagGems opt-in left to apply. FLAGOS_USE_FLAGGEMS,
+    FLAGOS_USE_FLAGGEMS_CPP and FLAGOS_USE_TILEOPS each used to name a conf of
+    their own; every one of those files was the platform's own conf with one
+    backend column rewritten, which is why they could -- and did -- drift from it.
+    Each conf now states all five keys per op directly
+    (flaggems_cpp > flaggems > tileops > <vendor> > none), so the routing those
+    flags used to select is already in the file the platform reads.
 
-    On MetaX the C++ path uses backends_metax_flaggems_cpp.conf: 17 of those 18
-    ops are verified on-device, but mm/mm.out go to the cuda boxing kernel
-    because flag_gems' C++ mm_kernel_general requests 98304 bytes of shared
-    memory and MetaX C550 provides 65536 (mcErrorInvalidValue at launch). Its
-    non-C++ ops inherit the backends_metax_flaggems.conf routing, so the
-    triton-metax fallbacks documented there still apply. This needs a FlagGems
-    built for MACA (cpp/ -DFLAGGEMS_BACKEND=MACA) linked in at build time.
+    Which entry point an op actually takes is then decided by what got compiled
+    in, not by which file was read. flaggems_cpp is Backend::kFlagGemsCpp and needs
+    FLAGGEMS_KERNEL=ON (liboperators.so built for the vendor); tileops is
+    Backend::kTileOps and needs TILEOPS_KERNEL=ON plus an SM90 device. Where the
+    slot is empty Dispatcher::GetFn degrades to the boxing kernel rather than
+    raising, so one file stays correct across both builds. FLAGOS_USE_TILEOPS=1
+    survives as a table transform in common.cc (ApplyTileOpsOptIn): it repins
+    every op the conf annotates `# tileops` onto that path, which is the same op
+    set backends_tileops.conf used to carry.
 
-    On an Ascend NPU box (detected via /dev/davinci*), the ACL C++ backend is the
-    only usable one, so the choice is instead:
+    backends_metax.conf carries 15 of those ops on flaggems_cpp -- the 17 verified
+    on-device intersected with the current C++ set. mm/mm.out are excluded
+    deliberately: flag_gems' C++ mm_kernel_general requests 98304 bytes of shared
+    memory and MetaX C550 provides 65536 (mcErrorInvalidValue at launch), so they
+    stay on the cuda boxing kernel. Those 15 need a FlagGems built for MACA (cpp/
+    -DFLAGGEMS_BACKEND=MACA) linked in; without it Dispatcher::GetFn sees an empty
+    kFlagGemsCpp slot and boxes them, which is why one file is safe for both builds.
 
-      * FLAGOS_USE_FLAGGEMS=1 -> backends_ascend_flagos_py.conf (FlagGems Triton
-                                 where triton-ascend can run, else ascend aclnn)
-      * unset / 0             -> backends_ascend.conf (pure aclnn C++)
+    Native-kernel vendors (musa, ascend, gcu, tsingmicro) do not take part in that
+    choice; each takes backends_<platform>.conf directly. For musa, ascend and gcu
+    that conf is generated full-coverage: every routable op appears exactly once,
+    already resolved by the priority flaggems_cpp > flaggems > tileops > <vendor>
+    > none, so operator support is countable from the file alone. tsingmicro stays
+    hand-written and sparse because it registers the full generated op list rather
+    than a subset -- a `none` entry there would reach the dispatcher and raise on
+    an empty slot instead of boxing to cpu_fallback, so the whole-list shape is
+    not available to it. Such a build is detected via lib/flagos_platform, or for
+    Ascend via /dev/davinci* device nodes. To collapse that table onto a single
+    backend for A/B measurement, set ALL_USE_FLAGGEMS=1 or ALL_USE_VENDOR=1
+    (mutually exclusive). Both are applied in common.cc over the parsed table:
+    an op only moves if the target backend actually implements it, known from
+    the routed value plus its `# <backend>` annotation. Ops with no such
+    implementation are listed on stderr and stay on their configured backend --
+    ALL_USE_VENDOR is therefore partial by nature, since a vendor implements far
+    fewer ops than FlagGems.
 
-    The MetaX flaggems conf mirrors backends_flaggems.conf but routes the ops
-    triton-metax cannot run (mm/bmm/mean.dim) back to the cuda boxing kernel
-    (maca libtorch_cuda) instead of flagos_python. The DCU one does the same for
-    the ops DTK's triton (hcu backend) cannot run -- slice_backward (hardware
-    VMFault) and silu_backward (missing div_rn lowering). An explicit
+    The two boxing confs (metax, dcu) are generated by the same script and have
+    the same full-coverage shape as the vendor ones; only the fallback key
+    differs, spelled `cuda` because a CUDA-compatible platform can box every op
+    (which is why they have no `none` entries). Each routes the ops its own triton
+    backend cannot run back to that boxing kernel instead of to flaggems:
+    mm/bmm/mean.dim and friends on MetaX (maca libtorch_cuda), slice_backward
+    (hardware VMFault) and silu_backward (missing div_rn lowering) on DCU under
+    DTK's hcu triton. Those per-platform gap sets are measured on hardware, so the
+    generator recovers them from the confs rather than restating them. An explicit
     FLAGOS_BACKEND_CONFIG always wins (advanced/testing use), and the per-op
     FLAGOS_OP_<name> overrides in common.cc still apply on top. This must run
     before the first op dispatch triggers BackendTable() init; setting it at
@@ -84,48 +125,20 @@ def _select_backend_config() -> None:
     """
     if os.environ.get("FLAGOS_BACKEND_CONFIG"):
         return
-    use_tileops = os.environ.get("FLAGOS_USE_TILEOPS", "0") not in (
-        "0",
-        "",
-        "off",
-        "OFF",
-        "false",
-        "FALSE",
-    )
-    use_flaggems_cpp = os.environ.get("FLAGOS_USE_FLAGGEMS_CPP", "0") not in (
-        "0",
-        "",
-        "off",
-        "OFF",
-        "false",
-        "FALSE",
-    )
-    use_flaggems = os.environ.get("FLAGOS_USE_FLAGGEMS", "0") not in (
-        "0",
-        "",
-        "off",
-        "OFF",
-        "false",
-        "FALSE",
-    )
     metax_boxing = os.environ.get("FLAGOS_METAX_BOXING", "0") == "1"
 
     # A vendor build whose kernels are native (no CUDA boxing) records its
-    # platform in lib/flagos_platform. MUSA and Ascend each have an explicit
-    # opt-in hybrid config; all other native platforms retain their
-    # native-only config. This branch runs before the /dev/davinci* runtime
-    # check below, so it must reproduce that check's FlagGems opt-in itself --
-    # otherwise an Ascend build with the marker installed would silently drop
-    # FLAGOS_USE_FLAGGEMS=1 back to the native-only conf.
+    # platform in lib/flagos_platform. backends_<platform>.conf is generated by
+    # scripts/gen_vendor_confs.py and already lists every routable op with its
+    # final backend (flaggems_cpp > flaggems > tileops > <vendor> > none), so
+    # there is no FlagGems opt-in to apply here -- the conf is FlagGems-first by
+    # construction. ALL_USE_FLAGGEMS / ALL_USE_VENDOR narrow it afterwards.
     marker = os.path.join(os.path.dirname(__file__), "lib", "flagos_platform")
     if os.path.exists(marker):
         with open(marker) as f:
             platform = f.read().strip().lower()
-        platform_name = f"backends_{platform}"
-        if platform in ("musa", "ascend") and use_flaggems:
-            platform_name = f"backends_{platform}_flagos_py"
         platform_conf = os.path.join(
-            os.path.dirname(__file__), "configs", f"{platform_name}.conf"
+            os.path.dirname(__file__), "configs", f"backends_{platform}.conf"
         )
         if os.path.exists(platform_conf):
             os.environ["FLAGOS_BACKEND_CONFIG"] = platform_conf
@@ -141,7 +154,6 @@ def _select_backend_config() -> None:
     # is an Ascend box, where the only usable routing is the ascend conf. (A CUDA
     # build could not run here anyway, so this never mis-fires on a CUDA host.)
     ascend_default = os.path.join(conf_dir, "backends_ascend.conf")
-    ascend_flaggems = os.path.join(conf_dir, "backends_ascend_flagos_py.conf")
     try:
         is_ascend_build = os.path.exists(ascend_default) and any(
             name.startswith("davinci") for name in os.listdir("/dev")
@@ -150,27 +162,15 @@ def _select_backend_config() -> None:
         is_ascend_build = False
 
     if is_ascend_build:
-        conf_path = (
-            ascend_flaggems
-            if (use_flaggems and os.path.exists(ascend_flaggems))
-            else ascend_default
-        )
-        if os.path.exists(conf_path):
-            os.environ["FLAGOS_BACKEND_CONFIG"] = conf_path
+        os.environ["FLAGOS_BACKEND_CONFIG"] = ascend_default
         return
 
-    if use_tileops:
-        conf_name = "backends_tileops.conf"
-    elif use_flaggems_cpp and metax_boxing:
-        conf_name = "backends_metax_flaggems_cpp.conf"
-    elif use_flaggems_cpp:
-        conf_name = "backends_flaggems_cpp.conf"
-    elif use_flaggems and metax_boxing:
-        conf_name = "backends_metax_flaggems.conf"
-    elif use_flaggems and _build_accelerator() == "dcu":
-        conf_name = "backends_dcu_flaggems.conf"
-    elif use_flaggems:
-        conf_name = "backends_flaggems.conf"
+    if metax_boxing:
+        conf_name = "backends_metax.conf"
+    elif _build_accelerator() == "dcu":
+        conf_name = "backends_dcu.conf"
+    elif _is_ppu_build():
+        conf_name = "backends_ppu.conf"
     else:
         conf_name = "backends_cuda.conf"
     conf_path = os.path.join(os.path.dirname(__file__), "configs", conf_name)
@@ -179,6 +179,32 @@ def _select_backend_config() -> None:
 
 
 _select_backend_config()
+
+
+def _conf_routes_to_flaggems() -> bool:
+    """True when the selected conf routes at least one op to a FlagGems path.
+
+    The FlagGems Python path needs process-level setup before flag_gems is
+    imported (the torch.musa surface its MThreads backend selects on, the Philox
+    seed bridge). That setup used to be gated on FLAGOS_USE_FLAGGEMS=1, which no
+    longer decides anything: a generated vendor conf is FlagGems-first by
+    construction, so the opt-in is gone and the gate would never open -- leaving
+    flag_gems to fail its own backend discovery on the very ops the conf routes
+    to it. Read the conf instead, which is the thing that actually decides.
+    """
+    conf = os.environ.get("FLAGOS_BACKEND_CONFIG")
+    if not conf or not os.path.exists(conf):
+        return False
+    try:
+        with open(conf) as f:
+            for line in f:
+                value = line.split("#")[0].partition("=")[2].strip()
+                if value in ("flaggems", "flaggems_python", "flagos_python"):
+                    return True
+    except OSError:
+        return False
+    return False
+
 
 # Optional: PyTorch wheels may require libcudart.so.12 version tags on MetaX.
 if os.environ.get("FLAGOS_METAX_CUDART_SHIM", "0") == "1":
@@ -491,9 +517,7 @@ def _install_musa_flaggems_compat() -> None:
     provide only the small compatibility surface required during FlagGems
     discovery. The actual tensor device remains ``flagos``.
     """
-    if _build_accelerator() != "musa" or os.environ.get(
-        "FLAGOS_USE_FLAGGEMS", "0"
-    ).lower() in ("0", "", "off", "false"):
+    if _build_accelerator() != "musa" or not _conf_routes_to_flaggems():
         return
 
     import importlib.machinery
@@ -639,9 +663,7 @@ def _patch_flaggems_philox():
     manual_seed/get_rng_state/set_rng_state and mixed native/FlagGems call order
     deterministic without maintaining a second CUDA-style generator state.
     """
-    if _build_accelerator() != "musa" or os.environ.get(
-        "FLAGOS_USE_FLAGGEMS", "0"
-    ).lower() in ("0", "", "off", "false"):
+    if _build_accelerator() != "musa" or not _conf_routes_to_flaggems():
         return
 
     try:
@@ -898,6 +920,7 @@ def _patch_flaggems_codegen_config():
     # Provide a minimal shim module so the import doesn't fail.
     # Also set __spec__ to satisfy importlib.util.find_spec() checks (used by
     # accelerate.utils.imports.is_npu_available).
+    # triton-ascend backend_register.py also checks torch_npu._C for stream APIs.
     if "torch_npu" not in sys.modules:
         import types
         import importlib.machinery
@@ -909,7 +932,18 @@ def _patch_flaggems_codegen_config():
             loader=None,
             origin="torch_fl_shim",
         )
+        # triton-ascend checks hasattr(torch_npu._C, "_npu_getCurrentRawStreamNoWait")
+        # Provide a minimal _C shim with mock stream functions
+        _npu_c_shim = types.ModuleType("torch_npu._C")
+
+        # Mock stream API - return flagos stream handle
+        def _mock_get_current_stream(device_index=0):
+            return flagos.current_stream(device_index).cuda_stream
+
+        _npu_c_shim._npu_getCurrentRawStreamNoWait = _mock_get_current_stream
+        _npu_shim._C = _npu_c_shim
         sys.modules["torch_npu"] = _npu_shim
+        sys.modules["torch_npu._C"] = _npu_c_shim
 
 
 # Patch FlagGems codegen config before any FlagGems code is imported

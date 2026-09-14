@@ -372,6 +372,94 @@ The target cohort is the available MTT S5000 host; no S6000 claim is made.
 
 The MUSA hybrid config adds seven non-overlapping FlagGems Python routes (`all`, `all.dims`, `any`, `any.dims`, `index_add`, `index_add_`, and `repeat_interleave.Tensor`) while retaining native RNG precedence. They were execution-validated with FlagGems 5.0.2 and the vendor `flagtree-0.5.0+mthreads3.1` wheel (Triton 3.1.0, backend `mthreads`; SHA-256 `197b0c6954ad8b3edef51138311a8c4f3aea75b90ba0f69d3c2fda95a76b6b1b`). `tests/integration/ops/test_musa_flaggems.py` passed **2 tests in 5.33 seconds** on `flagos:0`: instrumentation observed every configured wrapper, it compares selected route outputs against CPU, includes duplicate-index `index_add`, checks in-place `index_add_`, and launches FlagGems `randn` on `flagos:0` between native `rand` calls. Repeating after `torch.flagos.manual_seed(20260817)` reproduced all outputs and confirmed the two shared C++ generator reservations. Native and hybrid suites must run in separate pytest processes because the C++ `BackendTable()` caches the backend configuration on first use. The generic installed Triton 3.7.1 is not MThreads-capable and is not execution evidence.
 
+### Full-coverage vendor configurations (2026-09-10)
+
+The MUSA, GCU and Ascend configurations became **full-coverage**: all 2036 ops
+torch_fl can route are listed exactly once under one of four keys, with routing
+priority `flaggems_cpp > flaggems > <vendor> > none`. Previously these files were
+sparse, so "absent from the file" and "known to be unsupported" looked identical
+and support could not be counted from the configuration. Omission was never a
+safe way to say "unsupported" either: `GetBackendForOp()` returns `kFlagOs` on a
+table miss, so an unlisted op claimed a FlagGems kernel by default.
+
+What a configuration may claim is bounded by what the platform registers on
+PrivateUse1. FlagGems coverage is measured on CUDA and is only a **ceiling**: the
+FlagGems wrapper is reached *through* the op's PrivateUse1 registration, so an op
+the platform does not register cannot reach any kernel, FlagGems included. Each
+platform's registration set is therefore read from the generated
+`*_register.inc` files that `csrc/aten/register.cc` includes — the same list the
+compiler sees — and every accelerated route is required to be in it.
+
+| Platform | flaggems | vendor | none | Registered / total |
+|---|---:|---:|---:|---:|
+| Ascend 910 | 248 | 126 | 1662 | 374 / 2036 (18%) |
+| Enflame GCU S60 | 88 | 64 | 1884 | 152 / 2036 (7%) |
+| MTT S5000 (MUSA) | 122 | 36 | 1878 | 158 / 2036 (7%) |
+
+The FlagGems count differs per platform because it is now the intersection of the
+shared coverage set with that platform's registrations, not the shared set
+itself. Ops the vendor also implements but that FlagGems covers are routed to
+FlagGems by priority; a trailing `# <vendor>` annotation records the kernel so it
+stays recoverable and `ALL_USE_VENDOR` can find it (248 such kernels on Ascend,
+88 on GCU, 115 on MUSA — MUSA's remaining 7 FlagGems routes come from
+`musa_flaggems_register.inc`, which registers wrappers without native kernels
+behind them).
+
+`none` means no accelerated implementation on that platform. It is honest only
+where registration *skips* the op, so the call reaches `cpu_fallback` instead of
+a registered-but-empty dispatcher slot. That is what limits generation to these
+three platforms: **MetaX and Tsingmicro register the full generated op list** via
+the `#else` branch of `csrc/aten/register.cc`, so a `none` entry there would
+reach the dispatcher and raise instead of falling back. Their configurations stay
+hand-written and sparse; MetaX's supported path is its boxing configurations.
+Relative to the sparse files this is not a regression for MUSA/GCU/Ascend — an
+absent op reached the same fallback, it just could not be counted.
+
+The two boxing configurations (`metax`, `dcu`) are generated in the same
+full-coverage shape, but their fallback key is `cuda` and they contain no `none`:
+a CUDA-compatible platform can box every op. Their per-op key distribution is
+byte-for-byte equivalent to the previous revision — only the shape and key
+spellings changed.
+
+The `flaggems_cpp` key is emitted **only** in `backends_metax.conf`. That slot
+is `Backend::kFlagOs`, registered behind `#ifdef FLAGOS_FLAGGEMS_CPP`, which is
+defined only for a `FLAGGEMS_KERNEL=ON` build; `CMakeLists.txt` force-sets it
+`OFF` for ascend, dcu, musa, bpu, tsingmicro and non-boxing metax. When a build
+without that slot reads a `flaggems_cpp` entry, `Dispatcher::GetFn` degrades to
+the boxing kernel instead of raising, so the file is safe for both opt-in and
+plain boxing builds. No coverage is lost: the C++ op set is a subset of the
+Python set, so those ops take the Python path to the same FlagGems kernels and
+only the GIL-free entry point is given up.
+
+**Evidence status: not revalidated on any accelerator.** No route was measured on
+hardware for this change. `tests/manual/flaggems_overload_survey.py` could not
+run: the work was done on a CPU-only host whose Triton 3.7.1 exposes only the
+`amd` and `nvidia` backends, so `import flag_gems` fails there. This applies to
+every platform named above — Ascend 910, Enflame GCU S60, MTT S5000, MetaX C550
+and Hygon DCU data in the sections above predate this change and were **not**
+re-measured against it.
+
+No coverage set is newly measured either. The vendor sets are read from the
+committed codegen artifacts, and the boxing platforms' measured facts (each
+platform's Triton gap set, the MetaX 17-of-18 C++ subset that keeps `mm` boxed)
+are recovered from the configurations the generator rewrites. That is what makes
+the change auditable by regeneration rather than by hardware. Confirmed
+mechanically:
+
+- `scripts/gen_vendor_confs.py` twice in a row produces an empty diff and
+  `--check` exits 0, so no measured fact is lost across the round trip.
+- Routing equals registration exactly on all three generated vendors
+  (Ascend 374/374, GCU 152/152, MUSA 158/158, with no op routed outside its
+  registration set and none registered-but-left-`none`).
+- `tests/unit/test_gen_vendor_confs.py`: 27 passed, pinning the four-key
+  priority, the registration gate, the annotation round trip, the `flaggems_cpp`
+  build gate, and that MetaX/Tsingmicro stay hand-written.
+- Per-op key distribution on `metax` and
+  `dcu` is unchanged from the previous revision.
+
+Before any of these platforms is described as validated under the new
+configurations, rerun the survey on that hardware and replace this entry's status.
+
 ## FlagGems Route Removals
 
 The 10 stale-qualname routes fixed on 2026-08-31 are omitted from this section
@@ -385,8 +473,8 @@ to this change.
 
 `index_select` was moved from `flagos_python` to `cuda` in all FlagGems
 configurations (`backends_flaggems.conf`, `backends_flaggems_cpp.conf`,
-`backends_metax_flaggems.conf`, `backends_metax_flaggems_cpp.conf`,
-`backends_dcu_flaggems.conf`; `index_select.out` was already CUDA-routed).
+        `backends_metax.conf`, `backends_dcu.conf`,
+`backends_dcu.conf`; `index_select.out` was already CUDA-routed).
 The generic configuration now activates 545 FlagGems Python routes with 27
 forced CUDA fallbacks (SHA-256
 `14b4c64c0d2684b126fe06c6f39f42b62c571a94813a684cb63d4a09b909b60c`).
@@ -444,6 +532,8 @@ MetaX kernel mode or for additional MACA releases and devices.
 
 | Date | Hardware | Cohort | Change | Evidence |
 |---|---|---|---|---|
+| 2026-09-11 | None (CPU-only host) | Unified MetaX confs (refactor/unified-vendor-confs) | Collapsed `backends_metax_flaggems.conf` and `backends_metax_flaggems_cpp.conf` into a single `backends_metax.conf`. The 17 on-device-verified C++ routes are now in the file unconditionally; a build without `FLAGGEMS_KERNEL=ON` degrades them to the boxing kernel via `Dispatcher::GetFn` instead of raising. `METAX_CPP_MEASURED` in `gen_vendor_confs.py` records the measured set explicitly since the file it was formerly recovered from no longer exists. `mm` remains on the boxing kernel (MetaX C550 shared-memory limit). `_select_backend_config()` now routes both `FLAGOS_USE_FLAGGEMS` and `FLAGOS_USE_FLAGGEMS_CPP` to the same `backends_metax.conf` under `FLAGOS_METAX_BOXING=1`. **All hardware rows not revalidated.** | Mechanical evidence only — generator idempotent (two runs, empty diff; `--check` exits 0), `tests/unit/test_gen_vendor_confs.py` passes with updated test names. |
+| 2026-09-10 | None (CPU-only host) | Full-coverage MUSA/GCU/Ascend and boxing configurations | Converted the MUSA, GCU, Ascend and boxing configurations to full coverage: all 2036 routable ops listed exactly once under `flaggems_cpp` / `flaggems` / `<vendor>` / `none`, priority in that order, generated by `scripts/gen_vendor_confs.py`. Every accelerated route is now gated on the platform's real PrivateUse1 registration set, read from the generated `*_register.inc` files, because CUDA-measured FlagGems coverage is a ceiling and not a per-platform routing set (Ascend 374, GCU 152, MUSA 158 registered of 2036). MetaX and Tsingmicro register the full generated list, so `none` would raise there instead of boxing to `cpu_fallback`; Tsingmicro's configuration stays hand-written. **All hardware rows not revalidated.** | No route measured. `flaggems_overload_survey.py` cannot run on this host: Triton 3.7.1 exposes only `amd`/`nvidia` backends and `import flag_gems` fails. Mechanical evidence only — generator idempotent (two runs, empty diff; `--check` exits 0), routing equals registration exactly on all three vendors, `tests/unit/test_gen_vendor_confs.py`: 27 passed, `tests/unit/`: 303 passed, 96 skipped, 2 pre-existing profiler failures (`CXXABI_1.3.15` libstdc++ skew) unrelated to routing. |
 | 2026-08-31 | MetaX C550 (8 devices) | FlagGems qualname/cohort skew | Rerouted 10 FlagGems entries whose generated Python qualnames are absent from the current FlagGems tree to the CUDA boxing path in the generic, DCU, and MetaX FlagGems configurations. The generic FlagGems cohort was not revalidated on the other platforms. | On MetaX, `x[None]`, `binary_cross_entropy_with_logits`, and the affected dispatch paths now resolve through CUDA boxing; the issue #218 `mul_` reproducer still passes. `special_bessel_j1` retains a pre-existing MACA boxing failure unrelated to FlagGems. The 10 routes were not measured by the standard overload survey. |
 | 2026-08-30 | MTT S5000 (8 devices) | Native MUSA empty-tensor handling | Added generated on-device handling for zero-element Unary/Binary/Reduce outputs and on-device identities for whole-tensor empty `sum`, `mean`, and `prod`; no CPU fallback is used. | `test_pow_dispatch.py`: 22 passed, 4 deselected; `test_narrow_dispatch.py`: 17 passed including the restored zero-length backward case; `test_musa_dispatch.py`: 89 passed. The full operator cohort reached 480 passed, 14 skipped, and 3 xpassed; three unrelated FlagGems consistency assertions remain environment/configuration failures. |
 | 2026-08-27 | Ascend 910 (CANN 9.0.0) | Native Ascend view routes | Added `_conj` and `_neg_view` as metadata-only view routes; without them every math-bit resolution raised `backend not registered`. Generic FlagGems cohort **not revalidated** because no FlagGems route changed. | `tests/integration/test_math_bits_contract.py`: 5 passed, 7 skipped. Negative-bit clone/copy/resolve are bit-exact; the Conjugate cases skip because CANN 9.0.0 has no complex compute (`_conj_physical` absent, `aclnnAdd`/`aclnnMul` reject Complex{Float,Double}). |

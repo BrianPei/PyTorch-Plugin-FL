@@ -4,6 +4,7 @@
 
 #include "ops.h"
 
+#include "../../generated/ops.h"
 #include "convert.h"
 #include "format.h"
 
@@ -11,9 +12,11 @@
 #include <ATen/Dispatch.h>
 #include <ATen/ops/bitwise_and.h>
 #include <ATen/ops/bitwise_right_shift.h>
+#include <ATen/ops/add.h>
 #include <ATen/ops/bmm.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/eq.h>
+#include <ATen/ops/mul.h>
 #include <ATen/ops/exp2.h>
 #include <ATen/ops/mm.h>
 #include <ATen/ops/ne.h>
@@ -27,6 +30,24 @@
 #include "../../../include/flagos.h"
 
 namespace at::native::flagos::soft_lowp {
+
+namespace {
+thread_local bool dispatch_suppressed = false;
+}
+
+bool IsDispatchSuppressed() {
+  return dispatch_suppressed;
+}
+
+DispatchSuppressionGuard::DispatchSuppressionGuard()
+    : previous_(dispatch_suppressed) {
+  dispatch_suppressed = true;
+}
+
+DispatchSuppressionGuard::~DispatchSuppressionGuard() {
+  dispatch_suppressed = previous_;
+}
+
 namespace {
 
 at::Tensor DecodeFp4Nibbles(const at::Tensor& raw) {
@@ -223,6 +244,14 @@ at::Tensor AddmmImpl(
     const at::Scalar& beta,
     const at::Scalar& alpha,
     c10::ScalarType out_dtype) {
+  // Some composite callers (notably linear_out) can reach this helper after
+  // their own boxing/decomposition even when the matrix operands are ordinary
+  // dtypes. Keep that path on a fused backend instead of applying the
+  // low-precision-only validation below.
+  if (!HasLowpInput(mat1) && !HasLowpInput(mat2)) {
+    return addmm_dispatcher.DispatchBackend(
+        Backend::kCuda, self, mat1, mat2, beta, alpha);
+  }
   CheckMatrixInputs(mat1, mat2);
   auto bias = self;
   CheckDevice(bias, "addmm");
@@ -231,7 +260,12 @@ at::Tensor AddmmImpl(
   }
   auto lhs = DecodeIfNeeded(mat1, false);
   auto rhs = DecodeIfNeeded(mat2, true);
-  auto result = at::addmm(bias, lhs, rhs, beta, alpha);
+  // Preserve one fused addmm operation while bypassing the public wrapper's
+  // low-precision gate. The decoded inputs are ordinary BF16 tensors, so the
+  // configured backend dispatcher can execute the complete matrix operation
+  // without recursively re-entering this software path.
+  auto result = addmm_dispatcher.DispatchBackend(
+      Backend::kCuda, bias, lhs, rhs, beta, alpha);
   const auto output_dtype = DefaultOutputDtype(mat1, out_dtype);
   return output_dtype == result.scalar_type() ? result : result.to(output_dtype);
 }

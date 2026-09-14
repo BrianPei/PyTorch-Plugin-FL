@@ -21,7 +21,7 @@ Enables inductor-based kernel fusion for models running on the flagos device:
 The backend internally uses TorchInductor for graph optimization and kernel
 fusion, with device context patched to target the flagos device. Generated
 Triton kernels dispatch through the existing flagos routing infrastructure
-(kFlagOsPython/kFlagOs/cuda boxing).
+(kFlagGems/kFlagGemsCpp/cuda boxing).
 
 FlagTree compiles these kernels instead of OpenAI Triton when it is installed,
 which requires no change here: FlagTree replaces the `triton` module at install

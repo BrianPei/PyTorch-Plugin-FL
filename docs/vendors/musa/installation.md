@@ -81,13 +81,24 @@ print(f"abs matches CPU: {torch.allclose(y.cpu(), x.cpu().abs())}")
 
 `torch_fl` installs a `lib/flagos_platform` marker so the runtime picks `backends_musa.conf` automatically. This native-only mode requires no environment variable override.
 
-The same wheel also contains a narrow hybrid route set. Enable it with:
+There is no `FLAGOS_USE_FLAGGEMS` opt-in and no separate `*_flagos_py.conf`
+narrow hybrid set. `backends_musa.conf` is generated FlagGems-first: of the 158
+ops MUSA registers on PrivateUse1, 122 resolve to `flaggems` and 36 to `musa`,
+and the remaining ops are written `none` because MUSA does not register them, so
+they reach `cpu_fallback`. Where a mudnn kernel exists behind an op FlagGems
+wins, the entry carries a `# musa` annotation. Reading the file tells you the
+whole routing.
 
-```bash
-export FLAGOS_USE_FLAGGEMS=1
-```
+The FlagGems routes require FlagGems and the MThreads FlagTree compiler/runtime.
+On the measured host, FlagGems 5.0.2 executed with the vendor
+`flagtree-0.5.0+mthreads3.1` wheel (Triton 3.1.0, backend `mthreads`). The
+generic installed Triton 3.7.1 is not sufficient and must not be used for this
+path. The vendor wheel SHA-256 was
+`197b0c6954ad8b3edef51138311a8c4f3aea75b90ba0f69d3c2fda95a76b6b1b`.
 
-This selects `backends_musa_flagos_py.conf`: native mudnn/muRAND remains authoritative for every native schema, including RNG and dropout, while `all`, `all.dims`, `any`, `any.dims`, `index_add`, `index_add_`, and `repeat_interleave.Tensor` route to the FlagGems Python caller. The hybrid routes require FlagGems and the MThreads FlagTree compiler/runtime. On the measured host, FlagGems 5.0.2 executed with the vendor `flagtree-0.5.0+mthreads3.1` wheel (Triton 3.1.0, backend `mthreads`). The generic installed Triton 3.7.1 is not sufficient and must not be used for this path. The vendor wheel SHA-256 was `197b0c6954ad8b3edef51138311a8c4f3aea75b90ba0f69d3c2fda95a76b6b1b`.
+To pin the table to one backend for A/B measurement, set `ALL_USE_FLAGGEMS=1` or
+`ALL_USE_VENDOR=1` (mutually exclusive). Ops the target does not implement are
+listed on stderr and stay on their configured backend.
 
 ## Testing
 

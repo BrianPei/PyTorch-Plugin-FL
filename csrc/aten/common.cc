@@ -2,6 +2,7 @@
 
 #include "common.h"
 
+#include <algorithm>
 #include <cstdio>
 
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -69,22 +71,91 @@ std::string TrimStr(std::string s) {
   return (l == std::string::npos) ? "" : s.substr(l, r - l + 1);
 }
 
+// Backend names are matched case-insensitively so a per-op override can be
+// spelled the way it reads in docs (FLAGOS_OP_mm=FLAGGEMS) as well as the way
+// the conf files write it (mm = flaggems).
+std::string LowerStr(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+  }
+  return s;
+}
+
+// Maps a conf/env backend name to its enum slot. Returns false for an
+// unrecognized name so the caller can warn and pick its own default.
+//
+// The five names a vendor conf uses are "flaggems_cpp", "flaggems", "tileops",
+// "<vendor>" and "none". Legacy spellings "flagos" (for flaggems_cpp),
+// "flaggems_python" and "flagos_python" (for flaggems) stay accepted so an
+// out-of-tree conf or a pinned script keeps working.
+bool ParseBackendName(const std::string& raw, Backend* out) {
+  const std::string val = LowerStr(raw);
+  if (val == "cuda") {
+    *out = Backend::kCuda;
+  } else if (val == "metax") {
+    *out = Backend::kMetax;
+  } else if (val == "tsingmicro") {
+    *out = Backend::kTsingMicro;
+  } else if (val == "gcu") {
+    *out = Backend::kGcu;
+  } else if (val == "ascend") {
+    *out = Backend::kAscend;
+  } else if (val == "musa") {
+    *out = Backend::kMusa;
+  } else if (val == "tileops") {
+    *out = Backend::kTileOps;
+  } else if (val == "flaggems_cpp" || val == "flagos") {
+    *out = Backend::kFlagGemsCpp;
+  } else if (val == "flaggems" || val == "flaggems_python" ||
+             val == "flagos_python") {
+    *out = Backend::kFlagGems;
+  } else if (val == "none") {
+    *out = Backend::kNone;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+const char* BackendName(Backend b) {
+  switch (b) {
+    case Backend::kCuda:         return "cuda";
+    case Backend::kFlagGemsCpp:  return "flaggems_cpp";
+    case Backend::kFlagGems:     return "flaggems";
+    case Backend::kAscend:       return "ascend";
+    case Backend::kMusa:         return "musa";
+    case Backend::kMetax:        return "metax";
+    case Backend::kTsingMicro:   return "tsingmicro";
+    case Backend::kGcu:          return "gcu";
+    case Backend::kTileOps:      return "tileops";
+    case Backend::kNone:         return "none";
+    default:                     return "unknown";
+  }
+}
+
 // Parse one conf file into `table`. Later assignments win, so a caller that
 // wants to override an inherited route just restates the op after the
 // `include`.
 //
 // A line of the form `include <path>` splices another conf in at that point.
 // Relative paths resolve against the including file's directory. This lets a
-// hybrid conf (e.g. backends_ascend_flagos_py.conf) inherit the full vendor
-// baseline and state only its own overrides, instead of duplicating every op.
-// Duplicating was the previous arrangement and it silently rotted: the Ascend
-// baseline grew to 223 ops via codegen while the hybrid conf stayed at 55, so
-// 168 ops fell through to Backend::kFlagOs -- which has no kernel registered in
-// an Ascend build, surfacing as "<op>: backend not registered" at runtime.
+// conf inherit another's baseline and state only its own overrides, instead of
+// duplicating every op. Duplicating was the previous arrangement and it
+// silently rotted: the Ascend baseline grew to 223 ops via codegen while the
+// hand-maintained hybrid conf stayed at 55, so 168 ops fell through to
+// Backend::kFlagGemsCpp -- which has no kernel registered in an Ascend build,
+// surfacing as "<op>: backend not registered" at runtime. The generated vendor
+// confs now state all four keys per op directly and need no include.
 //
 // `depth` bounds include recursion so a cyclic include can't hang import.
+// `alt` collects trailing `# <backend>` annotations: a generated vendor conf
+// writes `abs = flaggems  # musa` to record that the vendor also implements the
+// op even though priority routed it to FlagGems. Runtime routing ignores the
+// annotation; ALL_USE_VENDOR needs it to know which ops may legally be pinned
+// back to the vendor kernel.
 void ParseConfigInto(const std::string& path,
                      std::unordered_map<std::string, Backend>& table,
+                     std::unordered_map<std::string, Backend>& alt,
                      int depth = 0) {
   if (depth > 8) {
     fprintf(stderr, "[flagos] include nesting too deep at %s, skipping\n",
@@ -102,9 +173,13 @@ void ParseConfigInto(const std::string& path,
 
   std::string line;
   while (std::getline(f, line)) {
-    // strip comments
+    // strip comments, keeping the text for the `# <backend>` annotation below
+    std::string comment_text;
     auto comment = line.find('#');
-    if (comment != std::string::npos) line = line.substr(0, comment);
+    if (comment != std::string::npos) {
+      comment_text = TrimStr(line.substr(comment + 1));
+      line = line.substr(0, comment);
+    }
 
     auto eq = line.find('=');
     if (eq == std::string::npos) {
@@ -121,7 +196,7 @@ void ParseConfigInto(const std::string& path,
             inc = path.substr(0, slash + 1) + inc;
           }
         }
-        ParseConfigInto(inc, table, depth + 1);
+        ParseConfigInto(inc, table, alt, depth + 1);
       }
       continue;
     }
@@ -133,29 +208,126 @@ void ParseConfigInto(const std::string& path,
 
     if (op.empty() || val.empty()) continue;
 
-    if (val == "cuda") {
-      table[op] = Backend::kCuda;
-    } else if (val == "metax") {
-      table[op] = Backend::kMetax;
-    } else if (val == "tsingmicro") {
-      table[op] = Backend::kTsingMicro;
-    } else if (val == "gcu") {
-      table[op] = Backend::kGcu;
-    } else if (val == "ascend") {
-      table[op] = Backend::kAscend;
-    } else if (val == "musa") {
-      table[op] = Backend::kMusa;
-    } else if (val == "flagos" || val == "flaggems") {
-      table[op] = Backend::kFlagOs;
-    } else if (val == "flagos_python" || val == "flaggems_python") {
-      table[op] = Backend::kFlagOsPython;
-    } else if (val == "tileops") {
-      table[op] = Backend::kTileOps;
+    Backend parsed;
+    if (ParseBackendName(val, &parsed)) {
+      table[op] = parsed;
     } else {
-      fprintf(stderr, "[flagos] unknown backend '%s' for op '%s', using flagos\n", val.c_str(), op.c_str());
-      table[op] = Backend::kFlagOs;
+      fprintf(stderr, "[flagos] unknown backend '%s' for op '%s', using flaggems\n", val.c_str(), op.c_str());
+      table[op] = Backend::kFlagGems;
+    }
+
+    Backend annotated;
+    if (!comment_text.empty() && ParseBackendName(comment_text, &annotated)) {
+      alt[op] = annotated;
+    } else {
+      alt.erase(op);
     }
   }
+}
+
+bool EnvIsOn(const char* name) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return false;
+  std::string s(v);
+  return s != "0" && s != "off" && s != "OFF" && s != "false" && s != "FALSE";
+}
+
+bool IsFlagGems(Backend b) {
+  return b == Backend::kFlagGemsCpp || b == Backend::kFlagGems;
+}
+
+// ALL_USE_FLAGGEMS=1 / ALL_USE_VENDOR=1 collapse the whole table onto one
+// backend, for A/B measurement against the default mixed routing. Each op is
+// only movable if that backend actually implements it -- known from the routed
+// value plus the `# <backend>` annotation. Ops that are not are reported and
+// left on their configured backend; nothing is silently rerouted to a kernel
+// that does not exist, which would surface much later as "backend not
+// registered" mid-model.
+void ApplyAllUseOverride(std::unordered_map<std::string, Backend>& table,
+                         const std::unordered_map<std::string, Backend>& alt) {
+  const bool all_flaggems = EnvIsOn("ALL_USE_FLAGGEMS");
+  const bool all_vendor = EnvIsOn("ALL_USE_VENDOR");
+  if (!all_flaggems && !all_vendor) return;
+  if (all_flaggems && all_vendor) {
+    fprintf(stderr,
+            "[flagos] ALL_USE_FLAGGEMS and ALL_USE_VENDOR are mutually "
+            "exclusive, ignoring both\n");
+    return;
+  }
+
+  std::vector<std::string> unsupported;
+  size_t moved = 0;
+  for (auto& [op, backend] : table) {
+    auto it = alt.find(op);
+    Backend annotated = it != alt.end() ? it->second : Backend::kNone;
+
+    // The op's candidates are its routed backend and its annotation.
+    Backend target = Backend::kNone;
+    if (all_flaggems) {
+      if (IsFlagGems(backend)) target = backend;
+      else if (IsFlagGems(annotated)) target = annotated;
+    } else {
+      if (!IsFlagGems(backend) && backend != Backend::kNone) target = backend;
+      else if (!IsFlagGems(annotated) && annotated != Backend::kNone) target = annotated;
+    }
+
+    if (target == Backend::kNone) {
+      unsupported.push_back(op);
+      continue;
+    }
+    if (target != backend) {
+      backend = target;
+      ++moved;
+    }
+  }
+
+  const char* which = all_flaggems ? "ALL_USE_FLAGGEMS" : "ALL_USE_VENDOR";
+  fprintf(stderr, "[flagos] %s=1: %zu ops repinned, %zu left as configured\n",
+          which, moved, unsupported.size());
+  if (!unsupported.empty()) {
+    std::sort(unsupported.begin(), unsupported.end());
+    fprintf(stderr, "[flagos] %s: no implementation for", which);
+    for (size_t i = 0; i < unsupported.size() && i < 12; ++i) {
+      fprintf(stderr, " %s", unsupported[i].c_str());
+    }
+    if (unsupported.size() > 12) {
+      fprintf(stderr, " ... (+%zu more)", unsupported.size() - 12);
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
+// FLAGOS_USE_TILEOPS=1 repins every op the conf annotates `# tileops` onto the
+// TileOPs backend. TileOPs is an opt-in path: it needs the `tileops` package
+// plus an SM90 device, and its kernels are only built when TILEOPS_KERNEL=ON,
+// so the default routing must not name it. Keeping the op set in the conf as an
+// annotation -- rather than in a separate backends_tileops.conf -- means the
+// per-op default and the TileOPs candidate are stated on one line, and the same
+// `alt` map ALL_USE_* already reads carries it.
+//
+// If a table-collapse flag is also set it wins: ALL_USE_* exists to measure one
+// backend against the mixed default, and silently leaving 60 ops on a third
+// backend would corrupt exactly that measurement.
+void ApplyTileOpsOptIn(std::unordered_map<std::string, Backend>& table,
+                       const std::unordered_map<std::string, Backend>& alt) {
+  if (!EnvIsOn("FLAGOS_USE_TILEOPS")) return;
+  if (EnvIsOn("ALL_USE_FLAGGEMS") || EnvIsOn("ALL_USE_VENDOR")) {
+    fprintf(stderr,
+            "[flagos] FLAGOS_USE_TILEOPS ignored: ALL_USE_FLAGGEMS/"
+            "ALL_USE_VENDOR pin the whole table\n");
+    return;
+  }
+
+  size_t moved = 0;
+  for (auto& [op, backend] : table) {
+    auto it = alt.find(op);
+    if (it == alt.end() || it->second != Backend::kTileOps) continue;
+    if (backend == Backend::kTileOps) continue;
+    backend = Backend::kTileOps;
+    ++moved;
+  }
+  fprintf(stderr, "[flagos] FLAGOS_USE_TILEOPS=1: %zu ops repinned to tileops\n",
+          moved);
 }
 
 std::unordered_map<std::string, Backend> LoadBackendConfig() {
@@ -164,7 +336,10 @@ std::unordered_map<std::string, Backend> LoadBackendConfig() {
   const char* env = std::getenv("FLAGOS_BACKEND_CONFIG");
   std::string path = env ? env : DefaultConfigPath();
 
-  ParseConfigInto(path, table);
+  std::unordered_map<std::string, Backend> alt;
+  ParseConfigInto(path, table, alt);
+  ApplyAllUseOverride(table, alt);
+  ApplyTileOpsOptIn(table, alt);
 
   // Per-op env var overrides: FLAGOS_OP_<op_name>=cuda|metax|flaggems|tileops
   // e.g. FLAGOS_OP_mm=cuda  or  FLAGOS_OP_mm__out=cuda
@@ -178,34 +353,14 @@ std::unordered_map<std::string, Backend> LoadBackendConfig() {
     }
     const char* override_val = std::getenv(key.c_str());
     if (!override_val) continue;
-    std::string v(override_val);
-    if (v == "cuda") {
-      table[op] = Backend::kCuda;
-      fprintf(stderr, "[flagos] env override: %s -> cuda\n", op.c_str());
-    } else if (v == "metax") {
-      table[op] = Backend::kMetax;
-      fprintf(stderr, "[flagos] env override: %s -> metax\n", op.c_str());
-    } else if (v == "tsingmicro") {
-      table[op] = Backend::kTsingMicro;
-      fprintf(stderr, "[flagos] env override: %s -> tsingmicro\n", op.c_str());
-    } else if (v == "gcu") {
-      table[op] = Backend::kGcu;
-      fprintf(stderr, "[flagos] env override: %s -> gcu\n", op.c_str());
-    } else if (v == "ascend") {
-      table[op] = Backend::kAscend;
-      fprintf(stderr, "[flagos] env override: %s -> ascend\n", op.c_str());
-    } else if (v == "musa") {
-      table[op] = Backend::kMusa;
-      fprintf(stderr, "[flagos] env override: %s -> musa\n", op.c_str());
-    } else if (v == "flagos" || v == "flaggems") {
-      table[op] = Backend::kFlagOs;
-      fprintf(stderr, "[flagos] env override: %s -> flaggems\n", op.c_str());
-    } else if (v == "flagos_python" || v == "flaggems_python") {
-      table[op] = Backend::kFlagOsPython;
-      fprintf(stderr, "[flagos] env override: %s -> flaggems_python\n", op.c_str());
-    } else if (v == "tileops") {
-      table[op] = Backend::kTileOps;
-      fprintf(stderr, "[flagos] env override: %s -> tileops\n", op.c_str());
+    Backend parsed;
+    if (ParseBackendName(override_val, &parsed)) {
+      table[op] = parsed;
+      fprintf(stderr, "[flagos] env override: %s -> %s\n", op.c_str(),
+              BackendName(parsed));
+    } else {
+      fprintf(stderr, "[flagos] env override: unknown backend '%s' for op '%s', ignored\n",
+              override_val, op.c_str());
     }
   }
 
@@ -222,7 +377,7 @@ const std::unordered_map<std::string, Backend>& BackendTable() {
 Backend GetBackendForOp(const std::string& op_name) {
   const auto& table = BackendTable();
   auto it = table.find(op_name);
-  return it != table.end() ? it->second : Backend::kFlagOs;
+  return it != table.end() ? it->second : Backend::kFlagGems;
 }
 
 } // namespace at::native::flagos

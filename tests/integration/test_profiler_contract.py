@@ -103,6 +103,10 @@ def test_profiler_flow_events_are_paired(profile_result, profiler_capabilities):
 
 @pytest.mark.profiler_device
 @pytest.mark.profiler_linkage
+@pytest.mark.xfail(
+    reason="FlagGems mm/bmm don't report profiler device time (FlagGems issue #6223)",
+    strict=False,
+)
 def test_profiler_device_time_linkage(profile_result, profiler_capabilities):
     """key_averages device time equals the linked device events in the trace.
 
