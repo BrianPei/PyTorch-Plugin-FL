@@ -17,11 +17,15 @@
 The per-op files in this directory assert a ``-> cuda`` routing that MUSA builds
 cannot produce: no CUDA boxing kernels are compiled in (the platform ships no
 cudart), so those tests are skipped by conftest's platform gate. This file is the
-MUSA equivalent -- it checks that ops land on the ``musa`` backend, that the
-per-op env override works, and that the results match a CPU reference.
+MUSA equivalent -- it checks that ops land on accelerated backends (FlagGems or
+mudnn native), that the per-op env override works, and that the results match a
+CPU reference.
 
-The kernels here call mudnn (the vendor kernel library) directly, so "routes to
-musa" and "runs the vendor kernel" are the same statement.
+Current MUSA strategy prioritizes FlagGems (Triton) implementations where available,
+falling back to mudnn native kernels. Ops covered by FlagGems route to
+``flagos_python``; ops with only mudnn implementations route to ``musa``, and so
+does an op FlagGems cannot compile for this target -- ``add.Tensor`` and friends
+on bf16 with a Python-float operand, listed in ``NATIVE_TRITON_GAPS['musa']``.
 
 Usage:
     pytest tests/integration/ops/test_musa_dispatch.py -v
@@ -38,22 +42,30 @@ import torch_fl  # noqa: F401
 
 DEVICE = "flagos:0"
 
-# op name as it appears in the dispatch log -> snippet exercising it
+# op name as it appears in the dispatch log -> (snippet, expected backend)
+# Expected backend can be "musa" (mudnn native) or "flagos_python" (FlagGems)
 _OPS = {
-    "mm": "a @ b",
-    "add.Tensor": "a + b",
-    "mul.Tensor": "a * b",
-    "_softmax": "torch.softmax(a, -1)",
-    "relu": "torch.relu(a)",
+    "mm": ("a @ b", "flagos_python"),  # FlagGems coverage
+    # FlagGems' pointwise promotion cannot serve a bf16 tensor against the
+    # float64 0-dim tensor ATen boxes a Python-float operand into: the
+    # mthreads LLVM lowering has no double overload for
+    # llvm.musa.float2bfloat16, so the kernel fails to compile. mudnn takes
+    # the scalar as its Unary alpha instead. Listed in
+    # NATIVE_TRITON_GAPS['musa'] so the conf and the registration agree.
+    "add.Tensor": ("a + b", "musa"),
+    "mul.Tensor": ("a * b", "musa"),  # mudnn native only
+    "_softmax": ("torch.softmax(a, -1)", "flagos_python"),  # FlagGems coverage
+    "relu": ("torch.relu(a)", "flagos_python"),  # FlagGems coverage
 }
 
-# Ops in the coverage set that mudnn has no mode for. They are deliberately left
-# unregistered so they reach the cpu_fallback -- registering an op with no kernel
-# behind it would instead trip the dispatcher's "backend not registered" check.
-_CPU_FALLBACK_OPS = {
-    "sinh": lambda x: x.sinh(),
-    "cosh": lambda x: x.cosh(),
-    "asin": lambda x: x.clamp(-1, 1).asin(),
+# Ops mudnn has no mode for, so they are served by FlagGems rather than the
+# vendor backend. They used to be left unregistered to reach the cpu_fallback;
+# under the FlagGems-first routing they have a kFlagGems slot and reach it, so
+# what this checks is that the route resolves *and* the answer is right.
+_FLAGGEMS_ONLY_OPS = {
+    "sinh": ("a.sinh()", lambda x: x.sinh()),
+    "cosh": ("a.cosh()", lambda x: x.cosh()),
+    "asin": ("a.clamp(-1, 1).asin()", lambda x: x.clamp(-1, 1).asin()),
 }
 
 
@@ -78,15 +90,16 @@ def _run_dispatch_subprocess(expr: str, extra_env: dict) -> subprocess.Completed
 
 
 class TestMusaDispatch:
-    """Ops route to the musa backend and produce correct results."""
+    """Ops route to accelerated backends (FlagGems or mudnn) and produce correct results."""
 
     @pytest.mark.musa
-    @pytest.mark.parametrize("op,expr", sorted(_OPS.items()))
-    def test_dispatch_log_musa(self, op, expr):
-        """Every covered op reports `-> musa` in the dispatch log by default."""
+    @pytest.mark.parametrize("op,expr_backend", sorted(_OPS.items()))
+    def test_dispatch_log_musa(self, op, expr_backend):
+        """Every covered op routes to its configured backend (FlagGems or mudnn)."""
+        expr, expected_backend = expr_backend
         result = _run_dispatch_subprocess(expr, {"FLAGOS_LOG_DISPATCH": "1"})
-        assert f"[flagos dispatch] {op} -> musa" in result.stderr, (
-            f"Expected musa dispatch log for {op}, got:\n{result.stderr}"
+        assert f"[flagos dispatch] {op} -> {expected_backend}" in result.stderr, (
+            f"Expected {expected_backend} dispatch for {op}, got:\n{result.stderr}"
         )
 
     @pytest.mark.musa
@@ -101,7 +114,7 @@ class TestMusaDispatch:
 
     @pytest.mark.musa
     def test_dispatch_log_mm_out_musa(self):
-        """mm.out routes to musa too (mudnn MatMul into a caller-provided out)."""
+        """mm.out routes to FlagGems (mudnn MatMul fallback available but FlagGems preferred)."""
         env = os.environ.copy()
         env["FLAGOS_LOG_DISPATCH"] = "1"
         code = (
@@ -119,8 +132,8 @@ class TestMusaDispatch:
             env=env,
             check=True,
         )
-        assert "[flagos dispatch] mm.out -> musa" in result.stderr, (
-            f"Expected musa dispatch log, got:\n{result.stderr}"
+        assert "[flagos dispatch] mm.out -> flagos_python" in result.stderr, (
+            f"Expected flagos_python dispatch log, got:\n{result.stderr}"
         )
 
 
@@ -292,9 +305,15 @@ class TestMusaCorrectness:
         torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=1e-4, atol=1e-4)
 
     @pytest.mark.musa
-    @pytest.mark.parametrize("op,fn", sorted(_CPU_FALLBACK_OPS.items()))
-    def test_cpu_fallback_ops_still_correct(self, op, fn):
-        """The ops with no mudnn mode stay correct via the cpu_fallback."""
+    @pytest.mark.parametrize("op,expr_fn", sorted(_FLAGGEMS_ONLY_OPS.items()))
+    def test_flaggems_only_ops_route_and_stay_correct(self, op, expr_fn):
+        """The ops with no mudnn mode land on FlagGems and stay numerically right."""
+        expr, fn = expr_fn
+        result = _run_dispatch_subprocess(expr, {"FLAGOS_LOG_DISPATCH": "1"})
+        assert f"[flagos dispatch] {op} -> flagos_python" in result.stderr, (
+            f"Expected flagos_python dispatch for {op}, got:\n{result.stderr}"
+        )
+
         torch.manual_seed(42)
         a_cpu = torch.randn(16, 8)
         torch.testing.assert_close(

@@ -462,10 +462,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     #if defined(FLAGOS_MUSA_KERNEL)
     #include "backends/musa/generated/musa_register.inc"
     #endif
-    // Registered unconditionally: backends_musa.conf routes ops to FlagGems by
-    // default, so these kFlagGems dispatcher slots must exist or those
-    // routes raise "backend not registered". Gating them on an opt-in env var
-    // was correct only while the default conf was mudnn-only.
+    // Registered unconditionally when FlagGems is compiled in: backends_musa.conf
+    // routes ops to FlagGems by default, so these kFlagGems dispatcher slots must
+    // exist or those routes raise "backend not registered". Gating them on an
+    // opt-in env var was correct only while the default conf was mudnn-only.
     #if defined(FLAGOS_FLAGGEMS_PYTHON)
     #include "backends/musa/generated/musa_flaggems_register.inc"
     #endif

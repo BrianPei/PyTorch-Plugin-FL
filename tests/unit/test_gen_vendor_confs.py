@@ -181,6 +181,95 @@ def test_vendor_registered_ops_includes_the_flaggems_inc():
     assert native < registered
 
 
+def test_musa_registers_all_flaggems_ops_except_known_failures():
+    """MUSA registers every FlagGems Python op, then routes it to flaggems except
+    for the ops in NATIVE_TRITON_GAPS['musa'].
+
+    Strategy: register everything → run CI → move failures to NATIVE_TRITON_GAPS.
+    This maximizes coverage while maintaining correctness via the fallback list.
+
+    Known failures (as of 2026-09-14 on MTT S5000, FlagGems 4d9c34775 +
+    flagtree 0.6.2a3+mthreads3.6); the full diagnosis for each lives on the set
+    itself in scripts/gen_vendor_confs.py:
+      - _conj: flag_gems materializes the conjugation that ATen keeps as a lazy
+        view, so test_math_bits_contract's `is_conj()` contract breaks. No mudnn
+        kernel either, so this one routes to `none` and ATen's composite runs.
+      - add/sub/div/mul.Tensor and their in-place forms add_/sub_/div_/mul_.Tensor:
+        a Python-float operand arrives as a float64 0-dim tensor (ATen
+        wrapped-number boxing) and flag_gems' pointwise promotion does not honour
+        is_wrapped_number, so the kernel promotes to fp64 and mthreads' LLVM
+        lowering has no double overload for llvm.musa.float2bfloat16. bf16 only.
+        The .Scalar forms are unaffected, but ATen boxes them (and
+        _foreach_add_, and so AdamW's foreach path) onto the .Tensor overload, so
+        the in-place entries are what actually keep those callers off the failing
+        kernel. mul_.Tensor is listed even though mul.Tensor is already native.
+      - index_add/index_add_: return all zeros instead of accumulating.
+      - randn/randn_like: crash unpacking generator state.
+      - sort/sort.stable: flag_gems' radix sort casts its histogram to uint32
+        internally and mudnn's CAST has no UInt16/32/64 case, so the cast raises
+        before the sort runs. mudnn's own sort is correct here; argsort and
+        msort decompose onto sort.
+
+    Ops in NATIVE_TRITON_GAPS are NOT registered (to avoid "backend not registered"
+    errors when they route to none/musa).
+    """
+    routes = g.build_all(CONF_DIR)["musa"][1]
+    native = g.vendor_native_ops("musa")
+    flaggems_py = g.flaggems_python_ops()
+    registered = g.vendor_registered_ops("musa")
+    gaps = g.NATIVE_TRITON_GAPS.get("musa", set())
+
+    # All FlagGems ops except those in gaps should be registered
+    expected_registered_from_flaggems = flaggems_py - gaps
+    assert expected_registered_from_flaggems <= registered, (
+        "Some FlagGems ops not registered"
+    )
+
+    # Count flaggems routes
+    flaggems_routes = {
+        op for op, key in routes.items() if key.split("#")[0].strip() == "flaggems"
+    }
+
+    # 482 FlagGems ops minus the gaps above are registered and routed to flaggems.
+    assert len(flaggems_routes) == len(expected_registered_from_flaggems)
+    assert gaps == {
+        "_conj",
+        "add.Tensor",
+        "add_.Tensor",
+        "div.Tensor",
+        "div_.Tensor",
+        "index_add",
+        "index_add_",
+        "mul_.Tensor",
+        "randn",
+        "randn_like",
+        "sort",
+        "sort.stable",
+        "sub.Tensor",
+        "sub_.Tensor",
+    }
+
+    # Known failures should NOT be routed to flaggems or be registered
+    for op in gaps:
+        assert op not in flaggems_routes, (
+            f"{op} in NATIVE_TRITON_GAPS but routed to flaggems"
+        )
+        # Ops in gaps that mudnn doesn't have will be unregistered
+        if op not in native:
+            assert op not in registered, (
+                f"{op} in gaps without native impl should be unregistered"
+            )
+
+    # Coverage: every FlagGems op outside the gaps reaches the flaggems key, and
+    # mudnn still backs the ops FlagGems has no kernel for. The absolute
+    # accelerated total is reported in the PR; what is pinned here is the
+    # invariant, so that adding an op to either coverage set never needs an edit.
+    mudnn_only = native - flaggems_py
+    assert mudnn_only, "mudnn must still back the ops FlagGems does not cover"
+    unrouted = sorted(op for op in flaggems_py - gaps if routes.get(op) == "none")
+    assert not unrouted, f"FlagGems ops left with no route: {unrouted}"
+
+
 def test_ascend_matmul_is_native_though_absent_from_its_inc():
     """matmul is claimed straight from register.cc under `#if defined(USE_ASCEND)`
     so the call hits fused aclnnMatmul instead of decomposing. WrapperMatmul
