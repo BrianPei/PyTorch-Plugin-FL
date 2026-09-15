@@ -5,11 +5,11 @@
 This is a manual hardware survey, not a pytest test. CI does not invoke files in
 ``tests/manual``.
 
-The unit of measurement is an active, unique FlagGems overload in the platform
-conf under test (``backends_cuda.conf`` for a CUDA host; each vendor has its own
-``backends_<platform>.conf``) -- a `flaggems` route, or the legacy
-`flagos_python` spelling the retired ``backends_flaggems.conf`` used. Each
-overload runs in a fresh child process through
+The unit of measurement is an active, unique FlagGems Python overload from the
+platform conf under test (``backends_cuda.conf`` for a CUDA host; each vendor has
+its own ``backends_<platform>.conf``). It is spelled ``flaggems`` in the current
+configurations and ``flagos_python`` in the historical ones; both name
+``Backend::kFlagGems``. Each overload runs in a fresh child process through
 ``torch.ops.aten.<name>.<overload>``. Inputs are synthesized from the real ATen
 schema and are first validated on CPU; device results are then compared with the
 same overload on CPU.
@@ -73,14 +73,13 @@ PROFILES = (
     },
 )
 
-HARNESS_VERSION = 4
+HARNESS_VERSION = 6
 
-# Route spellings that mean "the FlagGems Python/Triton path". `flagos_python`
-# is the name the retired backends_flaggems.conf used; the per-platform confs
-# generated from backend_coverage.py spell it `flaggems`. Accepting both is what
-# lets this survey measure a platform's real routes -- with only the legacy
-# spelling it reported every platform conf as having nothing to test.
-FLAGGEMS_ROUTES = frozenset({"flagos_python", "flaggems"})
+# Backend::kFlagGems under every spelling ParseBackendName accepts. The current
+# configurations spell it "flaggems"; the two legacy names stay in the set
+# because the baseline cohort was measured under them, and a conf that uses
+# either would otherwise be surveyed as if it routed nothing to FlagGems.
+_FLAGGEMS_PYTHON_BACKENDS = frozenset({"flaggems", "flaggems_python", "flagos_python"})
 
 
 def active_routes(path: Path) -> list[str]:
@@ -90,7 +89,7 @@ def active_routes(path: Path) -> list[str]:
         if not line or "=" not in line:
             continue
         op, backend = (part.strip() for part in line.split("=", 1))
-        if backend in FLAGGEMS_ROUTES:
+        if backend in _FLAGGEMS_PYTHON_BACKENDS:
             routes.add(op)
     return sorted(routes)
 
@@ -113,8 +112,16 @@ import re
 import sys
 import traceback
 
-import torch
 import torch_fl  # noqa: F401
+import torch
+
+# torch_fl first, on purpose. On the external-libtorch CUDA build the accelerator
+# .so is dlopened by torch_fl's import-time preload, and PyTorch caches its CUDA
+# hooks on the first `import torch`. With the order reversed every device op
+# raises "Cannot initialize CUDA without ATen_cuda library" while the routes
+# themselves are fine, which is exactly the failure the survey must not record
+# as a FlagGems defect. pytest achieves the same ordering through
+# tests/integration/conftest.py::pytest_configure.
 
 op_name = sys.argv[1]
 profiles = json.loads(sys.argv[2])
