@@ -15,6 +15,15 @@
 
 set -euo pipefail
 
+# The isolated venv runs a CPU-only torch wheel while borrowing the vendor
+# flagcx package. The image registers flagcx as a torch.backends entry point,
+# so torch 2.10 auto-loads it on every `import torch`; flagcx._C then pulls in
+# libc10_cuda.so, which the CPU wheel does not ship and which is not yet on
+# LD_LIBRARY_PATH during the early CPU_TORCH_ROOT probe. Disable device-backend
+# auto-loading tree-wide; torch_fl loads the CUDA stack explicitly via
+# LD_LIBRARY_PATH (.libtorch_cuda_assets) when a backend is actually needed.
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
 case "${CI_STAGE:-}" in
   build|integration) ;;
   *)
@@ -282,6 +291,7 @@ if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
     PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
     FLAGOS_CUDA_ASSETS_DIR FLAGGEMS_DIR FLAGCX_PATH \
+    TORCH_DEVICE_BACKEND_AUTOLOAD \
     CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
