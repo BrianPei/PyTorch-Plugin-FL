@@ -288,8 +288,13 @@ if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"
 fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
+  # PATH is managed via GITHUB_PATH above (venv/bin prepend). Writing PATH
+  # to GITHUB_ENV here as well double-sets it and has been observed to break
+  # bash resolution for later container steps (docker exec reports "bash:
+  # executable file not found"). Let GITHUB_PATH own PATH and only propagate
+  # the non-PATH environment below.
   for name in \
-    PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
+    VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR CUDA_HOME CUDA_PATH \
     FLAGOS_CUDA_ASSETS_DIR FLAGGEMS_DIR FLAGCX_PATH \
     TORCH_DEVICE_BACKEND_AUTOLOAD \
     CMAKE_PREFIX_PATH CPATH LIBRARY_PATH LD_LIBRARY_PATH; do

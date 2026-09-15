@@ -67,6 +67,13 @@ jobs:
           TORCH_FL_VENDOR_PYTHON: /opt/venv/bin/python
         run: bash .github/scripts/set_env_cuda.sh
 
+      - name: Debug PATH before build
+        run: |
+          echo "PATH=$PATH"
+          echo "which bash: $(command -v bash || echo NONE)"
+          ls -la /bin/bash /usr/bin/bash 2>&1 || true
+          python -m build --version 2>&1 || true
+
       - name: Build wheel
         run: python -m build --wheel --no-isolation
 
