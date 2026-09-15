@@ -64,6 +64,7 @@ jobs:
       - name: Prepare CUDA build environment
         env:
           CI_STAGE: integration
+          TORCH_FL_VENDOR_PYTHON: /opt/venv/bin/python
         run: bash .github/scripts/set_env_cuda.sh
 
       - name: Build wheel
