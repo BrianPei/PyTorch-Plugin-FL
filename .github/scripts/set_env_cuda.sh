@@ -285,7 +285,21 @@ print(f"CUDA assets: {Path('.libtorch_cuda_assets').resolve()}")
 PY
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
-  printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"
+  # GA container jobs resolve `bash` (and every step shell) from the PATH
+  # assembled out of GITHUB_PATH, not from the image env or GITHUB_ENV.
+  # Emitting only venv/bin left later steps with a PATH lacking /bin, so
+  # docker exec could not find bash ("executable file not found in $PATH").
+  # Lead with the venv, then re-emit the standard system directories so
+  # bash and other system tools stay resolvable.
+  printf '%s\n' \
+    "$VENV_ROOT/bin" \
+    /usr/local/sbin \
+    /usr/local/bin \
+    /usr/sbin \
+    /usr/bin \
+    /sbin \
+    /bin \
+    >> "$GITHUB_PATH"
 fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   # PATH is managed via GITHUB_PATH above (venv/bin prepend). Writing PATH
