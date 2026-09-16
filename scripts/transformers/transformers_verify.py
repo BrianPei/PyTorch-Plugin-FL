@@ -2,8 +2,10 @@
 """Verify Transformers findings in fresh pytest subprocesses."""
 
 import argparse
+import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,43 @@ from typing import Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEVICE_SPEC = REPO_ROOT / "tests" / "manual" / "hf_device_spec.py"
+SOURCE_HELPER = REPO_ROOT / "tests" / "manual" / "transformers_hf_source.py"
+
+# pytest's summary line is the only place the isolated run states how many tests
+# it ran; ``in 10.30s`` identifies that line.
+SUMMARY_LINE_RE = re.compile(r"\bin\s+\d+(?:\.\d+)?s\b")
+OUTCOME_COUNT_RE = re.compile(
+    r"(\d+)\s+(passed|failed|error|errors|skipped|xfailed|xpassed|deselected)\b"
+)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from transformers_triage import generate_fingerprint  # noqa: E402 - sibling tool
+
+
+def load_source_helper():
+    """Load the runner's cache helper by path.
+
+    The manual test tree is not an importable package, and its cache root is
+    the only place a version-matched source tree is guaranteed to exist.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "transformers_hf_source", SOURCE_HELPER
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def recorded_version(findings_json: Dict) -> Optional[str]:
+    """The transformers version the findings were measured against.
+
+    Read from the run's own environment instead of from the cache directory
+    listing: a cache holding several versions must not verify a finding
+    against a source tree that did not produce it.
+    """
+    environment = findings_json.get("environment") or {}
+    return environment.get("source_version") or environment.get("transformers")
 
 
 def isolated_env(test_source_dir: Path, workdir: Path) -> dict[str, str]:
@@ -22,15 +61,50 @@ def isolated_env(test_source_dir: Path, workdir: Path) -> dict[str, str]:
     env["FLAGOS_LOG_FALLBACK"] = "1"
     env.pop("TRANSFORMERS_TEST_DEVICE", None)
     env["TRANSFORMERS_TEST_DEVICE_SPEC"] = "hf_device_spec.py"
+    # This mirrors the runner's ``child_env``. This repository also has a
+    # top-level ``tests`` package, so the source tree stays ahead of the
+    # repository root; the repository root is moved to the end rather than
+    # dropped, because ``hf_device_spec.py`` imports ``torch_fl`` and a checkout
+    # that was never installed can only provide it through the caller's
+    # PYTHONPATH. Dropping it made every isolated run die of
+    # ``ModuleNotFoundError: No module named 'torch_fl'`` before collecting a
+    # test, which the verifier could only record as ``ERROR``.
     entries = [
-        entry
+        str(Path(entry).resolve())
         for entry in env.get("PYTHONPATH", "").split(os.pathsep)
-        if entry and Path(entry).resolve() != REPO_ROOT
+        if entry
     ]
+    repo_entries = [entry for entry in entries if entry == str(REPO_ROOT)]
+    path_entries = [entry for entry in entries if entry != str(REPO_ROOT)]
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(workdir), str(test_source_dir), str(test_source_dir / "utils"), *entries]
+        [
+            str(workdir),
+            str(test_source_dir),
+            str(test_source_dir / "utils"),
+            *path_entries,
+            *repo_entries,
+        ]
     )
     return env
+
+
+def isolated_outcomes(output: str) -> tuple[int, set[str]]:
+    """The test count and outcome names pytest reported for one isolated run.
+
+    "An isolation result is valid only when pytest collected exactly one test"
+    is the documented rule, and this is the only place that can enforce it: a
+    nodeid pytest cannot select exits with a usage error, which used to be
+    recorded as an ordinary ``ERROR`` beside real per-test evidence. Reading the
+    last line that carries a duration keeps a traceback mentioning "2 failed"
+    from being counted as a result.
+    """
+    lines = [line for line in output.splitlines() if SUMMARY_LINE_RE.search(line)]
+    if not lines:
+        return 0, set()
+    matches = OUTCOME_COUNT_RE.findall(lines[-1])
+    return sum(int(count) for count, _ in matches), {
+        name.rstrip("s") for _, name in matches
+    }
 
 
 def run_isolated_test(
@@ -96,30 +170,81 @@ def run_isolated_test(
 
     duration = time.time() - started
     combined = result.stdout + result.stderr
-    if result.returncode == 0:
-        status = "SKIP" if " skipped" in combined.lower() else "PASS"
+    reported, outcomes = isolated_outcomes(combined)
+    if reported != 1:
+        # A nodeid that cannot be selected, or a run that collected the whole
+        # directory, says nothing about this finding. Recording it as anything
+        # but ERROR would turn an empty rerun into evidence.
+        status = "ERROR"
+        detail = (
+            f"the isolated run reported {reported} tests instead of one; the "
+            "nodeid did not select a single test\n" + combined[-8000:]
+        )
+    elif "error" in outcomes:
+        # A setup or teardown failure is not a per-test device defect.
+        status = "ERROR"
+        detail = combined[-8000:]
+    elif result.returncode == 0:
+        status = "SKIP" if "skipped" in outcomes else "PASS"
+        detail = combined[-8000:]
     elif result.returncode == 1:
         status = "FAIL"
+        detail = combined[-8000:]
     else:
         status = "ERROR"
+        detail = combined[-8000:]
 
     return {
         "status": status,
-        "detail": combined[-8000:],
+        "detail": detail,
         "duration_s": round(duration, 1),
         "command": command_str,
         "returncode": result.returncode,
+        "reported_tests": reported,
     }
 
 
 def determine_verdict(isolation_status: str, original_class: str) -> str:
-    """Map an isolation outcome to a filing verdict."""
+    """Map an isolation outcome to a filing verdict.
+
+    ``original_class`` is not used to decide the verdict, but it is part of the
+    signature because the verdict only means something for the class it was
+    measured on: :func:`apply_isolation` owns the class refinement.
+    """
     del original_class
     if isolation_status in ("FAIL", "TIMEOUT"):
         return "CONFIRMED"
     if isolation_status in ("PASS", "SKIP"):
         return "COLLATERAL"
     return "INCONCLUSIVE"
+
+
+def apply_isolation(finding: Dict, isolation_result: Dict) -> None:
+    """Record what an isolated re-run showed about one finding.
+
+    A test that hangs alone is a crash-shaped defect. The batch classification
+    saw it alongside hundreds of other failures of the same run, so isolation is
+    the better evidence for the class, and the fingerprint is recomputed to stay
+    the hash of the class it now carries.
+    """
+    status = isolation_result["status"]
+    finding["isolation_status"] = status
+    finding["isolation_detail"] = isolation_result["detail"]
+    finding["isolation_duration_s"] = isolation_result["duration_s"]
+    finding["isolation_command"] = isolation_result["command"]
+    finding["isolation_reported_tests"] = isolation_result.get("reported_tests")
+    if status == "TIMEOUT" and finding["class"] != "CRASH":
+        finding["isolation_note"] = (
+            f"the isolated run timed out; reclassified from {finding['class']} to CRASH"
+        )
+        finding["class"] = "CRASH"
+        finding["fingerprint"] = generate_fingerprint(
+            "CRASH",
+            finding.get("component", "unknown"),
+            finding["subject"],
+            finding["mechanism"],
+        )
+    finding["verdict"] = determine_verdict(status, finding["class"])
 
 
 def verify_findings(
@@ -162,13 +287,7 @@ def verify_findings(
         isolation_result = run_isolated_test(
             finding["representative_nodeid"], test_source_dir, timeout
         )
-        finding["isolation_status"] = isolation_result["status"]
-        finding["isolation_detail"] = isolation_result["detail"]
-        finding["isolation_duration_s"] = isolation_result["duration_s"]
-        finding["isolation_command"] = isolation_result["command"]
-        finding["verdict"] = determine_verdict(
-            isolation_result["status"], finding["class"]
-        )
+        apply_isolation(finding, isolation_result)
         print(
             f"  [{index}/{len(pending)}] {finding['class']} {finding['subject']}: "
             f"{isolation_result['status']} → {finding['verdict']}"
@@ -218,12 +337,14 @@ def main() -> int:
     parser.add_argument(
         "--test-source-dir",
         type=Path,
-        default=Path("/root/.cache/torch_fl/hf-tests"),
-        help="Exact Transformers source tree or its versioned cache root",
+        help="Exact Transformers source tree or its versioned cache root "
+        "(default: the cache the official runner writes to, honouring "
+        "HF_COVERAGE_CACHE)",
     )
     parser.add_argument(
         "--transformers-version",
-        help="Select an exact transformers-X.Y.Z cache directory",
+        help="Select an exact transformers-X.Y.Z cache directory "
+        "(default: the version recorded in the findings JSON)",
     )
     parser.add_argument(
         "--timeout", type=int, default=120, help="Per-test timeout in seconds"
@@ -238,19 +359,32 @@ def main() -> int:
 
     if not args.input.exists():
         raise FileNotFoundError(f"Input JSON not found: {args.input}")
-    if not args.test_source_dir.exists():
-        raise FileNotFoundError(
-            f"Test source directory not found: {args.test_source_dir}\n"
-            "Run transformers_hf_tests.py first to cache the official source."
-        )
-
-    test_source_dir = resolve_test_source(
-        args.test_source_dir, args.transformers_version
-    )
-    print(f"Using test source: {test_source_dir}")
 
     with open(args.input) as file:
         findings_json = json.load(file)
+
+    test_source_root = args.test_source_dir
+    if test_source_root is None:
+        # ``cache_root()`` rather than the module constant, so that the
+        # documented HF_COVERAGE_CACHE override resolves here exactly as it does
+        # in the runner that wrote the cache.
+        test_source_root = Path(load_source_helper().cache_root()).expanduser()
+    if not test_source_root.exists():
+        raise FileNotFoundError(
+            f"Test source directory not found: {test_source_root}\n"
+            "Run transformers_hf_tests.py first to cache the official source, or "
+            "pass --test-source-dir."
+        )
+    version = args.transformers_version or recorded_version(findings_json)
+    if version is None:
+        print(
+            "Warning: the findings JSON records no transformers version; falling "
+            "back to the newest cached source tree"
+        )
+
+    test_source_dir = resolve_test_source(test_source_root, version)
+    print(f"Using test source: {test_source_dir}")
+
     result = verify_findings(findings_json, test_source_dir, args.timeout, args.workers)
 
     print("\nVerification summary:")
@@ -260,6 +394,18 @@ def main() -> int:
     with open(args.out, "w") as file:
         json.dump(result, file, indent=2)
     print(f"\nWriting {args.out}")
+
+    # An isolation that selected no test measured nothing. That is a defect in
+    # the harness, not a result, and reporting it as an ordinary run would let
+    # "0 new findings" stand for "0 findings checked".
+    verified = [f for f in result["findings"] if f.get("verification_required", True)]
+    if verified and all(f.get("isolation_reported_tests") == 0 for f in verified):
+        print(
+            f"error: none of the {len(verified)} isolated runs selected a single "
+            "test; nothing was measured, so no finding is confirmed",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

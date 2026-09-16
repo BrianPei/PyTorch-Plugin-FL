@@ -43,13 +43,31 @@ processes (`collected == 1` per invocation).
 
 The corrected verification grouped the 20 occurrences into these tracked causes:
 
-| Class | Subject | Affected tests | Issue |
-| --- | --- | ---: | --- |
-| `CRASH` | qwen3 device context poisoning / model parallelism trigger | 1 | [#250](https://github.com/flagos-ai/Torch-FL/issues/250), [#265](https://github.com/flagos-ai/Torch-FL/issues/265) |
-| `OP_UNSUPPORTED` | mudnn softmax rejects non-contiguous input | 9 | [#262](https://github.com/flagos-ai/Torch-FL/issues/262), [#268](https://github.com/flagos-ai/Torch-FL/issues/268) |
-| `FEATURE_UNSUPPORTED` | ProcessGroupGloo rejects `flagos` tensors | 6 | [#263](https://github.com/flagos-ai/Torch-FL/issues/263) |
-| `FEATURE_UNSUPPORTED` | TorchInductor/Triton requires CUDA libraries | 2 | [#264](https://github.com/flagos-ai/Torch-FL/issues/264) |
-| `OP_UNSUPPORTED` | mudnn `TRUEDIV` with `INT64` | 2 | [#266](https://github.com/flagos-ai/Torch-FL/issues/266) |
+| Fingerprint | Class | Subject | Affected tests | Issue |
+| --- | --- | --- | ---: | --- |
+| | `CRASH` | qwen3 device context poisoning / model parallelism trigger | 1 | [#250](https://github.com/flagos-ai/Torch-FL/issues/250), [#265](https://github.com/flagos-ai/Torch-FL/issues/265) |
+| | `OP_UNSUPPORTED` | mudnn softmax rejects non-contiguous input | 9 | [#262](https://github.com/flagos-ai/Torch-FL/issues/262), [#268](https://github.com/flagos-ai/Torch-FL/issues/268) |
+| | `FEATURE_UNSUPPORTED` | ProcessGroupGloo rejects `flagos` tensors | 6 | [#263](https://github.com/flagos-ai/Torch-FL/issues/263) |
+| | `FEATURE_UNSUPPORTED` | TorchInductor/Triton requires CUDA libraries | 2 | [#264](https://github.com/flagos-ai/Torch-FL/issues/264) |
+| | `OP_UNSUPPORTED` | mudnn `TRUEDIV` with `INT64` | 2 | [#266](https://github.com/flagos-ai/Torch-FL/issues/266) |
+
+The `Fingerprint` column is what deduplication keys on: `transformers_deduplicate.py`
+reads it from each baseline's cause table, and `transformers_file_issues.py`
+fills it in when it records a newly filed issue. The five rows above are left
+blank on purpose. They were filed before the fingerprint convention existed and
+inventing hashes for them would defeat the check they exist to serve, so a
+re-measurement of this baseline is what fills them in. In the meantime a
+fingerprint match is not the only dedup path: the subject and component are also
+searched, and a semantic match is surfaced as `REVIEW_CANDIDATE` for a human to
+compare rather than treated as an automatic duplicate.
+
+Each `## Baseline:` section describes one board, and deduplication reads only the
+sections belonging to the board a run measured — `transformers_deduplicate.py`
+matches its `--hardware` label against the section heading and reports the
+sections it skipped. This is not a formality: two vendors may register their
+PrivateUse1 device under the same name, so the heading is the only place the
+boards can be told apart, and an unscoped read would let a measurement on one
+board be suppressed as already known by a measurement on another.
 
 Issue #267 was closed and replaced by #268 because its first draft listed
 incorrect parameterized nodeids. The initial baseline remains useful as the raw
