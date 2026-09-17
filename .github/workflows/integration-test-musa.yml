@@ -60,6 +60,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cache pip downloads across runs. The cache only skips the download,
+      # not the install, so the environment prepared by set_env_musa.sh is
+      # still rebuilt fresh each run.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: musa-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          restore-keys: |
+            musa-pip-${{ runner.os }}-
+
       - name: Prepare MUSA build environment
         env:
           CI_STAGE: integration

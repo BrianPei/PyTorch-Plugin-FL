@@ -61,6 +61,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cache pip downloads across runs. The cache only skips the download,
+      # not the install, so the environment prepared by set_env_dcu.sh is
+      # still rebuilt fresh each run.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: dcu-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          restore-keys: |
+            dcu-pip-${{ runner.os }}-
+
       - name: Prepare DCU build environment
         env:
           CI_STAGE: integration

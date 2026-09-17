@@ -62,6 +62,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cache pip downloads across runs. The cache only skips the download,
+      # not the install, so the environment prepared by the setup script is
+      # still rebuilt fresh each run. Keyed on display_name so each platform
+      # using this common workflow gets its own cache scope, and a platform's
+      # build job shares its cache with the same platform's integration job.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ inputs.display_name }}-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          restore-keys: |
+            ${{ inputs.display_name }}-pip-${{ runner.os }}-
+
       - name: Prepare platform environment
         env:
           CI_STAGE: build
