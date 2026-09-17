@@ -4,20 +4,21 @@ This document lists configuration variables that control torch_fl's build, opera
 
 ## Build Selection
 
-These variables control which backends and kernels are compiled into the wheel.
+These variables control which kernel sets are compiled into the wheel.
+Which chip they apply to is `ACCELERATOR`'s job alone -- there are no
+per-chip switches. Defaults below are the CMake defaults; `setup.py` forces
+per-accelerator values (see each branch) and any explicit environment value
+wins over both via the generic pass-through.
 
 | Variable | Scope | Default | Purpose |
 |----------|-------|---------|---------|
 | `ACCELERATOR` | Build | `cuda` | Hardware platform: `cuda`, `metax`, `ascend`, `tsingmicro`, `dcu`, `gcu`, `musa`, or `bpu` |
+| `VENDOR_KERNEL` | Build | `ON` | Build the `ACCELERATOR` vendor's native kernels (no-op where the vendor ships none: `cuda`, `dcu`, `tsingmicro`, `bpu`). `setup.py` forces `OFF` for metax boxing builds |
+| `FLAGGEMS_KERNEL` | Build | `ON` | FlagGems integration: Python kernel wrappers (calls via Python, no C++ linking); set `OFF` for a slim pure-boxing build |
+| `BOXING_KERNEL` | Build | `ON` | CUDA Boxing integration: generated boxing kernels for CUDA-ABI vendors (libtorch extracted from the vendor torch package); `setup.py` forces `OFF` for `gcu`/`musa`, which have no CUDA runtime |
+| `FLAGGEMS_CPP` | Build | `ON` | Enable the FlagGems C++ wrapper (`cpp_wrapper`): links `liboperators.so`; `setup.py` forces `OFF` unless a vendor-built FlagGems is pointed at via `FLAGGEMS_DIR` |
+| `TILEOPS_KERNEL` | Build | `ON` on CUDA, forced `OFF` elsewhere | TileOps kernel wrappers; `setup.py` forces `OFF` for non-CUDA builds |
 | `FLAGOS_BUILD_JOBS` | Build | System CPU count | Parallel jobs for CMake build |
-| `CUDA_KERNEL` | Build | `ON` | Enable CUDA boxing kernels; set `OFF` for pure vendor builds (Ascend/MUSA/GCU) |
-| `ASCEND_KERNEL` | Build | `OFF` | Enable Ascend ACL kernels; set `ON` for Ascend builds |
-| `GCU_KERNEL` | Build | Auto (enabled when `ACCELERATOR=gcu`) | Enable Enflame GCU topsaten kernels |
-| `MUSA_KERNEL` | Build | Auto (enabled when `ACCELERATOR=musa`) | Enable Moore Threads MUSA mudnn kernels |
-| `METAX_KERNEL` | Build | Auto (enabled when `ACCELERATOR=metax`) | Enable MetaX C++ kernel build |
-| `FLAGGEMS_KERNEL` | Build | `ON` | Enable FlagGems C++ kernel wrappers (liboperators.so); set `OFF` for pure vendor builds |
-| `FLAGGEMS_PYTHON` | Build | `OFF` | Enable FlagGems Python wrapper backend registration |
-| `FLAGOS_METAX_BOXING` | Build | `OFF` | Enable MetaX boxing mode (reuse CUDA boxing kernels + optional FlagGems, no mxcc backend) |
 
 ## SDK and Compiler Discovery
 
@@ -42,7 +43,7 @@ These variables control which backend implementation (CUDA boxing, vendor C++, F
 
 | Variable | Scope | Default | Purpose |
 |----------|-------|---------|---------|
-| `FLAGOS_BACKEND_CONFIG` | Runtime | Auto-selected by `torch_fl.__init__` based on hardware and switches below | Absolute path to a `backends_*.conf` file; overrides all auto-detection |
+| `FLAGOS_BACKEND_CONFIG` | Runtime | Derived from the build record (`_build_config.py` + `lib/flagos_platform`) | Absolute path to a `backends_*.conf` file; overrides auto-detection |
 | `FLAGOS_USE_FLAGGEMS` | Retired (no-op) | — | Removed: routing is stated per op in `backends_<platform>.conf` (FlagGems first, vendor fallback, CPU fallback). `ALL_USE_FLAGGEMS=1` / `ALL_USE_VENDOR=1` collapse the table onto one backend family for A/B measurement; the dispatcher raises instead of falling back when the resolved backend has no compiled implementation |
 | `FLAGOS_USE_FLAGGEMS_CPP` | Runtime | `0` (off) | Enable FlagGems C++ operators (kFlagOs dispatch, no GIL); selects `backends_flaggems_cpp.conf`; requires wheel built with `FLAGGEMS_KERNEL=ON` |
 | `FLAGOS_OP_<name>` | Runtime | No default | Per-operator backend override (e.g., `FLAGOS_OP_add__Tensor=cuda`); replace `.` with `__` in op names |
@@ -54,7 +55,7 @@ These variables control which backend implementation (CUDA boxing, vendor C++, F
 
 **Apex compatibility**: On CUDA-ABI boxing vendors, Torch-FL automatically patches Apex's common `MultiTensorApply` entry point when Apex is imported. The patch converts flagos tensors to zero-copy CUDA views for direct `amp_C` calls and converts CUDA results back to flagos views. It is optional and does not apply to native non-CUDA backends. Set `FLAGOS_DISABLE_APEX_COMPAT=1` to disable it.
 
-**Note on auto-detection**: `FLAGOS_BACKEND_CONFIG` is normally set by `torch_fl.__init__._select_backend_config()`, which detects the hardware platform (via `/dev/davinci*`, `/dev/mxcd`, the `flagos_platform` marker, or build-time `ACCELERATOR`) and applies the `FLAGOS_USE_FLAGGEMS_CPP` / `FLAGOS_METAX_BOXING` switches to pick the correct config. Users should override `FLAGOS_BACKEND_CONFIG` only for testing or debugging.
+**Note on auto-detection**: `FLAGOS_BACKEND_CONFIG` is normally set by `torch_fl.__init__._select_backend_config()`, which reads the build record: the accelerator the wheel was built for (from `_build_config.py`) plus the `lib/flagos_platform` marker a native-kernel build writes. There is no mode variable — a wheel's routing follows from what was compiled in. Users should override `FLAGOS_BACKEND_CONFIG` only for testing or debugging.
 
 ## Runtime and Packaging
 
