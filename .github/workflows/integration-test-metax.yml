@@ -59,6 +59,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Self-hosted runners accumulate stale wheels in ~/.cache/pip across
+      # runs (pip no longer passes --no-cache-dir); wipe before restore so
+      # the uploaded archive stays bounded to this run's downloads.
+      - name: Reset pip cache dir
+        shell: bash
+        run: rm -rf ~/.cache/pip
+
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by set_env_metax.sh is
       # still rebuilt fresh each run.
