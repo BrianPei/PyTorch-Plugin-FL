@@ -31,7 +31,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pip_retry() {
   local attempt=1
   while true; do
-    if python -m pip install --retries 10 --timeout 300 --no-cache-dir "$@"; then
+    if python -m pip install --retries 10 --timeout 300 "$@"; then
       return 0
     fi
     if (( attempt >= 5 )); then

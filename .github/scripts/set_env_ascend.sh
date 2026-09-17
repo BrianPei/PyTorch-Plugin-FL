@@ -263,7 +263,7 @@ pip_retry() {
     # Raise pip's own retry limit and timeout for large wheels on unstable
     # networks: the flagtree wheel is ~200 MB, and the default timeout (15s) and
     # retries (5) are not enough when the mirror link drops mid-download.
-    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 --no-cache-dir "$@"; then
+    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 "$@"; then
       return 0
     fi
     if (( attempt >= 5 )); then

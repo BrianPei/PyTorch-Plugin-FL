@@ -255,7 +255,7 @@ export PIP_DEFAULT_TIMEOUT=120
 pip_retry() {
   local attempt=1
   while true; do
-    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 --no-cache-dir "$@"; then
+    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 "$@"; then
       return 0
     fi
     if ((attempt >= 5)); then
