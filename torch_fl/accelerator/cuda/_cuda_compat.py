@@ -235,6 +235,8 @@ def cuda_graph_supported() -> bool:
 def _device_index(device: Union[torch.device, int, str, None]) -> int:
     if device is None:
         return 0
+    if isinstance(device, torch.cuda.device):
+        return device.idx
     if isinstance(device, torch.device):
         return device.index if device.index is not None else 0
     if isinstance(device, str):

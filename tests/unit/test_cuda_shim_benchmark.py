@@ -49,6 +49,12 @@ _Placeholder = type(
 )
 
 
+def test_device_index_accepts_cuda_device_context():
+    """Third-party probes pass ``torch.cuda.device`` context objects."""
+    device = torch.cuda.device(3)
+    assert _cuda_compat._device_index(device) == 3
+
+
 def test_graph_capture_is_read_from_the_binding_not_the_attribute(monkeypatch):
     monkeypatch.setattr(torch._C, "_CUDAGraph", _Binding, raising=False)
     assert _cuda_compat.cuda_graph_supported() is True
