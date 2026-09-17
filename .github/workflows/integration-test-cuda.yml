@@ -70,6 +70,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cache pip downloads across runs so the heavy wheels (CPU torch,
+      # transformers, flagtree) are fetched once and reused. The cache only
+      # skips the download, not the install, so the isolated venv is still
+      # rebuilt fresh by set_env_cuda.sh each run; this never risks reusing a
+      # stale environment the way a venv cache would.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          restore-keys: |
+            cuda-pip-${{ runner.os }}-py312-
+
       - name: Prepare CUDA build environment
         env:
           CI_STAGE: integration
