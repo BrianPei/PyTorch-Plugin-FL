@@ -12,25 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.machinery
+import importlib.util
 import os
+from pathlib import Path
 
 import pytest
+
+
+def _build_accelerator() -> str:
+    """The accelerator the installed wheel was built for ("" if unknown).
+
+    From the build record setup.py writes (torch_fl/_build_config.py), the same
+    source torch_fl itself reads: FLAGOS_ACCELERATOR is a build input and no
+    longer overrides the record at run time, so reading it here would let a
+    stale export from another build choose this gate's skip set.
+
+    find_spec() locates the package without executing it, so this stays free of
+    the torch import that must not happen before the assets are preloaded; the
+    record itself imports nothing.
+    """
+    try:
+        spec = importlib.util.find_spec("torch_fl")
+    except (ImportError, ValueError):
+        return ""
+    if spec is None or not spec.origin:
+        return ""
+    path = Path(spec.origin).resolve().parent / "_build_config.py"
+    try:
+        loader = importlib.machinery.SourceFileLoader("_flagos_build_record", str(path))
+        module = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader(loader.name, loader)
+        )
+        loader.exec_module(module)
+    except (OSError, ImportError, SyntaxError):
+        # A source checkout with no build yet; the marker below is what
+        # identifies such an install.
+        return ""
+    return str(getattr(module, "ACCELERATOR", "")).strip().lower()
+
+
+def _resolved_conf() -> str:
+    """Path of the conf the routing table is read from, "" if none resolved.
+
+    Asked of torch_fl rather than read from the environment, which torch_fl no
+    longer writes: FLAGOS_BACKEND_CONFIG now holds only what a user set, and the
+    wheel's own choice lives in torch_fl.backend_config_path(). A stub package
+    with no accessor (the unit tests import one) falls back to the variable,
+    which is what that accessor itself falls back to.
+    """
+    try:
+        import torch_fl
+    except ImportError:
+        return os.environ.get("FLAGOS_BACKEND_CONFIG", "")
+    resolve = getattr(torch_fl, "backend_config_path", None)
+    return resolve() if resolve else os.environ.get("FLAGOS_BACKEND_CONFIG", "")
 
 
 def _detect_platform() -> str:
     """Infer the active hardware/backend platform.
 
-    ACCELERATOR is a *build*-time variable, so it is usually absent when running
-    the tests against an installed wheel. The lib/flagos_platform marker that
-    native-kernel builds write is authoritative in that case, and the resolved
-    FLAGOS_BACKEND_CONFIG name is the last resort.
+    The accelerator is read from the wheel's build record, which is what
+    torch_fl consults. The lib/flagos_platform marker that native-kernel builds
+    write is authoritative for those platforms, and the name of the conf torch_fl
+    resolved is the last resort.
 
-    Every chip has its own ACCELERATOR value, PPU included (it is a CUDA-ABI
-    boxing vendor, not a cuda build). Older PPU wheels reported ACCELERATOR=cuda,
-    so the PPU_SDK environment and the lib_ppu/ bundle directory stay
-    as fallbacks for them.
+    Every chip has its own record value, PPU included (it is a CUDA-ABI boxing
+    vendor, not a cuda build). Wheels built before PPU had a value of its own
+    report cuda and are still recognised through the PPU_SDK environment or the
+    lib_ppu/ bundle directory.
     """
-    accelerator = os.environ.get("ACCELERATOR", "").lower()
+    accelerator = _build_accelerator()
     if accelerator == "ascend":
         return "ascend"
     if accelerator in ("metax", "maca"):
@@ -64,7 +116,7 @@ def _detect_platform() -> str:
     except ImportError:
         pass
 
-    backend_cfg = os.environ.get("FLAGOS_BACKEND_CONFIG", "").lower()
+    backend_cfg = _resolved_conf().lower()
     if "ascend" in backend_cfg:
         return "ascend"
     if "metax" in backend_cfg:
@@ -98,18 +150,18 @@ _PLATFORM_SKIP_MARKERS: dict[str, tuple[str, ...]] = {
 
 
 def _flaggems_cpp_enabled() -> bool:
-    """True when the FlagGems C++ runtime path is switched on (FLAGOS_USE_FLAGGEMS_CPP=1).
+    """True when this wheel has the FlagGems C++ runtime compiled in.
 
-    Tests marked ``flaggems_cpp`` require a wheel built with FLAGGEMS_CPP=ON
-    (liboperators.so linked in) and FLAGOS_USE_FLAGGEMS_CPP=1 at runtime; they
-    are skipped when the env var is off (default).
+    Read from the build record (setup.py writes ``KERNELS`` into
+    ``torch_fl/_build_config.py``), not from an environment variable. It used to
+    be ``FLAGOS_USE_FLAGGEMS_CPP``, which had to be exported by hand and kept in
+    step with the ``FLAGOS_BUILD_FLAGGEMS_CPP`` build switch; the record cannot disagree with
+    the wheel it is inside, so tests marked ``flaggems_cpp`` are now collected
+    exactly when the feature exists.
     """
-    return os.environ.get("FLAGOS_USE_FLAGGEMS_CPP", "0").lower() not in (
-        "0",
-        "",
-        "off",
-        "false",
-    )
+    from torch_fl import _env
+
+    return "flaggems_cpp" in _env.build_kernels()
 
 
 def pytest_collection_modifyitems(
@@ -133,13 +185,14 @@ def pytest_collection_modifyitems(
                 )
             )
             continue
-        # The FlagGems C++ path requires a FLAGGEMS_CPP=ON wheel and runtime env.
+        # The FlagGems C++ path requires a wheel built with the flaggems_cpp
+        # kernel set linked in (liboperators.so).
         if item.get_closest_marker("flaggems_cpp") and not flaggems_cpp_on:
             item.add_marker(
                 pytest.mark.skip(
                     reason=(
-                        "FlagGems C++ path is off "
-                        "(set FLAGOS_USE_FLAGGEMS_CPP=1 with a FLAGGEMS_CPP=ON wheel)"
+                        "FlagGems C++ kernels are not compiled into this wheel "
+                        "(rebuild with FLAGOS_BUILD_FLAGGEMS_CPP=ON)"
                     )
                 )
             )
@@ -181,8 +234,7 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "flaggems_cpp: requires torch_fl built with FLAGGEMS_CPP=ON and "
-        "FLAGOS_USE_FLAGGEMS_CPP=1 at runtime",
+        "flaggems_cpp: requires torch_fl built with FLAGOS_BUILD_FLAGGEMS_CPP=ON",
     )
     config.addinivalue_line(
         "markers", "flaggems_python: requires FlagGems Python wrapper backend"

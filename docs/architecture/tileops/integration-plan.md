@@ -62,7 +62,7 @@ adapters**.
 ## 2. Findings from hardware verification
 
 Environment: H800 xN, torch 2.10.0+cu130, CUDA 13.0, SM90, Python 3.12.
-`torch_fl` builds cleanly with `ACCELERATOR=cuda CUDA_KERNEL=1 FLAGGEMS_KERNEL=0
+`torch_fl` builds cleanly with `FLAGOS_ACCELERATOR=cuda CUDA_KERNEL=1 FLAGOS_BUILD_FLAGGEMS=0
 FLAGGEMS_PYTHON=0 python setup.py build_ext --inplace`.
 
 ### 2.1 The dependency stack must be pinned exactly (or import crashes)
@@ -311,9 +311,12 @@ The plan is to **reuse that machinery**, adding:
   `backends_cuda.conf`, with only the allowlisted operators changed to
   `= tileops` and everything else left at `cuda`.
 - A `FLAGOS_USE_TILEOPS=1` branch in
-  `torch_fl/__init__.py::_select_backend_config()` selecting that conf.
+  `torch_fl/__init__.py::_select_backend_config()` selecting that conf. (Neither
+  the separate conf nor that switch survived review: TileOPs candidates are the
+  ops the platform conf itself annotates `# tileops`, selected with
+  `FLAGOS_FORCE_BACKEND=tileops`.)
 
-The benefit: routing granularity, env overrides, `FLAGOS_LOG_DISPATCH=1` logging
+The benefit: routing granularity, env overrides, `FLAGOS_LOG=dispatch` logging
 and the existing dispatch test conventions (`tests/integration/ops/test_*_dispatch.py`
 has mature templates) all come for free, without introducing a second mechanism.
 
@@ -348,7 +351,7 @@ wrong**, on both halves:
 With the cost neutral, the dispatcher path wins on everything else. Registering
 on PrivateUse1 in Python intercepts *before* the C++ dispatcher runs, so a route
 bound that way never reaches its own routing config -- which meant
-`FLAGOS_OP_<op>=<backend>` and `FLAGOS_LOG_DISPATCH` had to be reimplemented in
+`FLAGOS_OP_<op>=<backend>` and `FLAGOS_LOG=dispatch` had to be reimplemented in
 Python to work at all, and `FLAGOS_USE_TILEOPS=1` selected a conf file that
 nothing consulted (it needed a separate `enable_tileops_for_flagos()` call).
 Going through the dispatcher makes all three work by construction and deletes
@@ -436,7 +439,7 @@ That work should be a separate PR, after the Stage A skeleton lands.
 
 1. **PR1 skeleton**: `Backend::kTileOps` enum, dispatcher slot, conf parsing,
    `backends_tileops.conf`, and the `FLAGOS_USE_TILEOPS` switch. Plumbing only,
-   no operators.
+   no operators. (Landed without the separate conf and switch — see §3.1.)
 2. **PR2 Stage A**: `torch_fl/tileops/runtime.py` (instance cache, boxing,
    `mm`/`bmm` adapters), dispatch and numerical tests following the
    `tests/integration/ops/test_*_dispatch.py` template, the SM90 gate, plus docs

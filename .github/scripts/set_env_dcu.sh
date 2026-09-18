@@ -133,7 +133,7 @@ if [[ ! -f "$VENDOR_TORCH_LIB/libtorch_hip.so" ]]; then
   echo "::error::$VENDOR_TORCH_LIB has no libtorch_hip.so, not a DTK torch/lib" >&2
   exit 1
 fi
-export FLAGOS_DCU_TORCH_LIB="$VENDOR_TORCH_LIB"
+export FLAGOS_VENDOR_TORCH_LIB="$VENDOR_TORCH_LIB"
 
 # CPU torch base version must match the vendor's for ABI compatibility. The
 # DTK wheel version (e.g. 2.10.0+das on the current CI image) may differ across
@@ -141,7 +141,7 @@ export FLAGOS_DCU_TORCH_LIB="$VENDOR_TORCH_LIB"
 # vendor wheel instead of hard-coding it.
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-$VENDOR_TORCH_BASE_VERSION}"
 
-# FlagGems C++ package is optional for DCU (FLAGGEMS_CPP=OFF in setup.py);
+# FlagGems C++ package is optional for DCU (FLAGOS_BUILD_FLAGGEMS_CPP=OFF in setup.py);
 # the flaggems runtime path uses the DTK triton hcu backend + Python flag_gems.
 # Probe it for CMAKE_PREFIX_PATH but never fail when absent.
 VENDOR_FLAGGEMS_DIR="$("$VENDOR_PYTHON" - <<'PY'
@@ -341,16 +341,15 @@ export VIRTUAL_ENV="$VENV_ROOT"
 export PATH="$VENV_ROOT/bin:$PATH"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH=""
-export ACCELERATOR=dcu
+export FLAGOS_ACCELERATOR=dcu
 # FlagGems on DCU goes through the Python (Triton) path, not the C++ wrapped
 # one: the flagtree hcu backend lands the kernels on the HIP runtime, which is
 # exactly the CUDA-compatible path a kernel library needs here. Mirrors the
-# backend selection set_env_musa.sh performs -- FLAGGEMS_CPP is the C++
+# backend selection set_env_musa.sh performs -- FLAGOS_BUILD_FLAGGEMS_CPP is the C++
 # switch and stays off so nothing tries to rebuild flag_gems
 # against the DCU toolchain.
-export FLAGGEMS_CPP=0
-export FLAGGEMS_KERNEL=1
-export FLAGOS_USE_FLAGGEMS_CPP=0
+export FLAGOS_BUILD_FLAGGEMS_CPP=0
+export FLAGOS_BUILD_FLAGGEMS=1
 export FLAGGEMS_DIR="$VENDOR_FLAGGEMS_DIR"
 export FLAGCX_PATH="${FLAGCX_PATH:-/opt/FlagCX}"
 
@@ -402,7 +401,7 @@ fi
 # DTK release ever needs more from the vendor core than the shim covers.
 # FLAGOS_DCU_VENDOR_CORE=1 selects the legacy full-core bundle + relink; CI
 # smoke-tests that path separately below.
-FLAGOS_DCU_TORCH_LIB="$FLAGOS_DCU_TORCH_LIB" \
+FLAGOS_VENDOR_TORCH_LIB="$FLAGOS_VENDOR_TORCH_LIB" \
   PYTHON="$VENV_PYTHON" bash scripts/vendor/bundle_dcu_libtorch.sh
 
 # Wheel invariants for the decoupled default. A vendor core .so in lib_dcu means
@@ -489,7 +488,7 @@ else:
 PY
 
     echo "Legacy-mode smoke: full-core bundle"
-    FLAGOS_DCU_TORCH_LIB="$FLAGOS_DCU_TORCH_LIB" \
+    FLAGOS_VENDOR_TORCH_LIB="$FLAGOS_VENDOR_TORCH_LIB" \
       PYTHON="$VENV_PYTHON" FLAGOS_DCU_VENDOR_CORE=1 \
       bash scripts/vendor/bundle_dcu_libtorch.sh
     FLAGOS_DCU_VENDOR_CORE=1 python - <<'PY'
@@ -527,7 +526,7 @@ print(f"Legacy smoke rolled back cleanly: no symlinks or backup in {lib}")
 PY
 
     echo "Restoring the decoupled bundle for the wheel"
-    FLAGOS_DCU_TORCH_LIB="$FLAGOS_DCU_TORCH_LIB" \
+    FLAGOS_VENDOR_TORCH_LIB="$FLAGOS_VENDOR_TORCH_LIB" \
       PYTHON="$VENV_PYTHON" bash scripts/vendor/bundle_dcu_libtorch.sh
     python - <<'PY'
 from pathlib import Path
@@ -597,7 +596,7 @@ assert Path("torch_fl/lib/libtorch_fl.so").is_file()
 print(f"Isolated Python: {sys.executable}")
 print(f"CPU PyTorch: {torch.__version__}")
 print(f"CPU torch path: {torch_path}")
-print(f"DCU torch lib: {os.environ.get('FLAGOS_DCU_TORCH_LIB', '?')}")
+print(f"DCU torch lib: {os.environ.get('FLAGOS_VENDOR_TORCH_LIB', '?')}")
 PY
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
@@ -605,9 +604,9 @@ if [[ -n "${GITHUB_PATH:-}" ]]; then
 fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   for name in \
-    PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH ACCELERATOR ROCM_PATH \
-    FLAGOS_DCU_TORCH_LIB FLAGGEMS_DIR FLAGCX_PATH \
-    FLAGGEMS_CPP FLAGGEMS_KERNEL FLAGOS_USE_FLAGGEMS_CPP \
+    PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH FLAGOS_ACCELERATOR ROCM_PATH \
+    FLAGOS_VENDOR_TORCH_LIB FLAGGEMS_DIR FLAGCX_PATH \
+    FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS \
     CMAKE_PREFIX_PATH LIBRARY_PATH LD_LIBRARY_PATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done

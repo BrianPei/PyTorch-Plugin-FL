@@ -363,7 +363,7 @@ _DISPATCH_LINE = re.compile(r"\[flagos dispatch\] (\S+) -> (\S+)")
 
 
 def _active_conf() -> str:
-    return os.environ.get("FLAGOS_BACKEND_CONFIG", "")
+    return torch_fl.backend_config_path()
 
 
 def _require_metax_flaggems() -> None:
@@ -402,7 +402,7 @@ def _run_logged(body: str, timeout: int = 300) -> subprocess.CompletedProcess:
         f"{body}\n"
     )
     env = os.environ.copy()
-    env["FLAGOS_LOG_DISPATCH"] = "1"
+    env["FLAGOS_LOG"] = "dispatch"
     return subprocess.run(
         [sys.executable, "-c", code],
         env=env,

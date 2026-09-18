@@ -108,15 +108,16 @@ export PATH="/opt/venv/bin:/opt/maca/tools/cu-bridge/bin:/opt/maca/mxgpu_llvm/bi
 export VIRTUAL_ENV=/opt/venv
 export PYTHONNOUSERSITE=1
 
-export ACCELERATOR=metax
+export FLAGOS_ACCELERATOR=metax
 export MACA_PATH=/opt/maca
 export MACA_HOME=/opt/maca
 
 # MetaX is a boxing-only build: no native mxcc kernels compile in, so
-# VENDOR_KERNEL=OFF is the one build-side statement. The runtime side derives
-# its conf from ACCELERATOR=metax (torch_fl._select_backend_config) -- there is
+# FLAGOS_BUILD_VENDOR=OFF is the one build-side statement. The export above is a
+# build input -- setup.py records it in torch_fl/_build_config.py, and the runtime
+# derives its conf from that record (torch_fl._select_backend_config), so there is
 # no mode variable to keep in agreement with the build any more.
-export VENDOR_KERNEL=OFF
+export FLAGOS_BUILD_VENDOR=OFF
 export FLAGOS_METAX_CUDART_SHIM=1
 export FLAGOS_DISABLE_CUDA_ASSETS=1
 # Which op takes which backend is stated in backends_metax.conf, not here: that
@@ -126,10 +127,10 @@ export FLAGOS_DISABLE_CUDA_ASSETS=1
 # used to select a separate backends_flaggems.conf; nothing reads it any more,
 # so setting it here would misdescribe the build -- the FlagGems Python path is
 # on for the 592 ops the conf routes to it either way.
-export FLAGGEMS_CPP=0
-export FLAGGEMS_KERNEL=1
+export FLAGOS_BUILD_FLAGGEMS_CPP=0
+export FLAGOS_BUILD_FLAGGEMS=1
 export FLAGOS_WHEEL_LOCAL=metax3.8.0
-export FLAGOS_MACA_TORCH_LIB=/opt/vendor-libtorch/lib
+export FLAGOS_VENDOR_TORCH_LIB=/opt/vendor-libtorch/lib
 
 export LD_LIBRARY_PATH="/opt/maca/lib:/opt/maca/tools/cu-bridge/lib:/opt/maca/mxgpu_llvm/lib:/opt/maca/mxshmem/lib:/opt/maca/ompi/lib:/opt/maca/ucx/lib:/opt/mxdriver/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBRARY_PATH="/opt/maca/lib:/opt/maca/tools/cu-bridge/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -179,7 +180,7 @@ PY
 # generated kernels were measured on -- rather than the triton-metax the image
 # carries beside its own MetaX torch install. FlagGems is required because
 # backends_metax.conf routes 592 ops to the Python FlagGems path by default
-# (FLAGGEMS_KERNEL=1 above compiles the dispatcher slot).
+# (FLAGOS_BUILD_FLAGGEMS=1 above compiles the dispatcher slot).
 #
 # Both are installed into the venv rather than linked out of the image, so the
 # packages the tests import are the ones this script put there. Linking is what
@@ -367,11 +368,11 @@ fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf '%s=%s\n' PATH "$PATH" >> "$GITHUB_ENV"
   for name in \
-    VIRTUAL_ENV PYTHONNOUSERSITE ACCELERATOR MACA_PATH MACA_HOME \
-    VENDOR_KERNEL FLAGOS_METAX_CUDART_SHIM \
+    VIRTUAL_ENV PYTHONNOUSERSITE FLAGOS_ACCELERATOR MACA_PATH MACA_HOME \
+    FLAGOS_BUILD_VENDOR FLAGOS_METAX_CUDART_SHIM \
     FLAGOS_DISABLE_CUDA_ASSETS \
-    FLAGGEMS_CPP FLAGGEMS_KERNEL FLAGOS_WHEEL_LOCAL \
-    FLAGOS_MACA_TORCH_LIB LD_LIBRARY_PATH LIBRARY_PATH CPATH; do
+    FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS FLAGOS_WHEEL_LOCAL \
+    FLAGOS_VENDOR_TORCH_LIB LD_LIBRARY_PATH LIBRARY_PATH CPATH; do
     printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
   done
 fi
@@ -424,7 +425,7 @@ bash scripts/vendor/bundle_maca_libtorch.sh
 #
 #     Importing torch_fl is what removes that condition: it points the stock
 #     wheel's torch/lib at the MetaX libtorch (the bundle
-#     bundle_maca_libtorch.sh just wrote, or FLAGOS_MACA_TORCH_LIB), and it has
+#     bundle_maca_libtorch.sh just wrote, or FLAGOS_VENDOR_TORCH_LIB), and it has
 #     to happen before `import torch` -- which is exactly the order the probe
 #     uses. The relink is on disk, so it holds for every later process, the
 #     tests included.

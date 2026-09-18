@@ -22,7 +22,7 @@ instance cache and turns an aten call into TileOPs constructor arguments.
 
 Dispatch decisions themselves are *not* made here. The dispatcher already
 consults the conf files and ``FLAGOS_OP_<op>``, and logs via
-``FLAGOS_LOG_DISPATCH``, so nothing in this module duplicates that. Only the
+``FLAGOS_LOG=dispatch``, so nothing in this module duplicates that. Only the
 per-call "can TileOPs actually serve these arguments" test is local, since it
 depends on the runtime dtype and shape.
 
@@ -55,6 +55,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
+from torch_fl import _env
 from torch_fl.tileops.spec import BINARY, REDUCE, SOFTMAX, UNARY
 
 __all__ = [
@@ -80,12 +81,12 @@ _available: Optional[bool] = None
 #: just a dict. Beyond the cap, _get stops caching and rebuilds per call: slower
 #: (see the cold-ctor cost in the module docstring), but bounded. Raise it with
 #: FLAGOS_TILEOPS_CACHE_MAX if you have many static shapes and headroom.
-_INSTANCE_CACHE_MAX = int(os.environ.get("FLAGOS_TILEOPS_CACHE_MAX", "512"))
+_INSTANCE_CACHE_MAX = int(_env.value("FLAGOS_TILEOPS_CACHE_MAX", "512"))
 _cache_full_warned = False
 
 
 def _use_l2() -> bool:
-    return os.environ.get("FLAGOS_TILEOPS_USE_L2") == "1"
+    return _env.flag("FLAGOS_TILEOPS_USE_L2")
 
 
 def _disable_frontend_cache() -> bool:
@@ -149,8 +150,8 @@ def is_tileops_available() -> bool:
     # Escape hatch: kill every TileLang cache. Correct but slow (see
     # _disable_frontend_cache), kept for hosts where the targeted fix does not
     # apply. Must precede the tileops import -- TileLang reads it at import time.
-    if os.environ.get("FLAGOS_TILEOPS_DISABLE_ALL_CACHE") == "1":
-        os.environ.setdefault("TILELANG_DISABLE_CACHE", "1")
+    if _env.flag("FLAGOS_TILEOPS_DISABLE_ALL_CACHE"):
+        _env.set_foreign("TILELANG_DISABLE_CACHE", "1")
 
     try:
         importlib.import_module("tileops")
@@ -202,14 +203,14 @@ def _device_index(t: torch.Tensor) -> int:
 # instance cache
 # --------------------------------------------------------------------------- #
 def _log_declined(overload: str) -> None:
-    """Note a call TileOPs could not serve, under FLAGOS_LOG_DISPATCH=1.
+    """Note a call TileOPs could not serve, when ``FLAGOS_LOG`` lists `dispatch`.
 
     The dispatcher logs the routing decision, which is made before the arguments
     are known. When a route then declines on dtype or argument shape the real
     kernel is aten's, so this second line is what explains a "-> tileops" log
     line followed by vendor-speed timings.
     """
-    if os.environ.get("FLAGOS_LOG_DISPATCH") == "1":
+    if "dispatch" in _env.listed("FLAGOS_LOG"):
         print(f"[flagos dispatch] {overload} -> cuda (tileops declined)", flush=True)
 
 

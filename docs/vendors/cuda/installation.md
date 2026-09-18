@@ -29,7 +29,7 @@ cd PyTorch-Plugin-FL
 pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
 
 # Build torch_fl with CUDA boxing kernels and bundled CUDA assets
-ACCELERATOR=cuda \
+FLAGOS_ACCELERATOR=cuda \
   pip install --no-build-isolation -vvv -e .
 ```
 
@@ -44,8 +44,8 @@ This build:
 To enable the C++ fast path for FlagGems Triton kernels:
 
 ```bash
-ACCELERATOR=cuda \
-  FLAGGEMS_CPP=1 \
+FLAGOS_ACCELERATOR=cuda \
+  FLAGOS_BUILD_FLAGGEMS_CPP=1 \
   FLAGGEMS_DIR=<path-to-FlagGems>/lib/cmake/FlagGems \
   pip install --no-build-isolation -vvv -e .
 ```
@@ -56,8 +56,12 @@ ACCELERATOR=cuda \
 
 The following environment variables control runtime behavior:
 
-- `FLAGOS_USE_FLAGGEMS_CPP=1`: Enable the `flaggems_cpp` test gate. Routing itself follows the conf's `flaggems_cpp` keys, so this variable only decides whether those tests are collected
 - `CUDA_VISIBLE_DEVICES`: Control which GPUs are visible to the process
+
+Whether the `flaggems_cpp`-marked tests are collected is not a variable: the
+wheel records its kernel sets in `torch_fl/_build_config.py`, and the
+integration conftest collects those tests exactly when `flaggems_cpp` is in that
+record — see [Testing](../../development/testing.md).
 
 ## Verification
 

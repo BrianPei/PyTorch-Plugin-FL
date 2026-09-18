@@ -40,11 +40,11 @@
 # (libtorch_hip.so's DT_NEEDED hard-codes librocblas.so.4).
 #
 # Usage:
-#   FLAGOS_DCU_TORCH_LIB=<dtk torch/lib> bash scripts/vendor/bundle_dcu_libtorch.sh
+#   FLAGOS_VENDOR_TORCH_LIB=<dtk torch/lib> bash scripts/vendor/bundle_dcu_libtorch.sh
 #   ROCM_PATH=/opt/dtk bash scripts/vendor/bundle_dcu_libtorch.sh
 #   FLAGOS_DCU_VENDOR_CORE=1 bash scripts/vendor/bundle_dcu_libtorch.sh   # legacy
 #
-# Should run after `python setup.py build_ext --inplace` (ACCELERATOR=dcu) and
+# Should run after `python setup.py build_ext --inplace` (FLAGOS_ACCELERATOR=dcu) and
 # before packing the wheel. Idempotent.
 
 set -euo pipefail
@@ -64,13 +64,13 @@ case "${FLAGOS_DCU_VENDOR_CORE:-0}" in
   *) VENDOR_CORE=0 ;;
 esac
 
-SRC="${FLAGOS_DCU_TORCH_LIB:-}"
+SRC="${FLAGOS_VENDOR_TORCH_LIB:-}"
 if [ -z "${SRC}" ]; then
   SRC="$(bundle_find_vendor_torch_lib libtorch_hip.so dtk hip das || true)"
 fi
 
 if [ -z "${SRC}" ] || [ ! -d "${SRC}" ]; then
-  echo "error: DTK torch/lib not found. Set FLAGOS_DCU_TORCH_LIB=<dtk torch/lib>" >&2
+  echo "error: DTK torch/lib not found. Set FLAGOS_VENDOR_TORCH_LIB=<dtk torch/lib>" >&2
   exit 1
 fi
 if [ ! -f "${SRC}/libtorch_hip.so" ]; then
@@ -237,7 +237,7 @@ else
   # build_ext, i.e. it is already there before this script runs.
   if [ ! -f "${LIB_DCU}/${COMPAT_SO}" ]; then
     echo "error: ${LIB_DCU}/${COMPAT_SO} is missing. Build first with" >&2
-    echo "       ACCELERATOR=dcu python setup.py build_ext --inplace" >&2
+    echo "       FLAGOS_ACCELERATOR=dcu python setup.py build_ext --inplace" >&2
     exit 1
   fi
 

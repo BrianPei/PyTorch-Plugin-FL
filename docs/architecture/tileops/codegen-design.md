@@ -133,9 +133,11 @@ aten::relu(flagos tensor)
                             └─► ReluFwdOp / its compiled kernel
 ```
 
-`torch_fl/__init__.py` reads `FLAGOS_USE_TILEOPS=1` only to pick
-`backends_tileops.conf`. It performs no registration: the kernels are bound by
-static constructors when `libtorch_fl.so` loads, before Python runs.
+There is no TileOPs conf file. The routes live in the platform's own
+`backends_<platform>.conf`, annotated `# tileops` on the op's line, and
+`FLAGOS_FORCE_BACKEND=tileops` repins exactly those ops at load time. Python
+performs no registration: the kernels are bound by static constructors when
+`libtorch_fl.so` loads, before Python runs.
 
 Everything Python-side lives under one package, mirroring how the C++ side keeps
 each vendor in its own `csrc/aten/backends/<vendor>/`:
@@ -185,27 +187,26 @@ Reuse the existing machinery, adding `Backend::kTileOps`:
 - Add the `tileops_fn_` slot and the `"tileops"` name at the three sites in
   `csrc/aten/dispatcher.h` (`:52` `RegisterKernel`, `:80` `DispatchAs`,
   `:100` `LogDispatch`).
-- `torch_fl/configs/backends_tileops.conf` (generated): structurally identical to
-  `backends_cuda.conf` with 2033 entries, only the allowlisted operators set to
-  `= tileops`.
-- Add the `FLAGOS_USE_TILEOPS=1` branch to
-  `torch_fl/__init__.py::_select_backend_config()`.
+- No separate conf: the platform's own `backends_<platform>.conf` carries its
+  TileOPs candidates as a trailing `# tileops` annotation on the op's line, and
+  `FLAGOS_FORCE_BACKEND=tileops` repins exactly those ops to `= tileops` at load
+  time.
 
 The C++ kernels are generated into
-`csrc/aten/generated/tileops_python_kernels.cc` (section 3.4a), so a route set
-to `= tileops` in the conf lands in a real `tileops_fn_` slot. An empty slot
-still means fallback, which is what a build with `TILEOPS_KERNEL=OFF` (every
+`csrc/aten/generated/tileops_python_kernels.cc` (section 3.4a), so a repinned
+route lands in a real `tileops_fn_` slot. An empty slot
+still means fallback, which is what a build with `FLAGOS_BUILD_TILEOPS=OFF` (every
 non-CUDA accelerator, since TileOPs is SM90 NVIDIA-only) produces.
 
 Because the decision is made in `dispatcher.h` rather than in Python,
-`FLAGOS_LOG_DISPATCH=1` and `FLAGOS_OP_<op>=cuda` work for TileOPs with no extra
+`FLAGOS_LOG=dispatch` and `FLAGOS_OP_<op>=cuda` work for TileOPs with no extra
 code -- the same machinery that serves cuda and flaggems. Verified on H800:
 
 ```console
-$ FLAGOS_USE_TILEOPS=1 FLAGOS_LOG_DISPATCH=1 python -c "..."
+$ FLAGOS_FORCE_BACKEND=tileops FLAGOS_LOG=dispatch python -c "..."
 [flagos dispatch] relu -> tileops
 
-$ FLAGOS_USE_TILEOPS=1 FLAGOS_LOG_DISPATCH=1 FLAGOS_OP_relu=cuda python -c "..."
+$ FLAGOS_FORCE_BACKEND=tileops FLAGOS_LOG=dispatch FLAGOS_OP_relu=cuda python -c "..."
 [flagos dispatch] relu -> cuda
 ```
 
@@ -214,7 +215,7 @@ $ FLAGOS_USE_TILEOPS=1 FLAGOS_LOG_DISPATCH=1 FLAGOS_OP_relu=cuda python -c "..."
 > **intercepts before the C++ dispatcher** -- a bound operator never reached
 > `relu_dispatcher` at all. `common.cc` parsed `FLAGOS_OP_relu=cuda` and printed
 > `[flagos] env override: relu -> cuda`, yet `torch.relu` still built a TileOPs
-> instance; `FLAGOS_LOG_DISPATCH=1` showed only the operators that fell through
+> instance; `FLAGOS_LOG=dispatch` showed only the operators that fell through
 > to cuda, reading as if TileOPs were not wired up at all. Both features had to
 > be re-implemented in Python (`enable_tileops_for_flagos()` consulted an
 > `_env_override_backend()` helper and skipped binding overridden ops;
@@ -623,7 +624,7 @@ that is conf'd to `tileops` on a box without TileOPs therefore still enters the
 stub and crosses into Python before falling back -- correct, and the extra ~1 us
 only affects a misconfigured host.
 
-Build-side gating is separate: `TILEOPS_KERNEL` (CMake) defaults ON for CUDA and
+Build-side gating is separate: `FLAGOS_BUILD_TILEOPS` (CMake) defaults ON for CUDA and
 OFF for every other accelerator in `setup.py`, since TileOPs is SM90 NVIDIA-only.
 With it OFF, `tileops_fn_` is never populated and the dispatcher falls through.
 
@@ -712,7 +713,7 @@ inferred from the upstream timeline, not verified on this machine**.
 entry:
 
 1. **Dispatch hit**: confirm the tileops path is taken under
-   `FLAGOS_LOG_DISPATCH=1`.
+   `FLAGOS_LOG=dispatch`.
 2. **Numerical agreement**: compare against aten on CPU/cuda, with tolerances
    graded by dtype (relative tolerance for fp16/bf16, bit-exact for integer
    types). Shapes are the first entry from the manifest's `workloads`, plus one
@@ -732,7 +733,7 @@ the operator goes into `DEFAULT_OFF`.
 
 | PR | Content | Status |
 |---|---|---|
-| 1 | `Backend::kTileOps` enum + dispatcher slot + conf parsing + `FLAGOS_USE_TILEOPS` | **Done** |
+| 1 | `Backend::kTileOps` enum + dispatcher slot + conf parsing + the tileops opt-in (then `FLAGOS_USE_TILEOPS`, since folded into `FLAGOS_FORCE_BACKEND=tileops`) | **Done** |
 | 2 | `tileops/spec.py` + `codegen_tileops.py` + 4 recipes + generated artifacts | **Done, 60 routes** |
 | 2b | Move registration from `torch.library` into `csrc/aten/generated/tileops_python_kernels.cc` on `kTileOps`, via generated Python shims | **Done** |
 | 3 | Groups (1)(2)(3)(7) from section 3.4: `SCALAR_UNARY` 7 + `BROADCAST_TENSORS` 7 + `BINARY_EXTRA` 2 + `ROUND` 1 = **17** | To do, patterns measured |
@@ -764,7 +765,8 @@ validation in the generator:
 - `RoundFwdOp`'s `forward(input, decimals)` takes 2 arguments, violating UNARY's
   1-argument convention -> moved to hand-written.
 
-Verification results (H800, `FLAGOS_USE_TILEOPS=1`): **all 60 routes numerically
+Verification results (H800, `FLAGOS_USE_TILEOPS=1` -- that switch's successor is
+`FLAGOS_FORCE_BACKEND=tileops`): **all 60 routes numerically
 correct** at `(64, 32)` (42 floating-point routes via `assert_close`, 18
 integer/bool routes required bit-exact), plus the int32 dtype-guard fallback,
 the presence of all 60 shims, and dispatch through the C++ path with and without
@@ -826,7 +828,7 @@ pip install --target "$VENV/lib/python3.12/site-packages" pytest
 # put the tilelang stack in $STACK and bring it in via a .pth or PYTHONPATH;
 # z3 needs LD_LIBRARY_PATH
 export LD_LIBRARY_PATH="$STACK/z3/lib:$LD_LIBRARY_PATH"
-export FLAGOS_USE_TILEOPS=1
+export FLAGOS_FORCE_BACKEND=tileops
 ```
 
 On an offline machine, put the stack directory on a persistent path rather than

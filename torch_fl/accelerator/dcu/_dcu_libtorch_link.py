@@ -58,6 +58,7 @@ The DTK driver stack (``libgalaxyhip.so.5``, ``libMIOpen.so.1``,
 import ctypes
 import os
 
+from torch_fl import _env
 from torch_fl.accelerator._vendor_libtorch import (
     active_torch_lib,
     bundled_lib_dir,
@@ -149,12 +150,7 @@ _preloaded = False
 
 def vendor_core_mode():
     """True when the legacy vendor-core (symlink) path is requested."""
-    return os.environ.get("FLAGOS_DCU_VENDOR_CORE", "0").lower() in (
-        "1",
-        "on",
-        "true",
-        "yes",
-    )
+    return _env.flag("FLAGOS_DCU_VENDOR_CORE")
 
 
 def _bundled_dcu_lib():
@@ -165,13 +161,13 @@ def _bundled_dcu_lib():
 def _discover_dcu_torch_lib():
     """Locate the DTK libtorch .so dir.
 
-    Priority: bundled lib_dcu/, then FLAGOS_DCU_TORCH_LIB, then sibling conda
+    Priority: bundled lib_dcu/, then FLAGOS_VENDOR_TORCH_LIB, then sibling conda
     envs whose torch is a DTK build.
     """
     return discover_vendor_torch_lib(
         _BUNDLE_DIR,
         "libtorch_hip.so",
-        env_override="FLAGOS_DCU_TORCH_LIB",
+        env_override="FLAGOS_VENDOR_TORCH_LIB",
         vendor_markers=_MARKERS,
     )
 
@@ -181,7 +177,7 @@ def _compat_shim_path(lib_dir):
     for cand in (
         os.path.join(lib_dir, _COMPAT_SO),
         # Non-bundled in-place build: cmake installs into torch_fl/lib_dcu, but a
-        # dev may point FLAGOS_DCU_TORCH_LIB straight at the DTK wheel.
+        # dev may point FLAGOS_VENDOR_TORCH_LIB straight at the DTK wheel.
         os.path.join(
             os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -219,7 +215,7 @@ def preload_dcu_device_libs():
             f"{lib_dir}. It supplies the DTK-private ATen symbols that "
             "libtorch_hip.so imports from DTK's forked core, so the official "
             "PyTorch core cannot be used without it. Rebuild with "
-            "ACCELERATOR=dcu python setup.py build_ext --inplace, or set "
+            "FLAGOS_ACCELERATOR=dcu python setup.py build_ext --inplace, or set "
             "FLAGOS_DCU_VENDOR_CORE=1 to use DTK's own core libraries."
         )
 
@@ -248,7 +244,7 @@ def preload_dcu_device_libs():
                 raise FileNotFoundError(
                     f"DCU/DTK device library missing: {os.path.join(lib_dir, name)}. "
                     "Run scripts/vendor/bundle_dcu_libtorch.sh, or point "
-                    "FLAGOS_DCU_TORCH_LIB at a DTK torch/lib."
+                    "FLAGOS_VENDOR_TORCH_LIB at a DTK torch/lib."
                 )
         try:
             _device_handles.append(ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL))
@@ -290,7 +286,7 @@ def ensure_dcu_libtorch_links():
         _BUNDLE_DIR,
         _CORE_SO,
         extra_so=_HIP_SO,
-        env_override="FLAGOS_DCU_TORCH_LIB",
+        env_override="FLAGOS_VENDOR_TORCH_LIB",
         vendor_markers=_MARKERS,
         probe_so="libtorch_hip.so",
         vendor="DCU/DTK",

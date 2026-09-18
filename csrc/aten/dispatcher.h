@@ -5,7 +5,7 @@
 #include "common.h"
 #include <c10/util/Exception.h>
 #include <cstdio>
-#include <cstdlib>
+#include <flagos_env.h>
 #include <optional>
 #include <string>
 #include <utility>
@@ -145,29 +145,7 @@ class Dispatcher {
     auto fn = ResolveFn(backend, args...);
     LogDispatch(op_name_, backend);
 
-    // Strict mode: ALL_USE_FLAGGEMS / ALL_USE_VENDOR require impl to exist
-    if (!fn) {
-      static const bool strict_flaggems = []() {
-        const char* v = std::getenv("ALL_USE_FLAGGEMS");
-        return v && std::string(v) != "0" && std::string(v) != "";
-      }();
-      static const bool strict_vendor = []() {
-        const char* v = std::getenv("ALL_USE_VENDOR");
-        return v && std::string(v) != "0" && std::string(v) != "";
-      }();
-
-      if (strict_flaggems && (backend == Backend::kFlagGemsCpp || backend == Backend::kFlagGems)) {
-        std::string msg = std::string(op_name_) +
-                         ": ALL_USE_FLAGGEMS=1 but FlagGems impl not compiled (set FLAGGEMS_CPP=1 or FLAGGEMS_KERNEL=1)";
-        throw std::runtime_error(msg);
-      }
-      if (strict_vendor && backend != Backend::kFlagGemsCpp && backend != Backend::kFlagGems &&
-          backend != Backend::kNone && backend != Backend::kTileOps) {
-        std::string msg = std::string(op_name_) +
-                         ": ALL_USE_VENDOR=1 but vendor kernel not registered";
-        throw std::runtime_error(msg);
-      }
-    }
+    if (!fn) ThrowIfForcedBackendMissing(op_name_, backend);
 
     TORCH_CHECK(fn, op_name_, DispatchFailureMessage(backend));
     return fn(std::forward<Args>(args)...);
@@ -186,35 +164,41 @@ class Dispatcher {
     auto fn = ResolveFn(backend, args...);
     LogDispatch(op_name, backend);
 
-    // Strict mode: ALL_USE_FLAGGEMS / ALL_USE_VENDOR require impl to exist
-    if (!fn) {
-      static const bool strict_flaggems = []() {
-        const char* v = std::getenv("ALL_USE_FLAGGEMS");
-        return v && std::string(v) != "0" && std::string(v) != "";
-      }();
-      static const bool strict_vendor = []() {
-        const char* v = std::getenv("ALL_USE_VENDOR");
-        return v && std::string(v) != "0" && std::string(v) != "";
-      }();
-
-      if (strict_flaggems && (backend == Backend::kFlagGemsCpp || backend == Backend::kFlagGems)) {
-        std::string msg = op_name +
-                         ": ALL_USE_FLAGGEMS=1 but FlagGems impl not compiled (set FLAGGEMS_CPP=1 or FLAGGEMS_KERNEL=1)";
-        throw std::runtime_error(msg);
-      }
-      if (strict_vendor && backend != Backend::kFlagGemsCpp && backend != Backend::kFlagGems &&
-          backend != Backend::kNone && backend != Backend::kTileOps) {
-        std::string msg = op_name +
-                         ": ALL_USE_VENDOR=1 but vendor kernel not registered";
-        throw std::runtime_error(msg);
-      }
-    }
+    if (!fn) ThrowIfForcedBackendMissing(op_name, backend);
 
     TORCH_CHECK(fn, op_name, DispatchFailureMessage(backend));
     return fn(std::forward<Args>(args)...);
   }
 
  private:
+  // FLAGOS_FORCE_BACKEND asks for one backend family across the whole routing
+  // table, so a miss for the family it named is a hard error rather than a
+  // silent fall-through. Only `flaggems` and `vendor` get here: `tileops` is a
+  // repin of ops the conf already annotates `# tileops`, so a miss there means
+  // the op was never a TileOPs candidate and nothing was asked of it.
+  void ThrowIfForcedBackendMissing(const std::string& op_name,
+                                   Backend backend) const {
+    const std::string& forced = ForcedBackendMode();
+    if (forced.empty()) return;
+
+    if (forced == "flaggems" &&
+        (backend == Backend::kFlagGemsCpp || backend == Backend::kFlagGems)) {
+      throw std::runtime_error(
+          op_name +
+          ": FLAGOS_FORCE_BACKEND=flaggems but no FlagGems implementation is "
+          "compiled into this wheel (rebuild with FLAGOS_BUILD_FLAGGEMS_CPP=1 "
+          "or FLAGOS_BUILD_FLAGGEMS=1)");
+    }
+    if (forced == "vendor" && backend != Backend::kFlagGemsCpp &&
+        backend != Backend::kFlagGems && backend != Backend::kNone &&
+        backend != Backend::kTileOps) {
+      throw std::runtime_error(
+          op_name +
+          ": FLAGOS_FORCE_BACKEND=vendor but no vendor kernel is registered "
+          "for this op");
+    }
+  }
+
   // The build's own native kernel slot, with the backend name that selects it.
   // Exactly one is ever populated: a build registers its native kernels into
   // its own slot (kAscend on Ascend, kMusa on MUSA, ...) and, on the
@@ -264,7 +248,7 @@ class Dispatcher {
   FnPtr GetFn(Backend device) const {
     switch (device) {
       case Backend::kCuda:          return cuda_fn_;
-      // FlagGems C++ runtime is only compiled in for a FLAGGEMS_CPP=ON
+      // FlagGems C++ runtime is only compiled in for a FLAGOS_BUILD_FLAGGEMS_CPP=ON
       // build (flaggems_cpp_kernels.cc, behind FLAGOS_FLAGGEMS_CPP), which needs
       // liboperators.so built for the vendor. A platform ships ONE conf, so the
       // conf cannot know whether that opt-in build is the one running: MetaX's
@@ -278,7 +262,7 @@ class Dispatcher {
       case Backend::kFlagGemsCpp:
         if (flaggems_cpp_fn_) return flaggems_cpp_fn_;
         return cuda_fn_ ? cuda_fn_ : flaggems_fn_;
-      // FlagGems Python path is only compiled in for a FLAGGEMS_KERNEL=ON build
+      // FlagGems Python path is only compiled in for a FLAGOS_BUILD_FLAGGEMS=ON build
       // (flaggems_python_kernels.cc, behind FLAGOS_FLAGGEMS_PYTHON). When uncompiled,
       // degrade to the boxing kernel rather than raising "backend not registered".
       // This keeps one conf correct for both builds (Python FlagGems ON/OFF).
@@ -314,20 +298,57 @@ class Dispatcher {
   // Distinguishes "conf says none but the op was registered anyway" from a
   // genuinely missing kernel. The first is a codegen/conf mismatch and the
   // operator-support docs are the place to fix it; the second is a build gap.
+  //
+  // Every message keeps the phrase "backend not registered": it is what callers
+  // and tests match on to tell "this wheel cannot do that" from "the op is
+  // broken". The build set, when the wheel records one, is appended as the
+  // reason rather than replacing it.
   static std::string DispatchFailureMessage(Backend backend) {
     if (backend == Backend::kNone) {
       return ": routed to 'none' (no accelerated impl on this platform) but the "
              "op is registered on PrivateUse1 -- regenerate the vendor conf so "
              "registration and routing agree";
     }
-    return ": backend not registered";
+    std::string message = ": backend not registered";
+#if defined(FLAGOS_BUILTIN_KERNELS)
+    // The compile definition setup.py derives from the same kernel switches as
+    // the build record, so the wheel can name the missing set instead of
+    // leaving the user to guess whether it is a build gap or a broken install.
+    const char* kernel_set = KernelSetOf(backend);
+    if (kernel_set != nullptr &&
+        !flagos_env::ListedIn(FLAGOS_BUILTIN_KERNELS, kernel_set)) {
+      message += std::string(" (the '") + kernel_set +
+                 "' kernel set was not compiled into this wheel)";
+    }
+#endif
+    return message;
+  }
+
+  // Which kernel set provides a backend, named the way setup.py::KERNEL_SET_NAME
+  // and the KERNELS tuple in torch_fl/_build_config.py name it. nullptr for a
+  // backend that no kernel set owns.
+  static const char* KernelSetOf(Backend backend) {
+    switch (backend) {
+      case Backend::kCuda:        return "boxing";
+      case Backend::kFlagGemsCpp: return "flaggems_cpp";
+      case Backend::kFlagGems:    return "flaggems";
+      case Backend::kTileOps:     return "tileops";
+      // Every remaining backend is the accelerator's own native kernel library
+      // (ACLNN, mudnn, topsaten, ...), which the single FLAGOS_BUILD_VENDOR switch
+      // compiles. There is one such library per build, never two.
+      case Backend::kAscend:
+      case Backend::kMusa:
+      case Backend::kMetax:
+      case Backend::kTsingMicro:
+      case Backend::kGcu:         return "vendor";
+      case Backend::kNone:
+      case Backend::kUncached:    return nullptr;
+    }
+    return nullptr;
   }
 
   static void LogDispatch(const std::string& op_name, Backend backend) {
-    static const bool enabled = []() {
-      const char* v = std::getenv("FLAGOS_LOG_DISPATCH");
-      return v && std::string(v) == "1";
-    }();
+    static const bool enabled = LogEnabled("dispatch");
     if (!enabled) return;
     const char* name;
     switch (backend) {

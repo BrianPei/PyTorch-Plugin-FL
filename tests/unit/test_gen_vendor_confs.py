@@ -102,7 +102,7 @@ def test_route_loses_tileops_to_flaggems_and_withholds_it_when_unregistered():
 
 
 def test_route_omits_tileops_when_the_platform_cannot_compile_the_slot():
-    """TILEOPS_PLATFORMS gates the key. setup.py forces TILEOPS_KERNEL=OFF for
+    """TILEOPS_PLATFORMS gates the key. setup.py forces FLAGOS_BUILD_TILEOPS=OFF for
     every non-cuda accelerator, where kTileOps degrades to an equally empty
     cuda_fn_ -- so an ungated key would route a real op at nothing."""
     assert not g.TILEOPS_PLATFORMS
@@ -124,8 +124,8 @@ def test_route_withholds_flaggems_from_unregistered_ops():
 
 
 def test_route_annotates_vendor_kernels_that_lose_to_flaggems():
-    """The annotation is what tells a reader (and ALL_USE_VENDOR) that a kernel
-    exists behind an op FlagGems currently wins."""
+    """The annotation is what tells a reader (and FLAGOS_FORCE_BACKEND=vendor)
+    that a kernel exists behind an op FlagGems currently wins."""
     both = {"mm"}
     assert g.route("mm", "musa", both, set(), both, both) == "flaggems_cpp  # musa"
     assert g.route("mm", "musa", set(), both, both, both) == "flaggems  # musa"
@@ -405,9 +405,10 @@ def test_every_platform_covers_the_same_op_set():
 def test_flaggems_cpp_only_appears_where_the_slot_is_compiled_in():
     """`flaggems_cpp` is Backend::kFlagGemsCpp, registered in flaggems_cpp_kernels.cc
     behind `#ifdef FLAGOS_FLAGGEMS_CPP` -- which csrc/CMakeLists.txt defines only
-    for FLAGGEMS_CPP=ON. CMakeLists.txt force-sets that OFF for ascend, dcu,
-    musa, bpu, tsingmicro and a non-boxing metax build. For those, the slot is
-    empty and Dispatcher::GetFn degrades to the boxing kernel instead of raising.
+    for FLAGOS_BUILD_FLAGGEMS_CPP=ON. That switch defaults ON only for cuda and
+    tsingmicro and OFF everywhere else, and CMakeLists.txt pins it OFF for dcu,
+    musa and bpu. For those, the slot is empty and Dispatcher::GetFn degrades to
+    the boxing kernel instead of raising.
 
     backends_metax.conf is the only generated conf that routes any ops to the C++
     path. The vendor confs (musa/gcu/ascend) omit the key entirely: every C++ op
@@ -443,7 +444,7 @@ def test_tileops_set_survived_the_conf_deletion():
     file that was otherwise a copy of backends_cuda.conf. It is now
     TILEOPS_OPS in scripts/codegen/backend_coverage.py, regenerated in place by
     scripts/codegen/codegen_tileops.py. The count is pinned because losing entries here
-    silently shrinks what FLAGOS_USE_TILEOPS=1 can repin."""
+    silently shrinks what FLAGOS_FORCE_BACKEND=tileops can repin."""
     ops = g.tileops_ops()
     assert len(ops) == 60, f"expected 60 tileops ops, got {len(ops)}"
     assert {"abs", "add.Tensor", "_softmax"} <= ops

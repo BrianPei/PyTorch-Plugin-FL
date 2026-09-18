@@ -38,6 +38,7 @@ from typing import Any
 
 import torch
 
+from torch_fl import _env
 from torch_fl.comm.process_group import is_cuda_alias_vendor
 
 
@@ -57,19 +58,16 @@ _importing_apex = False
 
 
 def _is_disabled() -> bool:
-    return os.environ.get(_DISABLE_ENV, "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    return _env.flag(_DISABLE_ENV)
 
 
 def _build_accelerator() -> str:
-    """Return the build accelerator without importing torch_fl.__init__."""
-    value = os.environ.get("ACCELERATOR", "").strip().lower()
-    if value:
-        return value
+    """Return the build accelerator without importing torch_fl.__init__.
+
+    From the build record alone, like torch_fl._build_accelerator() -- see that
+    function for why the environment is not consulted. Duplicated rather than
+    imported because importing torch_fl there would pull in torch.
+    """
     try:
         from torch_fl._build_config import ACCELERATOR
     except ImportError:

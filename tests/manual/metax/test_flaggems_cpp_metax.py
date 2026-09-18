@@ -19,7 +19,7 @@ This is the MetaX counterpart of tests/integration/ops/test_flaggems_cpp_dispatc
 Background: the C++ FlagGems path calls flag_gems' C++ entry points in
 liboperators.so, which JIT-compile and launch Triton kernels without touching
 Python or the GIL. It was previously CUDA-only on the torch_fl side because
-CMakeLists forced FLAGGEMS_CPP=OFF for ACCELERATOR=metax. FlagGems itself
+CMakeLists forced FLAGOS_BUILD_FLAGGEMS_CPP=OFF for FLAGOS_ACCELERATOR=metax. FlagGems itself
 does support MetaX (cpp/ -DFLAGGEMS_BACKEND=MACA), and its kernels reach the
 device through the same DeviceBoxingGuard the metax boxing path already uses,
 so the C++ path works here once liboperators.so is built for MACA.
@@ -37,24 +37,24 @@ Build prerequisites:
      `cmake --install`. When running straight out of the build dir, link it:
        ln -sfn <FlagGems>/triton_src <FlagGems>/cpp/triton_src
   2. torch_fl against it:
-       ACCELERATOR=metax VENDOR_KERNEL=OFF MACA_PATH=/opt/maca \
-       FLAGGEMS_CPP=1 FLAGGEMS_DIR=<FlagGems>/cpp/build-maca \
+       FLAGOS_ACCELERATOR=metax FLAGOS_BUILD_VENDOR=OFF MACA_PATH=/opt/maca \
+       FLAGOS_BUILD_FLAGGEMS_CPP=1 FLAGGEMS_DIR=<FlagGems>/cpp/build-maca \
        python setup.py build_ext --inplace
 
 Run (from repo root):
-    ACCELERATOR=metax \
+    FLAGOS_ACCELERATOR=metax \
     MACA_PATH=/opt/maca \
     LD_LIBRARY_PATH=/opt/maca/lib:/opt/maca/lib64:$LD_LIBRARY_PATH \
     PYTHONPATH=$PWD \
     python tests/manual/metax/test_flaggems_cpp_metax.py
 
 Each op is checked twice:
-  * routing -- with FLAGOS_LOG_DISPATCH=1 the dispatcher logs "-> flagos" for
+  * routing -- with FLAGOS_LOG=dispatch the dispatcher logs "-> flagos" for
     the C++ backend (vs "-> flagos_python" / "-> cuda"). Correct numerics alone
     would not prove the C++ path ran, since the boxing fallback is also correct.
   * numerics -- compared against the CPU result.
 Routing is checked in a subprocess because the backend table is read once, at
-the first dispatch, from FLAGOS_BACKEND_CONFIG.
+the first dispatch, from the conf torch_fl.backend_config_path() reports.
 """
 
 import os
@@ -72,10 +72,9 @@ def check(name, ok, detail=""):
 
 
 def _run_snippet(code):
-    """Run code in a fresh interpreter with the C++ FlagGems path enabled."""
+    """Run code in a fresh interpreter, with the dispatch log on."""
     env = os.environ.copy()
-    env["FLAGOS_USE_FLAGGEMS_CPP"] = "1"
-    env["FLAGOS_LOG_DISPATCH"] = "1"
+    env["FLAGOS_LOG"] = "dispatch"
 
     env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     # The dispatch log is what proves the C++ path ran; keep stderr separate.
@@ -104,8 +103,7 @@ def test_conf_selected():
     proc = _run_snippet(
         _PREAMBLE
         + """
-import os
-print("CONF=" + os.environ.get("FLAGOS_BACKEND_CONFIG", "<unset>"))
+print("CONF=" + (torch_fl.backend_config_path() or "<unset>"))
 """
     )
     conf = ""

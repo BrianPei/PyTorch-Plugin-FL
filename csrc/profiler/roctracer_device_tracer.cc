@@ -22,6 +22,7 @@
 // - Thread-local stacks maintain correlation context across API boundaries
 
 #include "device_tracer.h"
+#include <flagos_env.h>
 
 // ROCtracer headers require __HIP_PLATFORM_AMD__ to be defined before inclusion.
 #ifndef __HIP_PLATFORM_AMD__
@@ -56,10 +57,10 @@
 #include <cstdio>
 #include <optional>
 
-// Diagnostic logging gated behind FLAGOS_ROCTRACER_DEBUG=1
+// Diagnostic logging gated behind FLAGOS_TRACE=1
 namespace {
 inline bool flagos_roctracer_debug() {
-  static const bool on = (std::getenv("FLAGOS_ROCTRACER_DEBUG") != nullptr);
+  static const bool on = flagos_env::EnvFlag("FLAGOS_TRACE");
   return on;
 }
 }  // namespace

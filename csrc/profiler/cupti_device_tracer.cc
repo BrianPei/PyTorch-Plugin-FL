@@ -18,6 +18,7 @@
 
 #include "device_tracer.h"
 #include "cupti_shim.h"
+#include <flagos_env.h>
 
 #include <cxxabi.h>
 #include <dlfcn.h>
@@ -49,11 +50,11 @@
 #include <cuda_occupancy.h>
 #endif
 
-// Diagnostic logging is gated behind FLAGOS_CUPTI_SHIM_DEBUG=1 so that normal
+// Diagnostic logging is gated behind FLAGOS_TRACE=1 so that normal
 // profiling runs stay quiet (these callbacks fire once per buffer/session).
 namespace {
 inline bool flagos_cupti_debug() {
-  static const bool on = (std::getenv("FLAGOS_CUPTI_SHIM_DEBUG") != nullptr);
+  static const bool on = flagos_env::EnvFlag("FLAGOS_TRACE");
   return on;
 }
 }  // namespace
@@ -240,7 +241,7 @@ void reportLayoutMismatch(const char* what) {
            " CUpti_ActivityMemcpy6 layouts by hand, so a CUPTI whose record\n"
         << "[flagos]   layout differs cannot be decoded. GPU kernel events will"
            " be missing from the trace; CPU-side profiling is unaffected.\n"
-        << "[flagos]   Set FLAGOS_CUPTI_LIBRARY to a matching libcupti, or"
+        << "[flagos]   Set FLAGOS_TRACER_LIBRARY to a matching libcupti, or"
            " report this CUPTI version so its layout can be added.\n";
   });
   g_layout_reject_count.fetch_add(1, std::memory_order_relaxed);

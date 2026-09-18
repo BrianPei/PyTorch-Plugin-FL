@@ -30,15 +30,15 @@ pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
 git clone https://github.com/flagos-ai/PyTorch-Plugin-FL.git
 cd PyTorch-Plugin-FL
 
-ACCELERATOR=musa pip install --no-build-isolation -v -e .
+FLAGOS_ACCELERATOR=musa pip install --no-build-isolation -v -e .
 ```
 
 Build flags:
-- `ACCELERATOR=musa`: selects the MUSA build path and enables `VENDOR_KERNEL=ON`
-- `VENDOR_KERNEL=ON`: compiles generated `mudnn` operator kernels (automatic when `ACCELERATOR=musa`)
-- `FLAGGEMS_KERNEL=ON`: compiles the optional Python dispatcher callers into the same wheel; runtime routing comes from `backends_musa.conf`
-- `BOXING_KERNEL=OFF`: forced (the MUSA toolkit exports no CUDA symbols)
-- `FLAGGEMS_CPP=OFF`: automatically disabled because the FlagGems C++ runtime is not built for MUSA
+- `FLAGOS_ACCELERATOR=musa`: selects the MUSA build path and enables `FLAGOS_BUILD_VENDOR=ON`
+- `FLAGOS_BUILD_VENDOR=ON`: compiles generated `mudnn` operator kernels (automatic when `FLAGOS_ACCELERATOR=musa`)
+- `FLAGOS_BUILD_FLAGGEMS=ON`: compiles the optional Python dispatcher callers into the same wheel; runtime routing comes from `backends_musa.conf`
+- `FLAGOS_BUILD_BOXING=OFF`: forced (the MUSA toolkit exports no CUDA symbols)
+- `FLAGOS_BUILD_FLAGGEMS_CPP=OFF`: automatically disabled because the FlagGems C++ runtime is not built for MUSA
 - `--no-build-isolation`: **required** (without it, pip resolves its own torch into a build overlay, and the extension links against that instead of your installed torch, causing `import torch_fl` to fail with `undefined symbol: c10::ValueError`)
 
 The build runs `scripts/codegen/codegen_mudnn.py` to generate kernels. Coverage is **64 generated ops** plus 2 handwritten convolution kernels; native RNG kernels add muRAND-backed `rand`/`randn`, `rand_like`/`randn_like`, `randint`, `normal_`, `uniform_`, `random_`, and mudnn dropout paths. Everything outside those sets reaches the `cpu_fallback`.
@@ -103,9 +103,9 @@ executed with `flagtree 0.6.2a3+mthreads3.6` (Triton 3.6.0, backend `mthreads`).
 A generic PyPI Triton wheel is not sufficient -- it ships no `mthreads` backend
 -- and must not be used for this path.
 
-To pin the table to one backend for A/B measurement, set `ALL_USE_FLAGGEMS=1` or
-`ALL_USE_VENDOR=1` (mutually exclusive). Ops the target does not implement are
-listed on stderr and stay on their configured backend.
+To pin the table to one backend for A/B measurement, set
+`FLAGOS_FORCE_BACKEND` to `flaggems` or `vendor`. Ops the target does not
+implement are listed on stderr and stay on their configured backend.
 
 ## Testing
 
@@ -120,7 +120,7 @@ This test file checks that ops route to the `musa` backend, exercises per-op env
 Run the autocast and GradScaler suite:
 
 ```bash
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 ACCELERATOR=musa \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 FLAGOS_ACCELERATOR=musa \
   LD_LIBRARY_PATH=/usr/local/musa/lib:$LD_LIBRARY_PATH \
   pytest tests/integration/test_amp_contract.py -m amp -v
 ```
@@ -252,7 +252,7 @@ The native RNG and hybrid FlagGems implementation were measured on 2026-08-17 on
 - `pytest tests/integration/ops/test_musa_dispatch.py -v`: **89 passed** in 36.31 seconds.
 - `pytest tests/unit/test_vendor_routing.py tests/unit/test_musa_rng_bridge.py -v`: **24 passed** in 2.19 seconds.
 - `pytest tests/integration/ops/test_musa_flaggems.py -q`: **2 passed** in 5.33 seconds with `FLAGOS_USE_FLAGGEMS=1`. The test instruments and observes all seven selected Python callables (`all`, `all.dims`, `any`, `any.dims`, `repeat_interleave.Tensor`, `index_add`, and `index_add_`) on `flagos:0`, verifies CPU-equivalent outputs including duplicate indices, and executes FlagGems `randn` on `flagos:0` between native `rand` calls. Repeating the sequence after `torch.flagos.manual_seed(20260817)` reproduces all three outputs and confirms two shared C++ generator reservations.
-- Native and hybrid suites ran in separate pytest processes. Backend configuration is cached by the process-static C++ `BackendTable()`, so changing `FLAGOS_USE_FLAGGEMS` after a native import cannot switch the active routes.
+- Native and hybrid suites ran in separate pytest processes. Backend configuration is cached by the process-static C++ `BackendTable()`, so changing the conf the process resolved after a native import cannot switch the active routes.
 - The MThreads driver obtained the same nonzero raw `musaStream_t` that native mudnn/muRAND uses, so native and FlagGems launches share the torch-fl stream. In the `torch.compile` path this handle comes from `torch_fl.compile.flagtree_shim.get_musa_current_raw_stream()`, without consulting the `torch_musa` plugin.
 
 The generic `triton` 3.7.1 installation remains unsuitable because it does not ship the MThreads backend. FlagGems stochastic ATen routing is intentionally still native-first; the end-to-end FlagGems RNG evidence comes from its real `flag_gems.ops.randn.randn` kernel and the shared reservation bridge, not an expanded RNG dispatcher route.
@@ -280,7 +280,7 @@ correlation IDs: the former draws flow arrows and the latter attributes device t
 Run the focused hardware test on an MTT S5000 host:
 
 ```bash
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 ACCELERATOR=musa \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 FLAGOS_ACCELERATOR=musa \
 LD_LIBRARY_PATH=/usr/local/musa/lib:$LD_LIBRARY_PATH \
 pytest tests/integration/test_profiler_musa.py -q
 ```
@@ -291,8 +291,8 @@ metadata, and a valid Chrome trace JSON document. The same run exposed torch ext
 captured device events. CPU-only Kineto builds may not invoke the PrivateUse1 resolver, so this is
 an MUPTI device-timeline validation rather than a claim of full torch-cuda profiler parity.
 
-Useful diagnostics are `FLAGOS_MUPTI_DEBUG=1` for activity setup and session lifecycle logging and
-`FLAGOS_MUPTI_LIBRARY=/path/to/libmupti.so` to select a specific MUPTI library. MUPTI subscriber
+Useful diagnostics are `FLAGOS_TRACE=1` for activity setup and session lifecycle logging and
+`FLAGOS_TRACER_LIBRARY=/path/to/libmupti.so` to select a specific MUPTI library. MUPTI subscriber
 ownership remains process-global; an external MUSA profiling tool may therefore reject a concurrent
 `torch.profiler` session. `torch.compile` with the vendor FlagTree runtime is
 validated separately below; a stock Triton wheel remains insufficient for MUSA.
@@ -328,7 +328,7 @@ Use a process with the vendor runtime before running the focused compile tests:
 ```bash
 PYTHONPATH=/path/to/flagtree-mthreads-runtime:$PWD \\
 LD_LIBRARY_PATH=/path/to/flagtree-mthreads-runtime/triton/_C:/usr/local/musa/lib:$LD_LIBRARY_PATH \\
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 ACCELERATOR=musa FLAGOS_USE_FLAGTREE=1 \\
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 FLAGOS_ACCELERATOR=musa FLAGOS_USE_FLAGTREE=1 \\
 pytest tests/integration/test_compile.py -v
 ```
 
@@ -374,7 +374,7 @@ mudnn/muRAND plus CPU fallback remain usable for the ops it sends to `musa` or
 To build the runtime layer only (device/memory/stream support) with no native operator kernels:
 
 ```bash
-ACCELERATOR=musa VENDOR_KERNEL=OFF pip install --no-build-isolation -v -e .
+FLAGOS_ACCELERATOR=musa FLAGOS_BUILD_VENDOR=OFF pip install --no-build-isolation -v -e .
 ```
 
 All compute ops will fall back to CPU. This mode is useful for testing the runtime layer in isolation.

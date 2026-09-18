@@ -33,7 +33,7 @@ with no accelerated implementation:
 
     flaggems_cpp > flaggems > tileops > <vendor> > none
 
-`flaggems_cpp` is only emitted for the confs a FLAGGEMS_KERNEL=ON build selects
+`flaggems_cpp` is only emitted for the confs a FLAGOS_BUILD_FLAGGEMS=ON build selects
 (see FLAGGEMS_CPP_PLATFORMS); everywhere else those ops take the Python path to
 the same kernels, because the C++ dispatcher slot is not compiled in.
 
@@ -388,13 +388,14 @@ CSRC_DIR = REPO_ROOT / "csrc/aten"
 #
 # That slot is Backend::kFlagGemsCpp, registered in csrc/aten/flaggems_cpp_kernels.cc
 # behind `#ifdef FLAGOS_FLAGGEMS_CPP`, which csrc/CMakeLists.txt defines only for
-# a FLAGGEMS_KERNEL=ON build -- and CMakeLists.txt force-sets FLAGGEMS_KERNEL OFF
-# for ascend, dcu, musa, bpu, tsingmicro and non-boxing metax, because the path
-# needs FlagGems' liboperators.so built for that vendor.
+# a FLAGOS_BUILD_FLAGGEMS_CPP=ON build. That switch defaults ON for cuda and
+# tsingmicro and OFF everywhere else, and CMakeLists.txt pins it OFF for dcu,
+# musa and bpu, because the path needs FlagGems' liboperators.so built for that
+# vendor's toolkit.
 #
 # One platform now means one conf, so a conf can no longer be reserved for the
 # opt-in build that compiles the slot: backends_metax.conf is what every MetaX
-# build reads, with or without FLAGGEMS_KERNEL=ON. The key stays legal there
+# build reads, with or without FLAGOS_BUILD_FLAGGEMS_CPP=ON. The key stays legal there
 # because Dispatcher::GetFn (csrc/aten/dispatcher.h) degrades kFlagGemsCpp to the
 # boxing kernel when the slot is empty, instead of raising "backend not
 # registered". So the 17 measured C++ routes are used when a MACA-built FlagGems
@@ -1112,14 +1113,14 @@ NATIVE_KERNEL_PREFERRED = set()
 
 # Platforms whose build can compile the TileOPs slot (Backend::kTileOps). The
 # shims are Triton kernels needing an SM90 device plus the `tileops` package, and
-# setup.py force-sets TILEOPS_KERNEL=OFF for every ACCELERATOR != "cuda" -- so on
+# setup.py force-sets FLAGOS_BUILD_TILEOPS=OFF for every FLAGOS_ACCELERATOR != "cuda" -- so on
 # any other platform the slot is empty, Dispatcher::GetFn degrades kTileOps to
 # cuda_fn_, and on a native-kernel vendor that is empty too. Naming `tileops` in
 # those confs would therefore route a real op at nothing, which is the "backend
 # not registered" class of failure this full-coverage rework exists to remove.
 # No shipped conf is generated for plain cuda (codegen_ops.py writes
 # backends_cuda.conf), so this is currently empty and the key reaches confs only
-# through the `# tileops` annotation that FLAGOS_USE_TILEOPS reads.
+# through the `# tileops` annotation that FLAGOS_FORCE_BACKEND=tileops reads.
 TILEOPS_PLATFORMS = set()
 
 # The 17 FlagGems C++ ops verified on MetaX hardware (of the 18 in the shared C++
@@ -1390,7 +1391,8 @@ def vendor_native_ops(vendor: str) -> set:
     from what is compiled, and a conf edit cannot invent or lose a kernel.
 
     The annotation is still *emitted* -- it is what tells a reader (and
-    ALL_USE_VENDOR) that a kernel exists behind an op FlagGems currently wins.
+    FLAGOS_FORCE_BACKEND=vendor) that a kernel exists behind an op FlagGems
+    currently wins.
     """
     native_inc, _ = VENDORS[vendor]
     return registered_impls(CSRC_DIR / native_inc) | EXTRA_NATIVE.get(vendor, set())
@@ -1528,11 +1530,13 @@ def route(
     routes are the ones the per-platform gap sets are calibrated against; above
     the vendor kernel because the TileOps shims are the newer path being brought
     up, so where both exist the shim is what a run should exercise. The vendor
-    kernel stays reachable through the `# <vendor>` annotation and ALL_USE_VENDOR.
+    kernel stays reachable through the `# <vendor>` annotation and
+    FLAGOS_FORCE_BACKEND=vendor.
 
     An op the vendor implements but FlagGems or TileOps wins gets a trailing
     `# <vendor>` annotation. That is what tells a reader a kernel exists behind
-    the winning route, and what makes ALL_USE_VENDOR able to move the op.
+    the winning route, and what makes FLAGOS_FORCE_BACKEND=vendor able to move
+    the op.
     """
     if op not in registered:
         return "none"
@@ -1577,7 +1581,7 @@ def render(platform: str, vendor: str, routes: dict, boxing: bool = False) -> st
         "# Values:",
         "#   flaggems_cpp  FlagGems C++ runtime (liboperators.so)",
         "#   flaggems      FlagGems Python/Triton path",
-        "#   tileops       TileOPs Triton shims (needs TILEOPS_KERNEL=ON + SM90)",
+        "#   tileops       TileOPs Triton shims (needs FLAGOS_BUILD_TILEOPS=ON + SM90)",
         f"#   {vendor:<13} {vendor_desc}",
     ]
     if boxing:
@@ -1608,12 +1612,12 @@ def render(platform: str, vendor: str, routes: dict, boxing: bool = False) -> st
         "#",
         "# Override one op at runtime with FLAGOS_OP_<name>=<backend> (dots in",
         "# the op name become double underscores: FLAGOS_OP_mm__out=flaggems).",
-        "# Collapse the whole table onto one backend for A/B measurement with",
-        "# ALL_USE_FLAGGEMS=1 or ALL_USE_VENDOR=1 (mutually exclusive). An op",
-        "# only moves if that backend implements it -- known from the routed",
-        "# value plus its `# <backend>` annotation. The rest are reported on",
-        "# stderr and stay as configured, so ALL_USE_VENDOR is partial by",
-        "# nature: a vendor implements far fewer ops than FlagGems.",
+        "# Collapse the whole table onto one backend family for A/B measurement",
+        "# with FLAGOS_FORCE_BACKEND=flaggems|vendor|tileops. An op only moves if",
+        "# that backend implements it -- known from the routed value plus its",
+        "# `# <backend>` annotation. The rest are reported on stderr and stay as",
+        "# configured, so FLAGOS_FORCE_BACKEND=vendor is partial by nature: a",
+        "# vendor implements far fewer ops than FlagGems.",
         "",
     ]
     for op in sorted(routes):
@@ -1658,7 +1662,7 @@ def build_all(conf_dir: Path) -> dict:
 
     out = {}
     for vendor in VENDORS:
-        # A vendor build is FLAGGEMS_KERNEL=OFF, so the flaggems_cpp slot has no
+        # A vendor build is FLAGOS_BUILD_FLAGGEMS=OFF, so the flaggems_cpp slot has no
         # kernel -- withhold the key and let those ops take the Python path.
         cpp_here = fg_cpp if vendor in FLAGGEMS_CPP_PLATFORMS else set()
         py_here = fg_py if vendor in FLAGGEMS_PYTHON_PLATFORMS else set()
