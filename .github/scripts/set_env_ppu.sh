@@ -46,6 +46,15 @@ case "${CI_STAGE:-}" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Pin pip's download cache to RUNNER_TEMP for cross-platform consistency. On
+# several sibling platforms the container's /github/home mount is owned by a
+# different uid and pip silently disables its cache there; RUNNER_TEMP is
+# always owned by the container. This path must stay aligned with the cache
+# step in integration-test-ppu.yml.
+export PIP_CACHE_DIR="${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
+
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 # Use the official indexes by default: the PPU runner pod's HTTP proxy returns
 # 500 on HTTPS CONNECT to *.tuna.tsinghua.edu.cn, so the Tsinghua PyPI and

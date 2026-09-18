@@ -25,6 +25,15 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# The GitHub Actions container job mounts /github/home from the host; on this
+# image it is owned by a uid that differs from the runtime user, so pip disables
+# its download cache there ("not owned or is not writable by the current user")
+# and the actions/cache post step then finds an empty path. Route pip's cache to
+# RUNNER_TEMP, which the container always owns. This path must stay aligned with
+# the cache step in the platform integration workflow.
+export PIP_CACHE_DIR="${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
+
 # Retries are deliberate: the flagtree wheel is ~180MB and the shared mirror can
 # close a large-wheel response early (IncompleteRead) even though the package is
 # there. Retrying just the failed package beats restarting all of setup.

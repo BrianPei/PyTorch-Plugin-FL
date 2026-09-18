@@ -67,17 +67,19 @@ jobs:
       # the uploaded archive stays bounded to this run's downloads.
       - name: Reset pip cache dir
         shell: bash
-        run: rm -rf ~/.cache/pip
+        run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by the setup script is
       # still rebuilt fresh each run. Keyed on display_name so each platform
       # using this common workflow gets its own cache scope, and a platform's
       # build job shares its cache with the same platform's integration job.
+      # PIP_CACHE_DIR is pinned to RUNNER_TEMP (see each set_env_*.sh) for
+      # cross-platform consistency.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
+          path: ${{ runner.temp }}/pip-cache
           key: ${{ inputs.display_name }}-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
           restore-keys: |
             ${{ inputs.display_name }}-pip-${{ runner.os }}-

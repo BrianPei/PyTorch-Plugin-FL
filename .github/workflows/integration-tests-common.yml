@@ -67,21 +67,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Self-hosted runners accumulate stale wheels in ~/.cache/pip across
-      # runs (pip no longer passes --no-cache-dir); wipe before restore so
-      # the uploaded archive stays bounded to this run's downloads.
+      # Self-hosted runners accumulate stale wheels across runs (pip no longer
+      # passes --no-cache-dir); wipe before restore so the uploaded archive stays
+      # bounded to this run's downloads. The GCU container's /github/home mount
+      # is not writable by the runtime user, so the pip cache lives under
+      # RUNNER_TEMP (see PIP_CACHE_DIR in set_env_gcu.sh); wipe that path here.
       - name: Reset pip cache dir
         shell: bash
-        run: rm -rf ~/.cache/pip
+        run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by the setup script is
       # still rebuilt fresh each run. Keyed on display_name so each platform
-      # using this common workflow gets its own cache scope.
+      # using this common workflow gets its own cache scope. The path must
+      # match PIP_CACHE_DIR exported by set_env_gcu.sh: RUNNER_TEMP is owned by
+      # the container, /github/home is not.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
+          path: ${{ runner.temp }}/pip-cache
           key: ${{ inputs.display_name }}-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
           restore-keys: |
             ${{ inputs.display_name }}-pip-${{ runner.os }}-

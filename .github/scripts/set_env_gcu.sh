@@ -40,6 +40,15 @@ CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.or
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-2.10.0}"
 PIP_INDEX_URL_ARG="${TORCH_FL_PIP_INDEX_URL:-https://pypi.org/simple}"
 
+# The GitHub Actions container job mounts /github/home from the host; on the GCU
+# image it is owned by a uid that differs from the runtime user, so pip disables
+# its download cache there ("not owned or is not writable by the current user")
+# and the actions/cache post step then finds an empty path. Route pip's cache to
+# RUNNER_TEMP, which the container always owns. This path must stay aligned with
+# the cache step in integration-tests-common.yml.
+export PIP_CACHE_DIR="${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
+
 discover_tops_root() {
   local candidate found
   local -a candidates=(

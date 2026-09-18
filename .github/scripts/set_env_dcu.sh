@@ -24,6 +24,16 @@ case "${CI_STAGE:-}" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# The GitHub Actions container job mounts /github/home from the host; on this
+# image it is owned by a uid that differs from the runtime user, so pip disables
+# its download cache there ("not owned or is not writable by the current user")
+# and the actions/cache post step then finds an empty path. Route pip's cache to
+# RUNNER_TEMP, which the container always owns. This path must stay aligned with
+# the cache step in the platform integration workflow.
+export PIP_CACHE_DIR="${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
+
 CPU_TORCH_INDEX_URL="${TORCH_FL_CPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
 PIP_INDEX_URL_ARG="${TORCH_FL_PIP_INDEX_URL:-https://pypi.org/simple}"
 
