@@ -63,11 +63,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      # Job-scoped so pip invocations in later steps (install wheel, pytest)
-      # share the cache directory restored/saved above, not just the set_env
-      # step's own shell. Must match the cache step's path.
-      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -83,9 +78,10 @@ jobs:
 
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by the setup script is
-      # still rebuilt fresh each run. PIP_CACHE_DIR is set at job scope (see
-      # the env block) so pip invocations in later steps (install wheel,
-      # pytest) share the cache directory, not just the set_env step's shell.
+      # still rebuilt fresh each run. PIP_CACHE_DIR is persisted to
+      # $GITHUB_ENV by the setup script, so pip invocations in later steps
+      # (install wheel, pytest) share the cache directory, not just the
+      # set_env step's shell.
       #
       # The key carries an -integration- stage suffix: this job and the build
       # job share display_name via all-tests-common, so without the suffix an

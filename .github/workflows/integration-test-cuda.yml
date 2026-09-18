@@ -66,11 +66,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      # Job-scoped so every step (set_env, build, install wheel) shares the
-      # cache directory restored/saved above, not just the set_env step's own
-      # shell. Must match the cache step's path.
-      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -88,8 +83,8 @@ jobs:
       # set_env_cuda.sh (they download fast from pytorch.org and would bloat
       # the archive past the self-hosted runner's upload capacity). The cache
       # only skips the download, not the install, so the isolated venv is still
-      # rebuilt fresh each run. PIP_CACHE_DIR is set at job scope (see the env
-      # block) so every step shares the cache directory.
+      # rebuilt fresh each run. PIP_CACHE_DIR is persisted to $GITHUB_ENV by
+      # set_env_cuda.sh so every step shares the cache directory.
       #
       # set_env_cuda.sh is hashed because the real version pins (torch,
       # flagtree, FlagGems revision) live there; without it a pin bump leaves
