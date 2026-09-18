@@ -66,6 +66,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Job-scoped so every step (set_env, build, install wheel) shares the
+      # cache directory restored/saved above, not just the set_env step's own
+      # shell. Must match the cache step's path.
+      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -77,17 +82,24 @@ jobs:
         shell: bash
         run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
-      # Cache pip downloads across runs so the heavy wheels (CPU torch,
-      # transformers, flagtree) are fetched once and reused. The cache only
-      # skips the download, not the install, so the isolated venv is still
-      # rebuilt fresh by set_env_cuda.sh each run; this never risks reusing a
-      # stale environment the way a venv cache would. PIP_CACHE_DIR is pinned
-      # to RUNNER_TEMP (see set_env_cuda.sh) for cross-platform consistency.
+      # Cache pip downloads across runs so the smaller venv-side wheels
+      # (transformers, flagtree, pytest) are fetched once and reused. The
+      # giant CUDA and CPU torch wheels are excluded via --no-cache-dir in
+      # set_env_cuda.sh (they download fast from pytorch.org and would bloat
+      # the archive past the self-hosted runner's upload capacity). The cache
+      # only skips the download, not the install, so the isolated venv is still
+      # rebuilt fresh each run. PIP_CACHE_DIR is set at job scope (see the env
+      # block) so every step shares the cache directory.
+      #
+      # set_env_cuda.sh is hashed because the real version pins (torch,
+      # flagtree, FlagGems revision) live there; without it a pin bump leaves
+      # the key unchanged, the exact-hit skips the save, and the new wheels are
+      # discarded every run.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_cuda.sh') }}
           restore-keys: |
             cuda-pip-${{ runner.os }}-py312-
 

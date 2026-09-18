@@ -63,6 +63,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Job-scoped so pip invocations in later steps (install wheel, pytest)
+      # share the cache directory restored/saved above, not just the set_env
+      # step's own shell. Must match the cache step's path.
+      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -78,16 +83,25 @@ jobs:
 
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by the setup script is
-      # still rebuilt fresh each run. Keyed on display_name so each platform
-      # using this common workflow gets its own cache scope. The path must
-      # match PIP_CACHE_DIR exported by set_env_gcu.sh: RUNNER_TEMP is owned by
-      # the container, /github/home is not.
+      # still rebuilt fresh each run. PIP_CACHE_DIR is set at job scope (see
+      # the env block) so pip invocations in later steps (install wheel,
+      # pytest) share the cache directory, not just the set_env step's shell.
+      #
+      # The key carries an -integration- stage suffix: this job and the build
+      # job share display_name via all-tests-common, so without the suffix an
+      # exact hit on the build cache would skip the save and discard the
+      # integration-only downloads (pytest, test deps). restore-keys fall back
+      # to the build prefix so the build cache is reused, then to the legacy
+      # unsuffixed key for migration. The setup script is hashed because the
+      # real version pins live there, not in pyproject/setup.py.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: ${{ inputs.display_name }}-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          key: ${{ inputs.display_name }}-integration-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_*.sh') }}
           restore-keys: |
+            ${{ inputs.display_name }}-integration-pip-${{ runner.os }}-
+            ${{ inputs.display_name }}-build-pip-${{ runner.os }}-
             ${{ inputs.display_name }}-pip-${{ runner.os }}-
 
       - name: Prepare platform environment

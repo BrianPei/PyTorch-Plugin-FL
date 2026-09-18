@@ -57,6 +57,11 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Job-scoped so every step (set_env, build, install wheel) shares the
+      # cache directory restored/saved above, not just the set_env step's own
+      # shell. Must match the cache step's path.
+      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
 
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +75,18 @@ jobs:
 
       # Cache pip downloads across runs. The cache only skips the download,
       # not the install, so the environment prepared by set_env_dcu.sh is
-      # still rebuilt fresh each run. The container's /github/home mount is
-      # not writable by the runtime user, so the pip cache lives under
-      # RUNNER_TEMP (matching PIP_CACHE_DIR in set_env_dcu.sh).
+      # still rebuilt fresh each run. PIP_CACHE_DIR is set at job scope (see
+      # the env block) and points at RUNNER_TEMP, which the container owns;
+      # /github/home is not writable by the runtime user on this image.
+      #
+      # set_env_dcu.sh is hashed because the real version pins live there;
+      # without it a pin bump leaves the key unchanged, the exact-hit skips the
+      # save, and the newly downloaded wheels are discarded every run.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: dcu-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py') }}
+          key: dcu-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_dcu.sh') }}
           restore-keys: |
             dcu-pip-${{ runner.os }}-
 

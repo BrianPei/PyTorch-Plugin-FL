@@ -426,7 +426,11 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
 fi
 
 "$VENV_PYTHON" -m pip install --upgrade pip "setuptools>=64,<77" "setuptools-scm>=8,<10" "wheel==0.46.2" cmake build
-"$VENV_PYTHON" -m pip install \
+# --no-cache-dir mirrors the vendor-torch install above: the CPU torch wheel
+# is ~800 MB and would dominate the cache archive, pushing the upload past the
+# self-hosted runner's capacity. It downloads quickly from pytorch.org; the
+# cache's value is the smaller wheels (transformers, flagtree, pytest).
+"$VENV_PYTHON" -m pip install --no-cache-dir \
   --index-url "$CPU_TORCH_INDEX_URL" \
   "torch==$CPU_TORCH_VERSION"
 
