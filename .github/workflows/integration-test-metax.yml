@@ -62,7 +62,7 @@ jobs:
       - name: Prepare MetaX build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_metax.sh
+        run: bash .github/scripts/set_env.sh --platform metax
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation

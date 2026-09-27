@@ -87,7 +87,7 @@ jobs:
       - name: Prepare PPU build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_ppu.sh
+        run: bash .github/scripts/set_env.sh --platform ppu
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation

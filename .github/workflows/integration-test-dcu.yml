@@ -64,7 +64,7 @@ jobs:
       - name: Prepare DCU build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_dcu.sh
+        run: bash .github/scripts/set_env.sh --platform dcu
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation

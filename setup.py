@@ -878,6 +878,12 @@ def _install_requires():
     # install ~200 MB of the wrong artifact (or fail to resolve outright). All
     # flag_gems imports in the Python layer are ImportError-guarded, so omitting
     # it is safe.
+    #
+    # The floor is intentional, not the version CI tests. CI installs the
+    # published FlagOS wheel pinned in .github/version-pins.env
+    # (FLAGGEMS_VERSION_DEFAULT), which is ahead of this floor; the floor only
+    # guarantees the API this wheel's generated kernels call exists. Bumping the
+    # floor to match CI would force every downstream install onto one build.
     if not _vendor_supplies_triton():
         reqs += ["flag_gems>=5.0.2", "triton>=3.5.1"]
     # For a CUDA wheel we bundle libtorch_cuda.so and preload it at import; it

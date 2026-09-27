@@ -114,3 +114,49 @@ venv_is_usable() {
   [[ -x "$VENV_PYTHON" ]] || return 1
   "$VENV_PYTHON" -m pip --version >/dev/null 2>&1
 }
+
+# ---------------------------------------------------------------------------
+# Shared provisioning phases.
+#
+# The seven scripts ran the same steps in the same order with only the SDK
+# discovery, vendor-interpreter choice and asset staging differing. These five
+# are the steps that were byte-for-byte the same modulo the pins, so they live
+# here too; the platform scripts call them instead of repeating the command.
+
+# Install the CPU-only PyTorch the isolated venv is built on.
+install_cpu_torch() {
+  "$VENV_PYTHON" -m pip install \
+    --index-url "$CPU_TORCH_INDEX_URL" \
+    "torch==${CPU_TORCH_VERSION}"
+}
+
+# Install the published FlagTree wheel for this platform (its Triton build).
+install_flagtree() {
+  pip_retry --no-deps --only-binary=:all: --index-url "$FLAGTREE_INDEX_URL" \
+    "flagtree===${FLAGTREE_VERSION}"
+}
+
+# Install the published FlagCX wheel and point torch at the flagos backend.
+install_flagcx() {
+  pip_retry --no-deps --only-binary=:all: --index-url "$FLAGGEMS_INDEX_URL" \
+    "flagcx===${FLAGCX_VERSION}"
+  export FLAGCX_TORCH_BACKEND=flagos
+}
+
+# Build the in-tree extension so package_data sees libtorch_fl.so before the
+# common workflow runs `python -m build`.
+build_flagos_inplace() {
+  cd "$REPO_ROOT"
+  python setup.py build_ext --inplace
+}
+
+# Persist the named variables to $GITHUB_ENV for later workflow steps. Every
+# name must be assigned before the call: they are read with ${!name} under
+# `set -u`.
+export_ci_env() {
+  [[ -n "${GITHUB_ENV:-}" ]] || return 0
+  local name
+  for name in "$@"; do
+    printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
+  done
+}

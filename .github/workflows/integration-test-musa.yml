@@ -63,7 +63,7 @@ jobs:
       - name: Prepare MUSA build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_musa.sh
+        run: bash .github/scripts/set_env.sh --platform musa
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation

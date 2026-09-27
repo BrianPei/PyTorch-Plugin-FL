@@ -33,6 +33,8 @@ SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
 PINS = REPO_ROOT / ".github" / "version-pins.env"
 
 PLATFORMS = ["cuda", "ascend", "dcu", "gcu", "metax", "musa", "ppu"]
+RUNNER = SCRIPTS_DIR / "set_env.sh"
+HOOKS_DIR = SCRIPTS_DIR / "hooks"
 
 SHARED_PINS = [
     "CPU_TORCH_VERSION_DEFAULT",
@@ -77,15 +79,15 @@ def test_pin_file_defines_every_shared_pin():
         assert pins.get(f"FLAGTREE_VERSION_{platform}"), platform
 
 
-def test_every_script_sources_the_pin_file():
-    for platform in PLATFORMS:
-        text = (SCRIPTS_DIR / f"set_env_{platform}.sh").read_text(encoding="utf-8")
-        assert 'source "${REPO_ROOT}/.github/version-pins.env"' in text, platform
+def test_the_runner_sources_the_pin_file():
+    """One entrypoint sources the pins; the hooks inherit them."""
+    text = RUNNER.read_text(encoding="utf-8")
+    assert 'source "${REPO_ROOT}/.github/version-pins.env"' in text
 
 
 def test_scripts_read_their_platform_flagtree_pin():
     for platform in PLATFORMS:
-        text = (SCRIPTS_DIR / f"set_env_{platform}.sh").read_text(encoding="utf-8")
+        text = (HOOKS_DIR / f"set_env_{platform}.sh").read_text(encoding="utf-8")
         assert (
             f'FLAGTREE_VERSION="${{TORCH_FL_FLAGTREE_VERSION:-$FLAGTREE_VERSION_{platform}}}"'
             in text
@@ -95,7 +97,7 @@ def test_scripts_read_their_platform_flagtree_pin():
 def test_no_script_keeps_a_literal_copy_of_a_shared_pin():
     """The grep that proves a pin bump is one edit, not seven."""
     for platform in PLATFORMS:
-        text = (SCRIPTS_DIR / f"set_env_{platform}.sh").read_text(encoding="utf-8")
+        text = (HOOKS_DIR / f"set_env_{platform}.sh").read_text(encoding="utf-8")
         for literal in FORBIDDEN_LITERAL_DEFAULTS:
             assert literal not in text, f"{platform}: still hard-codes {literal!r}"
 

@@ -34,7 +34,9 @@ from pathlib import Path
 import pytest
 
 
-_SCRIPT_PATH = Path(__file__).resolve().parents[2] / ".github/scripts/set_env_dcu.sh"
+_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2] / ".github/scripts/hooks/set_env_dcu.sh"
+)
 _SCRIPT = _SCRIPT_PATH.read_text(encoding="utf-8")
 
 # A `while <condition>; do ... done` preamble, across continuation lines.

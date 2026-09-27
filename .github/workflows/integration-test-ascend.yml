@@ -74,7 +74,7 @@ jobs:
       - name: Prepare Ascend build environment
         env:
           CI_STAGE: build
-        run: bash .github/scripts/set_env_ascend.sh
+        run: bash .github/scripts/set_env.sh --platform ascend
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation

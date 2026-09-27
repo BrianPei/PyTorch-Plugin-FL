@@ -72,7 +72,7 @@ jobs:
       - name: Prepare CUDA build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_cuda.sh
+        run: bash .github/scripts/set_env.sh --platform cuda
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation
