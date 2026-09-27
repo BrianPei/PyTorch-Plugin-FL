@@ -83,8 +83,10 @@ root-cause filing. Raw JSON remains outside the repository at
 
 ### What has changed since this baseline
 
-Four of the five causes have a fix; the fifth is the only reason this baseline is
-not fully resolved.
+All five causes have a fix. For one of them (#263) that is not the same thing as
+all of its nodeids passing: the collective failure the row names is gone, and the
+three nodeids that used to be blocked behind it now reach a separate defect in
+FSDP2's stream setup instead.
 
 - **#250, #265** (device context poisoning, and its `test_model_parallelism`
   trigger) — closed 2026-09-15, the same day PR #280 (`6b2af4b`, "stage
@@ -108,18 +110,30 @@ not fully resolved.
   MUSA integer division through mudnn and promote true division").
 - **#264** (TorchInductor/Triton requires CUDA libraries) — PR #419 (`48829b8`,
   "ask torch, not the redirected probe, before aliasing cuda to flagos").
-- **#263** (ProcessGroupGloo rejects `flagos` tensors) — still open. Its six
-  FSDP2 nodeids are the remaining known failures of this baseline, and the failure
-  reproduces today: `RuntimeError: ProcessGroupGloo::allreduce: unsupported device
-  type flagos`.
+- **#263** (ProcessGroupGloo rejects `flagos` tensors) — PR #435 (2026-09-27, "answer gloo
+  requests with the flagos backend and stage collectives over host memory"). gloo cannot be
+  repaired from the gloo side, so the request is answered with the `flagos` backend before the
+  backend config is built, and `ProcessGroupFlagOS` grew a last tier that stages
+  collectives through host memory over a real gloo group
+  (`docs/architecture/distributed-flagcx.md` §0.4 has the mechanism and the
+  measurements). Re-measured with the same harness on this change over `05be850`:
+  `{"PASS": 3, "FAIL": 3}` of the six FSDP2 nodeids, against six failures at
+  baseline. The three that pass are `test_fsdp2_save_load`,
+  `test_fsdp2_sharding_structure_0_untied` and `test_fsdp2_sharding_structure_1_tied`.
+  The three that fail are `test_fsdp2_plan_vs_ddp_0_untied`, `test_fsdp2_plan_vs_ddp_1_tied`
+  and `test_fsdp2_save_load_dcp`, and they fail *after* the collectives, in
+  `_fsdp_param_group.py::FSDPCommContext.lazy_init`, with `RuntimeError: libascendcl.so
+  not found. ACL runtime is required` — `torch_fl.flagos.Stream` sends every non-GCU
+  platform without a CUDA runtime to the Ascend ACL stream. That is a MUSA gap with no
+  issue of its own yet, not the collective path this row tracks.
 
 Because `Affected tests` and the baseline header above describe `64e60dd`, the
 whole table is a dated snapshot and not a statement about the current tree.
 Re-running the baseline is what refreshes it — and is also what fills in the
 `Fingerprint` column, per the note above. The closures above are recorded from the
-issues and the commits that landed; only the #268 re-measurement re-ran any of
-this baseline's tests, and it covers eight nodeids out of twenty, so the other
-four causes are **not revalidated** here.
+issues and the commits that landed; two re-measurements have re-run any of this
+baseline's tests since — #268's eight borrowed nodeids and #263's six — so the rows
+for #250/#265, #264 and #266 are **not revalidated** here.
 
 ### Failed test inventory
 

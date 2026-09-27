@@ -112,6 +112,18 @@ Logging and tracing. None of these changes routing.
 | `FLAGOS_TRACE` | Runtime | `0` (off) | Verbose logging in the device profiler shim compiled into this build. One switch covers every accelerator: exactly one device tracer is compiled per build, so the name is never ambiguous |
 | `FLAGOS_TRACER_LIBRARY` | Runtime | Auto-discovered | Override the tracer library the profiler shim `dlopen`s, when the default path does not match the installed driver |
 
+### Distributed
+
+How `torch.distributed` picks a backend for the flagos device. The `"flagos"`
+backend is registered at import; these switches cover the two cases where a
+caller does *not* ask for it by name. See
+[distributed over FlagCX](../architecture/distributed-flagcx.md).
+
+| Variable | Scope | Default | Purpose |
+|----------|-------|---------|---------|
+| `FLAGOS_DIST_REDIRECT_GLOO` | Runtime | `1` (on) | Answer a plain `init_process_group(backend="gloo")` or `new_group` request with the flagos backend when the process accelerator is the flagos device. `torch.distributed` routes any device type it does not recognise to gloo, and a `ProcessGroupGloo` rejects flagos tensors with `unsupported device type flagos` ([#263](https://github.com/flagos-ai/Torch-FL/issues/263)). Set `0` to keep the requested backend |
+| `FLAGOS_DIST_STAGED_GLOO` | Runtime | `1` (on) | Allow the host-staged gloo inner backend: the last fallback tier of the `"flagos"` backend when no vendor communicator (FlagCX/NCCL/HCCL/MCCL) is available. It needs no vendor library at all but copies every flagos operand device->host->device per collective. Set `0` to fail loudly instead of staging. One warning is emitted the first time a group is built on this tier |
+
 ### Vendor compatibility
 
 Import-time shims that adapt a vendor's torch or driver to the flagos device.

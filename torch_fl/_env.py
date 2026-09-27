@@ -479,6 +479,23 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
         "the complex exponential diffusers would otherwise fall back to; set 1 to "
         "measure that difference. A capability switch, not a route switch",
     ),
+    # --- Distributed -----------------------------------------------------
+    "FLAGOS_DIST_REDIRECT_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Answer a plain init_process_group(backend='gloo') / new_group request "
+        "with the flagos backend when the process accelerator is the flagos "
+        "device. Set 0 to keep the requested backend, which then rejects flagos "
+        "tensors. See torch_fl/comm/process_group.py",
+    ),
+    "FLAGOS_DIST_STAGED_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Allow the host-staged gloo inner backend: the last fallback tier when no "
+        "vendor communicator (FlagCX/NCCL/HCCL/MCCL) is available. It needs no "
+        "vendor library but copies every flagos operand device->host->device. Set "
+        "0 to fail loudly instead of staging",
+    ),
     "FLAGOS_DIST_FORCE_NCCL": (
         SCOPE_TEST,
         "0 (off)",

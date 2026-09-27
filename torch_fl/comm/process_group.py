@@ -25,7 +25,22 @@ backend, so callers (including the DDP Reducer) get properly typed futures.
 
 Vendor selection is table-driven by GEMS_VENDOR (see ``_VENDOR_PROFILES``).
 For every vendor the inner-backend priority is FlagCX first, then the vendor's
-native backend (NCCL for CUDA-ABI vendors, HCCL for Ascend).
+native backend (NCCL for CUDA-ABI vendors, HCCL for Ascend, MCCL for MUSA), and
+finally a host-staged gloo backend, which needs no vendor library at all but pays
+a device->host->device copy per collective (``_try_build_staged_gloo``). Set
+``FLAGOS_DIST_STAGED_GLOO=0`` to decline that last tier and fail loudly instead.
+
+Gloo requests
+    ``"flagos"`` has to be asked for by name, and not every caller does.
+    torch.distributed picks gloo for any device type it does not recognise, so
+    ``init_process_group(backend="gloo")`` -- what torchrun and the
+    transformers FSDP2 tests build on a flagos host -- lands on a
+    ProcessGroupGloo, whose C++ collectives reject flagos tensors outright and
+    cannot be extended from Python. ``redirect_gloo_requests`` therefore
+    interposes on ``init_process_group`` / ``new_group`` and substitutes the
+    flagos backend for a gloo request, but only when the process's accelerator
+    is the flagos device, i.e. when gloo has nothing else to fall back on. Set
+    ``FLAGOS_DIST_REDIRECT_GLOO=0`` to keep the requested backend.
 
 View conversion
     flagos tensors on CUDA-ABI vendors
@@ -218,6 +233,160 @@ def _tll(tensor_lists, view_fn):
 
 
 # ---------------------------------------------------------------------------
+# Host-staged gloo fallback
+# ---------------------------------------------------------------------------
+
+# Both names are the same device: "flagos" is the registered privateuse1 name,
+# and torch.device("privateuseone") reports it too once the backend is renamed.
+_HOST_STAGED_TYPES = ("privateuseone", "flagos")
+
+
+def _stage_to_host(obj, staged):
+    """Deep-copy every flagos tensor in ``obj`` to host memory.
+
+    Host tensors, split-size lists and option objects are returned untouched.
+    Each ``(device_tensor, host_tensor)`` pair is appended to ``staged`` so the
+    result can be copied back once the collective has run; that covers output
+    operands too, whose host shadow is the buffer gloo writes into.
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.device.type in _HOST_STAGED_TYPES:
+            host = obj.detach().to("cpu")
+            staged.append((obj, host))
+            return host
+        return obj
+    if isinstance(obj, list):
+        return [_stage_to_host(item, staged) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_stage_to_host(item, staged) for item in obj)
+    return obj
+
+
+def _completed_work():
+    """A Work object for a collective this process already finished itself.
+
+    The staging copy-back happens before the caller sees the Work, so the Work
+    only has to be waitable; c10d's future-backed Work is exactly that.
+    """
+    future = torch.futures.Future()
+    future.set_result(None)
+    return _c10d._create_work_from_future(future)
+
+
+def _allgather_into_tensor_coalesced(group, output_tensors, input_tensors, opts):
+    """gloo's ``_allgather_base`` repeated over the coalesced tensor lists."""
+    work = None
+    for output, input_ in zip(output_tensors, input_tensors):
+        work = group._allgather_base(output, input_, opts)
+    return work
+
+
+def _reduce_scatter_tensor_coalesced(group, output_tensors, input_tensors, opts):
+    """gloo's ``_reduce_scatter_base`` repeated over the coalesced tensor lists."""
+    work = None
+    for output, input_ in zip(output_tensors, input_tensors):
+        work = group._reduce_scatter_base(output, input_, opts)
+    return work
+
+
+# gloo implements neither of these two virtuals. Left to ProcessGroup's C++
+# base they resolve a backend for the operand's device and raise "No backend
+# type associated with device type flagos" -- and they are the path the
+# functional collectives (all_gather_into_tensor / reduce_scatter_tensor, and
+# therefore DeviceMesh and FSDP2) actually take. Expressing them over gloo's
+# single-tensor base calls is what keeps that path working without a vendor
+# communicator.
+_GLOO_SYNTHESISED_OPS = {
+    "allgather_into_tensor_coalesced": _allgather_into_tensor_coalesced,
+    "reduce_scatter_tensor_coalesced": _reduce_scatter_tensor_coalesced,
+}
+
+
+class _HostStagedGloo:
+    """Run a real gloo group on flagos operands staged through host memory.
+
+    Used as ``ProcessGroupFlagOS._inner`` on hosts where no vendor communicator
+    exists. gloo is built into c10d but its collectives are C++ overrides that
+    reject anything but cpu/cuda tensors, so a flagos operand has to arrive as
+    host memory: every call whose arguments mention one is turned into "copy to
+    host, run gloo, copy the result back", and every other call is forwarded
+    verbatim so cpu tensors keep gloo's own behaviour unchanged.
+
+    The copy-back is synchronous, before the Work is returned -- callers that
+    read the operands after ``wait()`` therefore see the result, and the host
+    shadow of an output operand is what gloo filled in.
+
+    ``group`` is the real ProcessGroupGloo behind the staging. It is not a
+    detail: it is the only object here that is a c10d ``Backend``, so it is
+    what ``ProcessGroupFlagOS._register_inner_backend`` registers for group
+    identity (name, rank, size); the facade itself cannot be registered.
+    """
+
+    def __init__(self, group):
+        self.group = group
+
+    @property
+    def c10d_backend(self):
+        """The real gloo group, i.e. the only c10d ``Backend`` in this facade."""
+        return self.group
+
+    def __getattr__(self, name):
+        try:
+            op = getattr(self.group, name)
+        except AttributeError:
+            synthesis = _GLOO_SYNTHESISED_OPS.get(name)
+            if synthesis is None:
+                raise
+            # The synthesised helpers take the group as their first argument
+            # because they are also readable on their own; bind it here so _run
+            # only has to forward the caller's arguments.
+            return functools.partial(
+                self._run, functools.partial(synthesis, self.group)
+            )
+        if not callable(op):
+            return op
+        return functools.partial(self._run, op)
+
+    def _run(self, op, *args, **kwargs):
+        staged = []
+        host_args = _stage_to_host(args, staged)
+        host_kwargs = _stage_to_host(kwargs, staged)
+        if not staged:
+            return op(*args, **kwargs)
+        op(*host_args, **host_kwargs).wait()
+        for device_tensor, host_tensor in staged:
+            device_tensor.copy_(host_tensor)
+        return _completed_work()
+
+    def __repr__(self):
+        return f"_HostStagedGloo({self.group!r})"
+
+
+# Warned about once per process, not once per group: a job that builds one
+# group per rank pair would otherwise repeat the same notice forever.
+_STAGED_GLOO_WARNED = False
+
+
+def _warn_staged_gloo() -> None:
+    """Report that collectives are being staged through host memory.
+
+    Not an error -- the group works -- but it is a silent order-of-magnitude
+    slowdown if it happens on a host that also has a vendor communicator that
+    merely failed to load, so it must be visible in the log.
+    """
+    global _STAGED_GLOO_WARNED
+    if _STAGED_GLOO_WARNED:
+        return
+    _STAGED_GLOO_WARNED = True
+    warnings.warn(
+        "[ProcessGroupFlagOS] no vendor communicator (FlagCX/NCCL/HCCL/MCCL) is "
+        "available; falling back to host-staged gloo. Collectives still run, but "
+        "every flagos operand is copied device->host->device. Set "
+        "FLAGOS_DIST_STAGED_GLOO=0 to make this an error instead."
+    )
+
+
+# ---------------------------------------------------------------------------
 # GCU device guard decorator
 # ---------------------------------------------------------------------------
 
@@ -296,12 +465,14 @@ def _gcu_device_guard(func):
 class ProcessGroupFlagOS(dist.ProcessGroup):
     """ProcessGroup backend for flagos (PrivateUse1).
 
-    Wraps an underlying NCCL or FlagCX ProcessGroup.  Each collective virtual
-    method converts privateuseone tensors to the appropriate backend view before
-    delegating; the inner backend's Work is returned directly.
+    Wraps an underlying FlagCX, vendor-native or host-staged-gloo ProcessGroup.
+    Each collective virtual method converts privateuseone tensors to the
+    appropriate backend view before delegating; the inner backend's Work is
+    returned directly.
 
     Instantiated by the ``creator_fn`` registered via
-    ``dist.Backend.register_backend``.  Do not instantiate directly.
+    ``dist.Backend.register_backend`` -- either by name, or for a plain gloo
+    request through ``redirect_gloo_requests``. Do not instantiate directly.
     """
 
     def __init__(self, store, rank: int, world_size: int, timeout=None):
@@ -339,6 +510,10 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
         inner = getattr(self, "_inner", None)
         if inner is None:
             return
+        # _HostStagedGloo is a facade, not a Backend: what has to be registered
+        # for the group identity to have somewhere to live is the gloo group it
+        # wraps (see its c10d_backend property).
+        inner = getattr(inner, "c10d_backend", inner)
         try:
             device = torch.device("privateuseone", max(torch.cuda.current_device(), 0))
             self._register_backend(device, dist.ProcessGroup.BackendType.CUSTOM, inner)
@@ -350,9 +525,10 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
 
         Table-driven by GEMS_VENDOR (see _VENDOR_PROFILES). For every vendor the
         priority is: FlagCX (heterogeneous unified comm) first, then the vendor's
-        native backend (NCCL / HCCL). The returned callable maps a flagos
-        (privateuseone) tensor to the physical device view the chosen inner
-        backend expects; it is the identity for tensors already off flagos.
+        native backend (NCCL / HCCL / MCCL), then host-staged gloo. The returned
+        callable maps a flagos (privateuseone) tensor to the physical device view
+        the chosen inner backend expects; it is the identity for tensors already
+        off flagos, and None for the staged tier, which converts operands itself.
         """
         vendor = os.environ.get("GEMS_VENDOR", _DEFAULT_VENDOR)
         prof = _get_profile(vendor)
@@ -372,9 +548,17 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
             if native_fn(store, rank, world_size, timeout):
                 return self._resolve_view(prof, vendor, backend="native")
 
+        # --- Host-staged gloo (last resort: needs no vendor library) ---
+        if self._try_build_staged_gloo(store, rank, world_size, timeout):
+            # No view conversion on this path: _HostStagedGloo stages the flagos
+            # operands through host memory itself, so a device view would be both
+            # unnecessary and wrong (gloo wants cpu tensors, not cuda ones).
+            return None
+
         # getattr because the unit tests drive _build_inner on __new__ instances
         # that never ran __init__ (see tests/unit/test_vendor_routing.py).
         reason = getattr(self, "_nccl_skip_reason", None)
+        staged_reason = getattr(self, "_staged_skip_reason", None)
         raise RuntimeError(
             f"ProcessGroupFlagOS: no suitable inner backend for "
             f"GEMS_VENDOR={vendor!r}. Install/import flagcx (heterogeneous), or "
@@ -383,6 +567,11 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
             f"CPU-only torch wheel + external libtorch_cuda, build the "
             f"_flagos_nccl extension (torch_fl/comm/_nccl_ext/build.py)."
             + (f"\nNative NCCL fallback unavailable: {reason}." if reason else "")
+            + (
+                f"\nHost-staged gloo unavailable: {staged_reason}."
+                if staged_reason
+                else ""
+            )
         )
 
     def _resolve_view(self, prof, vendor, backend):
@@ -615,6 +804,48 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
             )
             return False
 
+    def _try_build_staged_gloo(self, store, rank, world_size, timeout) -> bool:
+        """Build a gloo group and stage flagos operands through host memory.
+
+        The last tier, and the only one that needs no vendor library: gloo ships
+        inside c10d, so it is always present. That is what makes
+        ``backend="flagos"`` work on a host with no FlagCX, no NCCL and no vendor
+        torch -- e.g. a CPU-only wheel on a MUSA box -- and it is therefore also
+        what the gloo redirect (``redirect_gloo_requests``) lands on.
+
+        Returns True and sets ``self._inner`` to a ``_HostStagedGloo``. Declines
+        when the switch is off, when gloo is absent, when no store was supplied
+        (gloo rendezvouses through it) or when gloo refuses to build. Failures
+        are recorded rather than raised: this tier runs last, so a hard error
+        here would hide the diagnostic that explains why the tiers above it
+        declined.
+        """
+        if not _env.flag("FLAGOS_DIST_STAGED_GLOO", True):
+            self._staged_skip_reason = "FLAGOS_DIST_STAGED_GLOO=0"
+            return False
+        gloo_cls = getattr(torch.distributed, "ProcessGroupGloo", None)
+        if gloo_cls is None:
+            self._staged_skip_reason = "this torch was built without ProcessGroupGloo"
+            return False
+        if store is None:
+            self._staged_skip_reason = "no store was supplied for the gloo rendezvous"
+            return False
+        try:
+            group = (
+                gloo_cls(store, rank, world_size)
+                if timeout is None
+                else gloo_cls(store, rank, world_size, timeout=timeout)
+            )
+        except Exception as exc:  # noqa: BLE001 - last tier: report, never raise
+            # First line only: pybind's "incompatible function arguments" dump
+            # runs for pages and would bury the diagnostic it is appended to.
+            detail = str(exc).splitlines()[0][:160] if str(exc) else repr(exc)
+            self._staged_skip_reason = f"ProcessGroupGloo construction failed: {detail}"
+            return False
+        self._inner = _HostStagedGloo(group)
+        _warn_staged_gloo()
+        return True
+
     # ------------------------------------------------------------------
     # Collective virtuals
     #
@@ -811,6 +1042,122 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
 
 
 # ---------------------------------------------------------------------------
+# Gloo request redirection
+# ---------------------------------------------------------------------------
+
+_FLAGOS_BACKEND = "flagos"
+
+# Marker attribute on the wrappers themselves, so a second import of torch_fl (or
+# a reload) cannot stack a second layer of interposition.
+_REDIRECT_MARKER = "_flagos_redirects_gloo"
+
+
+def _gloo_requests_are_redirected() -> bool:
+    """True when a gloo request on this host has nothing left to fall back on.
+
+    gloo serves cpu and cuda tensors, so it is only the wrong backend when the
+    process's accelerator *is* the flagos device -- exactly the case c10d cannot
+    see, because it does not know the device type and maps it to gloo by default
+    (``BackendConfig`` expands gloo over ``backend_capability["gloo"]``, and on
+    these builds ``torch.device("cuda")`` is itself flagos, so the flagos device
+    type ends up with a ProcessGroupGloo registered against it).
+
+    Gated by ``FLAGOS_DIST_REDIRECT_GLOO`` so the requested backend can still be
+    honoured verbatim while debugging a distributed problem.
+    """
+    if not _env.flag("FLAGOS_DIST_REDIRECT_GLOO", True):
+        return False
+    try:
+        accelerator = torch._C._get_accelerator().type
+    except Exception:  # noqa: BLE001 - no accelerator query: leave gloo alone
+        return False
+    return accelerator in _HOST_STAGED_TYPES
+
+
+def _needs_gloo_redirect(value) -> bool:
+    """True for a backend argument that names gloo and must be served by flagos.
+
+    Both halves matter: the request has to be for gloo, and gloo has to be the
+    wrong backend here (see ``_gloo_requests_are_redirected``).
+    """
+    if not _gloo_requests_are_redirected():
+        return False
+    return isinstance(value, str) and value.lower() == dist.Backend.GLOO
+
+
+def _redirect_backend_argument(args, kwargs, position, keyword):
+    """Rewrite a gloo backend argument to "flagos", wherever it was passed.
+
+    Both spellings have to be handled: torchrun and the transformers FSDP2 tests
+    pass ``backend=`` by keyword, while ``new_group`` is usually called
+    positionally.
+    """
+    if len(args) > position:
+        if _needs_gloo_redirect(args[position]):
+            args = list(args)
+            args[position] = _FLAGOS_BACKEND
+            args = tuple(args)
+    elif keyword in kwargs and _needs_gloo_redirect(kwargs[keyword]):
+        kwargs = dict(kwargs)
+        kwargs[keyword] = _FLAGOS_BACKEND
+    return args, kwargs
+
+
+def redirect_gloo_requests() -> None:
+    """Interpose on ``init_process_group`` / ``new_group`` to serve gloo requests.
+
+    ``torch.distributed`` sends every device type it does not recognise to gloo,
+    so on a flagos host ``init_process_group(backend="gloo")`` -- what torchrun
+    and the transformers FSDP2 tests build -- lands on a ProcessGroupGloo whose
+    C++ collectives reject flagos tensors with "unsupported device type flagos"
+    (issue #263).
+
+    That cannot be repaired from the gloo side. gloo's own BackendConfig
+    expansion is what registers the group for the flagos device type, its
+    creator is asserted to return a ProcessGroupGloo, and ``c10d.Backend``
+    cannot be subclassed from Python -- so there is no seam inside the gloo
+    branch, and the request has to be answered with the flagos backend *before*
+    the backend config is built.
+
+    ``new_group`` is covered as well as ``init_process_group``: a group built
+    with ``backend=None`` inherits the default group's backend (already
+    "flagos" after a redirected init), but a caller that spells "gloo" out again
+    would otherwise get a second, flagos-hostile group on the same tensors.
+
+    Called once at ``import torch_fl``; subsequent calls are no-ops.
+    """
+    if getattr(dist.init_process_group, _REDIRECT_MARKER, False):
+        return
+
+    original_init_process_group = dist.init_process_group
+    original_new_group = dist.new_group
+
+    @functools.wraps(original_init_process_group)
+    def init_process_group(*args, **kwargs):
+        args, kwargs = _redirect_backend_argument(args, kwargs, 0, "backend")
+        return original_init_process_group(*args, **kwargs)
+
+    @functools.wraps(original_new_group)
+    def new_group(*args, **kwargs):
+        # new_group(ranks=None, timeout=..., backend=None, ...): backend is the
+        # third positional argument.
+        args, kwargs = _redirect_backend_argument(args, kwargs, 2, "backend")
+        return original_new_group(*args, **kwargs)
+
+    init_process_group._flagos_redirects_gloo = True
+    new_group._flagos_redirects_gloo = True
+    dist.init_process_group = init_process_group
+    dist.new_group = new_group
+
+    # Same two names on the defining module, so `from torch.distributed
+    # .distributed_c10d import init_process_group` also picks up the wrapper.
+    c10d_module = getattr(dist, "distributed_c10d", None)
+    if c10d_module is not None:
+        c10d_module.init_process_group = init_process_group
+        c10d_module.new_group = new_group
+
+
+# ---------------------------------------------------------------------------
 # Backend creator function + public registration helper
 # ---------------------------------------------------------------------------
 
@@ -821,7 +1168,7 @@ def _create_flagos_pg(store, rank, world_size, timeout):
 
 
 def register_flagos_backend() -> None:
-    """Register the ``"flagos"`` backend and set it as default for privateuseone.
+    """Register the ``"flagos"`` backend, set it as default, redirect gloo.
 
     Called once at ``import torch_fl``.  Subsequent calls are no-ops.
     """
@@ -838,3 +1185,12 @@ def register_flagos_backend() -> None:
     # Make `init_process_group(device_id=torch.device("privateuseone:0"))`
     # auto-select "flagos" without the user specifying a backend string.
     dist.Backend.default_device_backend_map.setdefault("privateuseone", "flagos")
+
+    # Serve plain gloo requests with this backend instead (see
+    # redirect_gloo_requests). Separate try/except on purpose: the backend above
+    # is registered either way, so a failure here must not be reported as a
+    # failed registration.
+    try:
+        redirect_gloo_requests()
+    except Exception as e:  # noqa: BLE001
+        warnings.warn(f"[torch_fl] Failed to redirect gloo requests: {e}")

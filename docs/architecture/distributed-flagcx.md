@@ -22,8 +22,9 @@ backend:
   (allreduce / allgather / reduce_scatter / alltoall / broadcast / gather / scatter / reduce /
   send / recv / barrier, …). Each override converts privateuseone tensors into the device view
   the inner backend needs (`_C._flagos_to_cuda_view`), delegates to `self._inner`, and returns
-  the inner backend's Work. Inner backend priority: FlagCX → HCCL (ascend) → NCCL
-  (nvidia/metax).
+  the inner backend's Work. Inner backend priority: FlagCX → the vendor's native backend
+  (HCCL for ascend, NCCL for nvidia/metax, MCCL for MUSA) → host-staged gloo, the last tier
+  and the only one that needs no vendor library (§0.4).
 
 - **Registration**: `import torch_fl` calls `register_flagos_backend()`, which runs
   `Backend.register_backend("flagos", creator, devices=["privateuseone"])` and sets
@@ -79,6 +80,58 @@ Integrate against this contract; do not guess:
 ### 0.3 Remaining GCU validation
 
 The manual suite does not yet exercise point-to-point operations, gather/scatter roots, all-to-all, multi-node rendezvous, process failure recovery, or more than two devices. Those paths remain unvalidated on Enflame hardware.
+
+### 0.4 Host-staged gloo and gloo redirection (measured on MUSA MTT S5000)
+
+A host with no FlagCX, no vendor torch and no vendor communication library used to have no
+working collective at all: `ProcessGroupFlagOS` raised "no suitable inner backend" from
+`backend="flagos"`, and `backend="gloo"` — what torchrun and the transformers FSDP2 tests ask
+for — built a `ProcessGroupGloo` whose C++ collectives reject flagos tensors with
+`ProcessGroupGloo::allreduce: unsupported device type flagos` (issue
+[#263](https://github.com/flagos-ai/Torch-FL/issues/263)).
+
+Two additions close that gap. Both are in `torch_fl/comm/process_group.py` and both are gated
+by a runtime switch:
+
+- **`_try_build_staged_gloo` — the last tier of `_build_inner`.** gloo ships inside c10d, so it
+  is always present; this tier builds a real `ProcessGroupGloo` and wraps it in
+  `_HostStagedGloo`, a `ProcessGroup` facade that moves every flagos operand through host memory
+  (device → host → collective → device) and synthesises the two virtuals gloo does not implement
+  (`allgather_into_tensor_coalesced`, `reduce_scatter_tensor_coalesced`) from gloo's own
+  `_allgather_base` / `_reduce_scatter_base`. It costs a copy per collective, so it runs only
+  after FlagCX and the vendor-native backend have declined, and it warns once when it is used.
+  `FLAGOS_DIST_STAGED_GLOO=0` declines the tier so the failure is explicit instead.
+- **`redirect_gloo_requests` — answered on the requested side.** gloo cannot be repaired from
+  the gloo side: gloo's own `BackendConfig` expansion is what registers a `ProcessGroupGloo`
+  under the flagos device type (`pg._device_types` reads `[('flagos', 'flagos'), ('cpu',
+  'cpu')]` on a plain gloo group), its creator branch asserts `isinstance(backend_class,
+  ProcessGroupGloo)`, and `c10d.Backend` cannot be subclassed from Python at all. So the request
+  is answered with the `flagos` backend *before* the backend config is built: `import torch_fl`
+  interposes on `torch.distributed.init_process_group` and `torch.distributed.new_group` and
+  rewrites a `"gloo"` backend argument to `"flagos"`, but only when the process accelerator is
+  the flagos device (`torch._C._get_accelerator().type`), because gloo is a legitimate choice on
+  a cpu/cuda host. `FLAGOS_DIST_REDIRECT_GLOO=0` keeps the requested backend verbatim while
+  debugging a distributed problem.
+
+**Measured** (two ranks, no FlagCX / no `torch_musa.distributed` / no NCCL, i.e. the worst case;
+`torch_fl/comm/process_group.py` as landed):
+
+| Request | Result |
+| --- | --- |
+| `init_process_group(backend="flagos")` | `ProcessGroupFlagOS` over `_HostStagedGloo`; `all_reduce` → `[3.0, 3.0]` on both ranks |
+| `init_process_group(backend="gloo")` | redirected to `flagos`; `all_reduce`, `all_gather_into_tensor`, `reduce_scatter_tensor`, cpu `all_reduce`, `barrier`, and `torch.ops._c10d_functional.all_gather_into_tensor` all correct on both ranks |
+| `new_group([0, 1], backend="gloo")` | redirected to `flagos`; subgroup `all_reduce` → `[3.0, 3.0]` on both ranks |
+| `FLAGOS_DIST_REDIRECT_GLOO=0` | both ranks get a plain `ProcessGroupGloo` again and fail on the flagos tensor — the switch is load-bearing |
+
+**Partially validated on the FSDP2 suite.** Of the six `Qwen3ModelTest::test_fsdp2_*` nodeids
+that #263 counted, three now pass (`test_fsdp2_save_load`, `test_fsdp2_sharding_structure_0_untied`,
+`test_fsdp2_sharding_structure_1_tied`); the other three get past the collectives and then fail in
+FSDP2's stream setup on a **separate** defect — `torch_fl.flagos.Stream.__init__` routes every
+non-GCU platform without a CUDA runtime to the Ascend ACL stream, so on MUSA it raises
+`RuntimeError: libascendcl.so not found. ACL runtime is required` at
+`_fsdp_param_group.py::FSDPCommContext.lazy_init`. MUSA has no Python-side stream/event
+implementation (`torch_fl/accelerator/` has `ascend`, `gcu`, `metax`, `dcu`, `cuda`, `bpu`,
+`ppu`), so those three remain blocked on that work, not on the collective path.
 
 ---
 
