@@ -119,14 +119,48 @@ if [[ -z "$BOOTSTRAP_PYTHON" || ! -x "$BOOTSTRAP_PYTHON" ]]; then
 fi
 
 PREBUILT_VENV="${TORCH_FL_PREBUILT_MUSA_VENV:-/opt/torch-fl-musa-venv}"
-USING_PREBUILT=0
+# Probe without inherited Python paths or backend auto-loading. A previous
+# torch_fl wheel must not initialize hardware while checking its build env.
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=""
+venv_is_usable() {
+  [[ -x "$VENV_ROOT/bin/python" ]] || return 1
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$VENV_ROOT/bin/python" - "$VENV_ROOT" <<'PY'
+import importlib.util
+import importlib.metadata as metadata
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+assert Path(sys.prefix).resolve() == root
+assert sys.prefix != sys.base_prefix
+config = (root / "pyvenv.cfg").read_text().lower()
+assert "include-system-site-packages = false" in config
+assert importlib.util.find_spec("torch_musa") is None
+assert importlib.util.find_spec("pip") is not None
+try:
+    metadata.distribution("torch_musa")
+except metadata.PackageNotFoundError:
+    pass
+else:
+    raise SystemExit("vendor torch_musa metadata is present")
+PY
+}
+
 if [[ -z "${TORCH_FL_VENV_ROOT:-}" && -x "$PREBUILT_VENV/bin/python" ]]; then
   VENV_ROOT="$PREBUILT_VENV"
-  USING_PREBUILT=1
   echo "Using prebuilt MUSA venv: $VENV_ROOT"
+  if ! venv_is_usable; then
+    echo "::error::Prebuilt MUSA venv is not isolated and usable: $VENV_ROOT"
+    exit 1
+  fi
 else
   VENV_ROOT="${TORCH_FL_VENV_ROOT:-${RUNNER_TEMP:-$REPO_ROOT/.ci}/torch-fl-musa-${CI_STAGE}}"
-  "$BOOTSTRAP_PYTHON" -m venv --clear "$VENV_ROOT" || true
+  if venv_is_usable 2>/dev/null; then
+    echo "Reusing isolated MUSA venv: $VENV_ROOT"
+  else
+    "$BOOTSTRAP_PYTHON" -m venv --clear "$VENV_ROOT" || true
+  fi
   # Ensure system site-packages are not inherited (torch_musa from base image)
   if [[ -f "$VENV_ROOT/pyvenv.cfg" ]]; then
     # Remove any existing include-system-site-packages line and add our own
@@ -137,10 +171,6 @@ else
 fi
 
 VENV_PYTHON="$VENV_ROOT/bin/python"
-venv_is_usable() {
-  [[ -x "$VENV_PYTHON" ]] || return 1
-  "$VENV_PYTHON" -m pip --version >/dev/null 2>&1
-}
 
 if ! venv_is_usable; then
   # The vendor base image may not ship the matching python*-venv package. Keep
@@ -173,26 +203,30 @@ if ! venv_is_usable; then
   exit 1
 fi
 
-if (( USING_PREBUILT == 0 )); then
-  # build (pypa/build) is the PEP 517 frontend the common "Build wheel" step
-  # invokes via `python -m build --wheel --no-isolation`. MetaX gets it from the
-  # prebuilt /opt/venv; this fresh venv must ship it itself. A derived CI image
-  # that bakes a prebuilt musa venv must bake `build` into it too.
-  "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
-    --upgrade pip setuptools wheel cmake ninja build
+# Reconcile build dependencies even in a prebuilt venv (older images lack
+# pypa/build). No --upgrade: already satisfied requirements need no download.
+"$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
+  'pip>=23' 'setuptools>=45' wheel 'cmake>=3.18' ninja build
+if ! TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$VENV_PYTHON" - "$CPU_TORCH_VERSION" 2>/dev/null <<'PY'
+import sys
+import torch
+
+assert torch.__version__ == sys.argv[1] + "+cpu", torch.__version__
+assert torch.version.cuda is None
+PY
+then
+  echo "Installing CPU PyTorch ${CPU_TORCH_VERSION}+cpu in $VENV_ROOT"
   "$VENV_PYTHON" -m pip install \
     --index-url "$CPU_TORCH_INDEX_URL" \
-    "torch==$CPU_TORCH_VERSION"
+    "torch==${CPU_TORCH_VERSION}+cpu"
 fi
 
 if [[ "$CI_STAGE" == "integration" ]]; then
   # Test dependencies. transformers pulls numpy 2.x, which breaks the stock
   # +cpu torch C extensions at import, so numpy stays on 1.x.
   #
-  # sentencepiece + tiktoken + protobuf: the Qwen3 tests load the tokenizer via
-  # AutoTokenizer, and the mounted model dir has no tokenizer.json, so
-  # transformers converts the slow tokenizer to a fast one and that conversion
-  # needs one of these.
+  # transformers is also used by the MUSA BERT dispatch regression; removing
+  # it would silently skip existing coverage even when Qwen3 is not enabled.
   #
   # transformers is pinned to [4.51, 5): 4.51 is where Qwen3 model_type support
   # landed (older releases raise "Unrecognized model" on AutoConfig), and 5.x has
@@ -204,7 +238,12 @@ if [[ "$CI_STAGE" == "integration" ]]; then
   # inference and training groups into an environment failure that looks like a
   # platform failure. pip is a no-op when they are already present.
   "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
-    pytest "transformers>=4.51,<5" "numpy<2" safetensors sentencepiece tiktoken protobuf
+    pytest "transformers>=4.51,<5" "numpy<2" safetensors 'PyYAML==6.0.1'
+  # Enable when adding a Qwen3 model mount/test group, or for manual Qwen3 runs.
+  if [[ "${TORCH_FL_INSTALL_QWEN_DEPS:-0}" == "1" ]]; then
+    "$VENV_PYTHON" -m pip install --index-url "$PIP_INDEX_URL_ARG" \
+      sentencepiece tiktoken protobuf
+  fi
 fi
 
 export VIRTUAL_ENV="$VENV_ROOT"
@@ -257,7 +296,7 @@ fi
 pip_retry() {
   local attempt=1
   while true; do
-    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 --no-cache-dir "$@"; then
+    if "$VENV_PYTHON" -m pip install --retries 10 --timeout 300 "$@"; then
       return 0
     fi
     if (( attempt >= 5 )); then
@@ -324,6 +363,33 @@ PY
 # failure has already been retried five times by pip_retry, and repeating that
 # spends the job's budget on a link that is down rather than on a bad checkout.
 install_flag_gems() {
+  # Only immutable commits with matching PEP 610 provenance can be reused.
+  # A branch such as master must still be resolved on every setup invocation.
+  if [[ "$FLAGGEMS_REVISION" =~ ^[0-9a-fA-F]{40}$ ]] && \
+    "$VENV_PYTHON" - "$FLAGGEMS_REPO" "$FLAGGEMS_REVISION" <<'PY'
+import importlib.metadata as metadata
+import importlib.util
+import json
+import sys
+
+try:
+    dist = metadata.distribution("flag_gems")
+    origin = json.loads(dist.read_text("direct_url.json") or "{}")
+    vcs = origin.get("vcs_info", {})
+    matches = (
+        origin.get("url") == sys.argv[1]
+        and vcs.get("vcs") == "git"
+        and vcs.get("commit_id", "").lower() == sys.argv[2].lower()
+        and importlib.util.find_spec("flag_gems") is not None
+    )
+except (metadata.PackageNotFoundError, ValueError):
+    matches = False
+raise SystemExit(0 if matches else 1)
+PY
+  then
+    echo "Reusing FlagGems from ${FLAGGEMS_REPO}@${FLAGGEMS_REVISION}"
+    return 0
+  fi
   local attempt=1
   while true; do
     if ! pip_retry --no-deps "git+${FLAGGEMS_REPO}@${FLAGGEMS_REVISION}"; then
@@ -382,7 +448,7 @@ pip_retry --index-url "$PIP_INDEX_URL_ARG" 'sqlalchemy==2.0.48'
 pip_retry --index-url "$PIP_INDEX_URL_ARG" 'numpy<2'
 
 # --- Verify the isolation held ----------------------------------------------
-CI_STAGE="$CI_STAGE" CPU_TORCH_VERSION="$CPU_TORCH_VERSION" "$VENV_PYTHON" - <<'PY'
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 CI_STAGE="$CI_STAGE" CPU_TORCH_VERSION="$CPU_TORCH_VERSION" "$VENV_PYTHON" - <<'PY'
 import importlib.util
 import os
 import sys
@@ -435,12 +501,8 @@ if command -v mthreads-gmi >/dev/null 2>&1; then
   mthreads-gmi
 fi
 
-# Integration deps (pytest, transformers, numpy<2, safetensors, sentencepiece,
-# tiktoken, protobuf) are pip-installed above. Triton is deliberately absent on
-# this line: the image ships no MThreads flagtree build and stock PyPI triton
-# targets NVIDIA, so torch.compile will fail when invoked -- that failure is the
-# environment-gap record the platform owners act on (compile-tests is withheld in
-# the manifest until the image bakes the vendor triton stack).
+# MThreads FlagTree and FlagGems are installed above. Integration keeps the
+# existing operator/contract baseline; compile coverage is tracked separately.
 
 # --- Export to later workflow steps ------------------------------------------
 if [[ -n "${GITHUB_PATH:-}" ]]; then

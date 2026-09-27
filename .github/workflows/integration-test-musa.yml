@@ -15,6 +15,8 @@
 name: Integration Tests (MUSA)
 
 on:
+  push:
+    branches: [improve_musa]
   workflow_call:
     inputs:
       timeout-minutes:
@@ -31,6 +33,21 @@ on:
         default: 60
 
 jobs:
+  check-setup:
+    name: Check MUSA environment setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Test environment reuse and dependency selection
+        run: |
+          bash -n .github/scripts/set_env_musa.sh
+          python -m pip install pytest
+          python -m pytest tests/unit/test_musa_env_script.py -q
+
   # The test list lives in .github/configs/musa.yml, not inline here. See
   # load-platform-tests.yml for why.
   load-tests:
@@ -40,10 +57,10 @@ jobs:
 
   integration-tests:
     name: Build and test (MUSA)
-    needs: load-tests
+    needs: [load-tests, check-setup]
     runs-on:
       - mt-8g-cicd-pytorch
-    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    timeout-minutes: ${{ inputs['timeout-minutes'] || 60 }}
     container:
       image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
       options: >-
