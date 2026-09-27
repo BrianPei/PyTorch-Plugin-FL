@@ -119,10 +119,25 @@ PrivScaledDotProductEfficientAttentionKernelAscend(
     atten_mask = at::Tensor();  // null
   }
 
-  // PyTorch boolean masks use True for allowed positions, while ACLNN consumes
-  // an exclusion mask. Additive attention bias is not a mask; keep rejecting it
-  // until the CANN realShift contract can be supported without semantic loss.
+  // PyTorch funnels both attention masking and attention bias through the one
+  // attn_bias argument, while ACLNN models them as two inputs, and choosing the
+  // wrong one silently changes the softmax:
+  //   * a boolean tensor is an allow-mask (True = attend), and ACLNN's
+  //     attenMask is an exclusion mask (True = drop), so it is negated;
+  //   * an additive float tensor holding only 0 and -inf is exactly a mask too,
+  //     and stays on the attenMask path where it composes with the causal mask
+  //     for free;
+  //   * any other additive tensor carries finite values. Those shift the
+  //     logits rather than select them, so they go to ACLNN's realShift input.
+  //     ACLNN applies that input to the *unscaled* scores -- measured: the
+  //     kernel computes (QK^T + realShift) * scaleValue, while PyTorch adds
+  //     attn_bias to the scores *after* scaling. The bias is therefore
+  //     pre-divided by scaleValue so the two agree at any scale.
+  at::Tensor pse_shift;  // ACLNN realShiftOptional
   if (attn_bias.has_value() && attn_bias->defined()) {
+    TORCH_CHECK(attn_bias->dim() >= 2 && attn_bias->dim() <= 4,
+                "SDPA Ascend: attn_bias must broadcast to [B, N, S, S_kv], got ",
+                attn_bias->dim(), " dimensions");
     if (attn_bias->scalar_type() == at::kBool) {
       auto bias_mask = at::logical_not(*attn_bias);
       if (atten_mask.defined()) {
@@ -131,21 +146,60 @@ PrivScaledDotProductEfficientAttentionKernelAscend(
         atten_mask = bias_mask;
       }
     } else {
+      TORCH_CHECK(attn_bias->scalar_type() == at::kHalf ||
+                      attn_bias->scalar_type() == at::kBFloat16 ||
+                      attn_bias->scalar_type() == at::kFloat,
+                  "SDPA Ascend: attn_bias must be bool, float16, bfloat16 or "
+                  "float32, got ", attn_bias->scalar_type());
       // PyTorch lowers a public boolean allow-mask to an additive 0/-inf bias
-      // before calling this efficient-attention overload. Accept that exact
-      // representation, but do not reinterpret finite additive values as a
-      // mask because doing so changes softmax semantics.
-      auto is_zero = at::eq(*attn_bias, 0);
+      // before calling this efficient-attention overload. That exact
+      // representation is still a mask, and only pure masks take the cheap
+      // path: reinterpreting an arbitrary finite value as an exclusion bit
+      // would change softmax semantics instead of shifting the logits.
       auto is_neg_inf = at::eq(
           *attn_bias, -std::numeric_limits<double>::infinity());
-      auto is_mask_value = at::logical_or(is_zero, is_neg_inf);
-      TORCH_CHECK(is_mask_value.all().item<bool>(),
-                  "SDPA Ascend: finite additive attention bias is not yet "
-                  "supported");
-      if (atten_mask.defined()) {
-        atten_mask = at::logical_or(atten_mask, is_neg_inf);
+      auto is_finite = at::logical_and(
+          at::logical_not(is_neg_inf), at::ne(*attn_bias, 0));
+      if (!is_finite.any().item<bool>()) {
+        if (atten_mask.defined()) {
+          atten_mask = at::logical_or(atten_mask, is_neg_inf);
+        } else {
+          atten_mask = is_neg_inf;
+        }
       } else {
-        atten_mask = is_neg_inf;
+        TORCH_CHECK(scale_value != 0.0,
+                    "SDPA Ascend: scale=0 cannot carry an additive attention "
+                    "bias through the realShift input");
+        // A real bias. Its -inf entries are still an exclusion mask -- letting
+        // an infinity reach the shift add only risks a NaN in the online
+        // softmax -- while the finite rest goes to realShift.
+        if (is_neg_inf.any().item<bool>()) {
+          if (atten_mask.defined()) {
+            atten_mask = at::logical_or(atten_mask, is_neg_inf);
+          } else {
+            atten_mask = is_neg_inf;
+          }
+        }
+        // Rescale while the tensor is still small: dividing after the expand
+        // would allocate a second full [B, N, S, S_kv] buffer. Done in fp32
+        // because 1/sqrt(D) is not exact in fp16/bf16.
+        auto bias_f32 =
+            at::where(is_neg_inf, at::zeros_like(*attn_bias), *attn_bias)
+                .to(at::kFloat) /
+            scale_value;
+        // Right-align the broadcast dims, matching how PyTorch broadcasts a
+        // mask against [B, N, S, S_kv], then materialize the shape ACLNN wants.
+        while (bias_f32.dim() < 4) {
+          bias_f32 = bias_f32.unsqueeze(0);
+        }
+        // .to() before .contiguous(), not after: a dtype change already copies
+        // into a fresh buffer, so together they allocate once. Reversed, a fp32
+        // query with a fp32 bias would take .to() as the no-op it is, leaving
+        // .contiguous() to materialize the stride-0 expand on its own -- and
+        // .contiguous() alone would leave a dtype change to copy a second time.
+        pse_shift = bias_f32.expand({B, N, S, S_kv})
+                        .to(query.scalar_type())
+                        .contiguous();
       }
     }
   }
@@ -165,6 +219,7 @@ PrivScaledDotProductEfficientAttentionKernelAscend(
   AclTensorWrapper k_wrap(key_eff);
   AclTensorWrapper v_wrap(value_eff);
   AclTensorWrapper mask_wrap(atten_mask);
+  AclTensorWrapper pse_wrap(pse_shift);
   AclTensorWrapper drop_mask_wrap(drop_mask);
   AclTensorWrapper softmax_max_wrap(softmax_max);
   AclTensorWrapper softmax_sum_wrap(softmax_sum);
@@ -178,7 +233,7 @@ PrivScaledDotProductEfficientAttentionKernelAscend(
       q_wrap.get(),
       k_wrap.get(),
       v_wrap.get(),
-      nullptr,  // realShiftOptional
+      pse_wrap.get(),  // realShiftOptional
       drop_mask_wrap.get(),  // dropMaskOptional
       nullptr,  // paddingMaskOptional
       mask_wrap.get(),  // attenMaskOptional
