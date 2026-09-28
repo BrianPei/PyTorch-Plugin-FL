@@ -80,15 +80,24 @@ registration route.
 
 ### Vendor toolchain workarounds
 
-Three modules exist only to compensate for the active Triton build and are no-ops
+Four modules exist only to compensate for the active Triton build and are no-ops
 on CUDA-like profiles. `triton_libdevice.py` fills the Ascend backend's empty
 libdevice module map; `triton_resource_limits.py` translates `ub overflow` into
 Triton's `OutOfResources` so inductor drops an oversized autotune config instead
 of failing the compile; `triton_byte_loads.py` works around a masked byte-load
-miscompile that silently produced wrong `relu` gradients. All three are
-idempotent — registration runs before every `compile_fx` — with their flags on the
-`triton` module rather than on the wrapped function, since two of them wrap the
-same `triton.compile`.
+miscompile that silently produced wrong `relu` gradients; `triton_64bit_guard.py`
+refuses a kernel that needs a 64-bit value on GCU, where the vendor compiler
+aborts the process on one. All four are idempotent — registration runs before
+every `compile_fx` — with their flags on the module that owns the wrapped entry
+point (`triton` for the first three, `triton_heuristics` for the guard) rather
+than on the wrapped function, since several of them sit on shared entry points.
+
+The guard is the one that runs *before* the compiler rather than translating its
+error afterwards: a GCU300 64-bit kernel segfaults inside `triton.compile`, below
+the `try/except` `CachingAutotuner._precompile_config` wraps around that call, so
+there is no exception for a translator to see. It is installed from
+`flagos_compile_backend` and from `_register_compile_backend` in `torch_fl`,
+because the default `backend="inductor"` path never reaches the former.
 
 ### CPU-torch wheel accommodations
 
@@ -97,6 +106,12 @@ This build pairs a CPU-only pip torch with an externally supplied
 backend compensates:
 
 - `use_static_cuda_launcher = False` -- `torch._C._StaticCudaLauncher` is not built.
+  `inductor_backend.pin_static_cuda_launcher()` reads that at import and exports
+  `TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0`, rather than only scoping the patch
+  into this backend's own compiles: a `torch.compile` that names no backend
+  (`transformers`' `CompiledFlexAttention` is the case) otherwise reaches
+  Inductor's default and dies with `ImportError: cannot import name
+  '_StaticCudaLauncher'` before generating a kernel.
 - `triton.cudagraphs = False` -- `torch.cuda.CUDAGraph` is a dummy base class
   that raises on construction; `mode="max-autotune"` would otherwise enable it.
 - `CudaInterface.get_raw_stream` is re-attached -- the binding exists, but the

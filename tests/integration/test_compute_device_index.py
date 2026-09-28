@@ -46,10 +46,16 @@ import torch
 import torch_fl
 
 
-pytestmark = pytest.mark.skipif(
-    torch_fl.flagos.device_count() < 2,
-    reason="needs at least 2 flagos devices",
-)
+# `multi_device` is the selection hook for the manifests' shared
+# `Multi-device contracts` step (issue #391); the skipif below stays here so the
+# hardware guard lives with the test rather than in the manifest.
+pytestmark = [
+    pytest.mark.multi_device,
+    pytest.mark.skipif(
+        torch_fl.flagos.device_count() < 2,
+        reason="needs at least 2 flagos devices",
+    ),
+]
 
 # Device 1 with device 0 current is the combination that faults: matching indices
 # would pass with or without the guard.
@@ -145,8 +151,14 @@ def test_dim_reduction_op():
 
 
 def test_ternary_tensor_op():
-    """CallPythonOp_TTT (addmm: 3 tensor operands)."""
-    a, b, c = torch.randn(4, 4), torch.randn(4, 8), torch.randn(8, 4)
+    """CallPythonOp_TTT (addmm: 3 tensor operands).
+
+    Use exactly representable values so vendor matmul precision differences
+    cannot obscure this test's device-guard assertion.
+    """
+    a = torch.arange(16, dtype=torch.float32).reshape(4, 4) / 8
+    b = torch.arange(32, dtype=torch.float32).reshape(4, 8) / 8
+    c = torch.arange(32, dtype=torch.float32).reshape(8, 4) / 8
     out = torch.addmm(a.to(DEVICE), b.to(DEVICE), c.to(DEVICE))
     _check(out, torch.addmm(a, b, c), "addmm")
 

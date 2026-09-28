@@ -15,12 +15,13 @@
 display_name: MUSA
 
 # MUSA-specific environment preparation stays outside the common workflow.
-setup_script: .github/scripts/set_env_musa.sh
+setup_script: .github/scripts/set_env.sh
+setup_platform: musa
 
-# Pinned Moore Threads release image. The vendor torch_musa (2.9.1) baked into
-# this image is ABI-incompatible with the CPU PyTorch 2.10 the wheel builds
-# against, so set_env_musa.sh provisions an isolated venv that never imports it.
-ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
+# Keep the previously running MUSA 5.1 image until the runner driver is
+# upgraded for MUSA 5.2 and that image can be pulled within the job budget.
+# Its torch_musa is isolated from the CPU PyTorch 2.10 build environment.
+ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public@sha256:13f7375aab77a4ace7084558eb939a977467330f558a3c2a185c6c6d31ec8935
 
 runner_labels:
   - mt-8g-cicd-pytorch
@@ -95,6 +96,30 @@ integration_tests:
       print(f"MUSA devices: {torch_fl.flagos.device_count()}")
       PY
 
+  # Issue #391: the multi-device contract files sit at the top level of
+  # tests/integration/, where no manifest sweeps by default -- a file added there
+  # reached no CI job at all. Selected by marker rather than by filename so the
+  # same step works on every platform and the 2+-device guard stays in the test.
+  - name: Backend autoload contract
+    command: python -m pytest tests/unit/test_startup_subprocess.py -v --tb=short
+  - name: Multi-device contracts
+    command: >-
+      python -m pytest tests/integration/
+      -m "multi_device" -v -s --tb=short
+
+  # Issue #409: the remaining top-level files no manifest selected. They are
+  # single-device suites, so the multi_device sweep above does not reach them,
+  # and they are named here rather than selected by marker for the reason
+  # test_factory_ops.py is: each would need a marker invented for it, and a
+  # marker that exists only to be selected proves nothing about the file.
+  - name: Portable top-level contracts
+    command: >-
+      python -m pytest
+      tests/integration/test_clone_dispatch_case.py
+      tests/integration/test_dtype_coverage.py
+      tests/integration/test_ops.py
+      -v -s --tb=short
+
   - name: Run MUSA dispatch tests
     command: >-
       python -m pytest tests/integration/ops/test_musa_dispatch.py
@@ -134,14 +159,20 @@ integration_tests:
   # cuda/metax/ascend/dcu/flaggems_python-marked cases on MUSA, so this selects
   # the anyplatform/main_ops subset that routes to the native mudnn backend.
   #
-  # Ordered AFTER the contract groups (general/AMP/math-bits): this group has
-  # one known MUSA backend gap (filed as an issue; see issue_body.md):
-  #   1. torch.mm on float64 -- mudnn GEMM has no double-precision path
-  #      (test_mm_still_runs[dtype3]).
-  # It is deselected below so the pipeline can complete end to end while the
-  # dev fix is queued. Remove the --deselect once the fix lands.
-  # run_integration_tests.py stops on the first non-zero group, so this
-  # ordering lets the contract groups above go green first.
+  # Ordered AFTER the contract groups (general/AMP/math-bits) because
+  # run_integration_tests.py stops on the first non-zero group, so a backend gap
+  # here would stop the pipeline before those go green.
+  #
+  # This group used to deselect test_mm_still_runs[dtype3] for a float64 mm gap
+  # attributed to "mudnn GEMM has no double-precision path". The attribution was
+  # wrong and the case is deselected no longer: float64 mm on this platform routes
+  # to FlagGems, not to mudnn, and the case measures `32x48x16`, whose aligned tile
+  # stays inside the device's 196608 B static shared-memory limit. What fails is a
+  # float64 mm whose M, K and N all exceed 32, where the mthreads `mm` tune space
+  # asks 262144 B at num_stages 5 and exactly 196608 B at num_stages 4 -- fixed in
+  # torch_fl/flagos/__init__.py, which fits the tune space to the limit. The case
+  # passes on S5000 on the unmodified tree as well, so the deselect had been dead
+  # weight and the two changes are independent.
   #
   # test_rng_dispatch.py is explicitly ignored here even though its tests carry
   # @pytest.mark.(anyplatform + main_ops) and would otherwise be collected:
@@ -160,7 +191,6 @@ integration_tests:
     command: >-
       python -m pytest tests/integration/ops/
       --ignore=tests/integration/ops/test_rng_dispatch.py
-      --deselect "tests/integration/ops/test_soft_lowp_gate_dispatch.py::TestSoftLowpGateLeavesFloatPathsAlone::test_mm_still_runs[dtype3]"
       -m "(anyplatform or main_ops) and not flaggems_python and not flaggems_cpp and not cuda and not ascend and not metax and not dcu and not gcu and not ppu"
       -v -s --tb=short
 

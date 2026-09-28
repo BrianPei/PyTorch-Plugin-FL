@@ -18,13 +18,53 @@
 | FlagGems | Platform dependent | Installed from PyPI or a vendor-compatible build only where the platform route uses it. |
 | Triton/compiler | Platform dependent | Use the compiler distribution required by the selected accelerator. |
 
+## Wheel compatibility record
+
+Every built wheel contains `torch_fl/compatibility.json`. It records the selected
+platform and kernel sets, bundled libtorch location, build-time PyTorch version
+and C++ ABI flag, the installed FlagTree/FlagGems/FlagCX versions observed during
+the build, the explicitly declared vendor PyTorch version when one supplies
+device libraries, and the wheel's Python requirements. These fields describe
+the artifact; an observed build version is evidence of testing, not an implicit
+pin on every downstream install. The package's version ranges remain the
+installation contract.
+
+An SDK version is recorded only when the builder sets `FLAGOS_SDK_VERSION` to a
+verified value. An absent value means **unknown**, not compatible with all SDKs.
+For CUDA, DCU, MetaX, and PPU release artifacts, also set
+`FLAGOS_VENDOR_TORCH_VERSION` from the vendor wheel used to source device/core
+libraries. `--release` rejects missing SDK or vendor PyTorch provenance. The
+build-time C++ ABI flag describes the PyTorch interpreter used
+for compilation; a vendor libtorch bundle may have a separate ABI provenance
+that must be checked against the vendor SDK. This manifest does not prove host
+driver compatibility.
+
+Inspect a wheel before importing its native extension:
+
+```bash
+python scripts/tools/torch-fl-preflight --wheel dist/torch_fl-*.whl --platform cuda \
+  --sdk-version 13.3 --check-installed
+```
+
+`--check-installed` checks declared dependency ranges, warns when an installed
+optional package differs from the build environment, and warns when PyTorch is
+within the declared range but not the exact build version. `--check-build-env`
+requires exact build dependency versions and is used by every wheel CI job.
+`--require-sdk` rejects wheels without a declared SDK version. The CLI lives in
+`scripts/tools/torch-fl-preflight` and is installed as the `torch-fl-preflight`
+command. It runs without importing `torch_fl`, so checks do not trigger backend
+import side effects. SDK/driver compatibility still requires platform-specific testing.
+Generate a release table from the final wheel files with
+`python scripts/tools/torch-fl-preflight --wheel dist/*.whl --release --markdown-table`;
+the command fails if any artifact lacks its required provenance.
+
 ## Platform Matrix
 
 | Platform | Build selector | Execution path | Eager and autograd | `torch.compile` | Distributed | Profiler | FlagGems | Status |
 |---|---|---|---|---|---|---|---|---|
 | NVIDIA CUDA | `FLAGOS_ACCELERATOR=cuda` (default) | CUDA boxing over an external `libtorch_cuda.so` | Stable | Experimental (inductor GPU device registered; no CI test step) | Beta (FlagCX + NCCL fallback, DDP live-verified) | Stable (CUPTI parity) | Beta (Python + C++ dispatch paths) | Stable |
 | MetaX | `FLAGOS_ACCELERATOR=metax` | CUDA boxing via `cu-bridge` against the vendor libtorch | Stable (FP16/BF16 autocast and GradScaler measured in boxing mode) | Experimental (vendor Triton and FlagTree MetaX measured on C550; vendor Triton CI-covered) | Experimental (NCCL-shaped `mccl` fallback; not CI-covered) | Experimental (MCPTI parity measured on C550; not CI-covered) | Experimental (Python dispatch; not CI-tested on MetaX) | Stable |
-| Ascend | `FLAGOS_ACCELERATOR=ascend` | Native ACLNN operator backend, FlagGems via FlagTree (Triton 3.5) | Stable (CI-covered ops, RNG suite) | Experimental (inductor measured on 910 against triton-ascend 3.2.0 only; **not** revalidated on FlagTree, three toolchain workarounds, serial compile, no CI step) | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Runtime only (device/runtime events not emitted; profiler parity suite excluded from CI) | Beta (Python dispatch; FlagGems-first conf, float64 routes fall back to ACLNN) | Beta |
+| Ascend | `FLAGOS_ACCELERATOR=ascend` | Native ACLNN operator backend, FlagGems via FlagTree (Triton 3.5) | Stable (CI-covered ops, RNG suite) | Experimental (inductor measured on 910 against triton-ascend 3.2.0 only; **not** revalidated on FlagTree, three toolchain workarounds, serial compile, no CI step) | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Beta (MSPTI kernel/runtime/flow/memcpy events plus device-time linkage, all CI-covered by the shared contract; parity suite excluded from CI) | Beta (Python dispatch; FlagGems-first conf, float64 and bool `neg` routes fall back to ACLNN) | Beta |
 | PPU | `FLAGOS_ACCELERATOR=ppu` | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK, bundling its own libtorch | Experimental (FP16/BF16 autocast and GradScaler measured on PPU hardware, not in CI) | Not validated | Experimental (NCCL fallback via vendor-adapted `libnccl.so.2`; not CI-covered) | Not validated on this vendor's tracer | Experimental (vendor-index Triton required) | Experimental |
 | Hygon DCU | `FLAGOS_ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | Beta (including FP16/BF16 autocast and GradScaler) | Experimental (FlagTree HCU validated on `gfx936`; not in CI) | Experimental (RCCL via DTK; all_reduce/DDP measured on 2 cards, not in CI) | Beta (parity suite runs in CI) | Beta (Python dispatch only) | Beta |
 | Enflame GCU | `FLAGOS_ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64/float64 ops | Beta (operator, RNG, factory, and AMP suites CI-guarded on S60) | Not validated | Not validated | Runtime only (TOPSPTI collects activities; no device events on a CPU-only Kineto build) | Experimental (Python dispatch, requires vendor Triton) | Beta |
@@ -102,10 +142,22 @@ path is not enabled in CI, so those tests run against the native ACLNN backend. 
 (Qwen3) validation exists as a point measurement outside CI — training at 0.82x `torch_npu` on
 real Ascend 910 hardware (`tests/perf/e2e_qwen3_train_ascend.py`) — but
 [`.github/configs/ascend.yml`](../../.github/configs/ascend.yml) (line 110) explicitly defers
-Qwen3 inference/training smoke pending a model mount on the CI runner. Profiler parity is
-explicitly out of scope: the Ascend profiler path does not yet emit device-side event
-categories, and `test_profiler_parity.py` is excluded from CI until it does (same file, lines
-112-117). Distributed support recommends the FlagCX path (see
+Qwen3 inference/training smoke pending a model mount on the CI runner. Profiler *parity* is
+still out of scope — `test_profiler_parity.py` is a diff against a torch-cuda baseline, and
+only the CUDA-boxing platforms can run one — and remains excluded from CI (same file, lines
+112-117). The shared profiler *contract* does run, and the device side of it is live: MSPTI
+emits named kernel, runtime/API, flow, and (under the process-start preload above) memcpy
+activity, and the step was measured on 910 at `11 passed, 1 skipped`. The skip is
+`gpu_memset`, a correct-by-design consequence of routing `torch.zeros()` through
+`aclnnInplaceZero` rather than the allocator (see
+[`docs/architecture/profiler.md`](../architecture/profiler.md)). The device-time
+linkage case is one of the eleven that assert: MSPTI used to stamp every launch with
+the id of the CPU op that started after it, which turned out to be this repository's
+defect rather than the vendor's — `popCorrelation` passed a null out-parameter, which
+CANN rejects without unwinding, so the external-correlation stack grew for the life of
+the process (issue #425). With the pop fixed, the launching
+operator owns its device events and the case asserts on this platform. Distributed support
+recommends the FlagCX path (see
 [`docs/architecture/distributed-flagcx.md`](../architecture/distributed-flagcx.md), lines
 204-208); the native HCCL fallback and the `flagos→npu` zero-copy view are architectural
 routing, not on-hardware-verified collectives (same file, lines 67-75).

@@ -14,7 +14,8 @@
 
 display_name: PPU
 
-setup_script: .github/scripts/set_env_ppu.sh
+setup_script: .github/scripts/set_env.sh
+setup_platform: ppu
 
 ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260811-ppu-dev
 
@@ -26,9 +27,8 @@ container_volumes:
   # CUDA_SDK/lib64/libcudart.so; no host mount needed. Neither is FlagGems: the
   # image ships it as a PEP 660 editable install pointing at a /workspace/FlagGems
   # bind mount, which is no longer part of the runner pod. set_env_ppu.sh instead
-  # installs the FlagGems stack into the job venv from the FlagOS index (FlagTree)
-  # and from git (FlagGems master), so the environment is reproducible from the
-  # image plus those two indexes alone.
+  # installs the FlagGems stack into the job venv from published FlagOS wheels,
+  # so the environment is reproducible from the image plus those indexes alone.
   - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 
 integration_environment:
@@ -115,6 +115,30 @@ integration_tests:
       print(f"flagos devices: {torch_fl.flagos.device_count()}")
       PY
 
+  # Issue #391: the multi-device contract files sit at the top level of
+  # tests/integration/, where no manifest sweeps by default -- a file added there
+  # reached no CI job at all. Selected by marker rather than by filename so the
+  # same step works on every platform and the 2+-device guard stays in the test.
+  - name: Backend autoload contract
+    command: python -m pytest tests/unit/test_startup_subprocess.py -v --tb=short
+  - name: Multi-device contracts
+    command: >-
+      python -m pytest tests/integration/
+      -m "multi_device" -v -s --tb=short
+
+  # Issue #409: the remaining top-level files no manifest selected. They are
+  # single-device suites, so the multi_device sweep above does not reach them,
+  # and they are named here rather than selected by marker for the reason
+  # test_factory_ops.py is: each would need a marker invented for it, and a
+  # marker that exists only to be selected proves nothing about the file.
+  - name: Portable top-level contracts
+    command: >-
+      python -m pytest
+      tests/integration/test_clone_dispatch_case.py
+      tests/integration/test_dtype_coverage.py
+      tests/integration/test_ops.py
+      -v -s --tb=short
+
   # `and not flaggems` keeps the vendor/FlagGems group split: flaggems-marked
   # cases are measured by the group below, not here (no switch exists any more
   # to skip them -- see ops/conftest.py).
@@ -126,7 +150,7 @@ integration_tests:
 
   # The venv triton is FlagTree's ppu build (triton 3.6.0, backends {'ppu'}),
   # not the vendor 3.5.0+v0.2.0.ppu2.1.0 (backends {'amd','nvidia'}) -- see
-  # set_env_ppu.sh, which installs flagtree==0.6.2a2+ppu3.6 plus FlagGems master
+  # set_env_ppu.sh, which installs flagtree==0.7.0rc1+ppu3.6 plus FlagGems 5.4.0
   # into the job venv. mm/bmm stay on the vendor route because FlagGems' _hygon
   # mm kernel passes a `num_ldmatrixes` keyword that the triton mm_kernel does
   # not accept: KeyError at triton/runtime/jit.py:_pack_args for mm, and bmm
@@ -151,16 +175,40 @@ integration_tests:
       python -m pytest tests/integration/test_math_bits_contract.py
       -v -m math_bits --tb=short
 
+  # GPU profiling on this platform went from nothing to the shared contract:
+  # until issue #411, `ppu` fell through csrc/CMakeLists.txt's tracer selection
+  # into the unavailable implementation, so no device activity was ever
+  # registered and every trace carried CPU records only. The capability table in
+  # tests/integration/profiler_support.py is what makes this step expressible on
+  # a CUDA-ABI platform that emits no memsets -- the memset case skips on its
+  # declared capability instead of failing.
+  #
+  # Measured on a 16x PPU-ZW810E host (torch 2.10.0): 10 passed, 1 skipped, 1
+  # xpassed.
+  - name: Unified profiler contract
+    command: >-
+      python -m pytest tests/integration/test_profiler_contract.py
+      -v -m profiler --tb=short
+
   # ---------------------------------------------------------------------------
-  # Follow-up (not part of first-version acceptance). PPU CUPTI Activity API is
-  # defective: CuptiActivityApi.cpp:298 logs "bufferCompleted called with
-  # unknown buffer", so torch.profiler collects no device-side events. The
-  # flagos trace has only ['Trace','cpu_op'] vs the torch-cuda baseline
-  # ['Trace','cpu_op','cuda_runtime','gpu_memcpy','gpu_memset','kernel'].
-  # test_profiler_parity.py (7 tests) all fail on the missing categories, so
-  # the step is excluded from first-version CI. Re-add once the PPU CUPTI
-  # Activity path emits the expected device/runtime categories.
-  # This may not be unblocked by a CPU fallback or faking a pass.
+  # Deliberately still out: structural comparison against the stock torch+cuda
+  # baseline. Not for the reason recorded here before #411 -- "PPU CUPTI
+  # Activity API is defective ... collects no device-side events" was a symptom
+  # of the tracer never being built, and is now measurably false: with the tracer
+  # selected, a 512x512 matmul trace carries
+  # ['Trace','cpu_op','gpu_memcpy','kernel','privateuse1_runtime'], PPU's real
+  # gemm/sum kernel names, and 73/73 link candidates resolved. The
+  # "bufferCompleted called with unknown buffer" line no longer appears either.
+  #
+  # What is left is platform shape, measured with `-m main_ops`: 3 passed, 1
+  # xpassed, 3 failed, and all three failures want something PPU's vendor kernels
+  # do not produce, so re-adding this step needs a per-platform gate in the test
+  # rather than another tracer fix:
+  #   - test_category_coverage and test_arg_key_supersets need a gpu_memset
+  #     record, and PPU emits none -- the same memset capability the shared
+  #     contract above already declares off for this platform.
+  #   - test_kernel_names_are_demangled needs a '::'-qualified kernel name, and
+  #     this platform's are gemm_ktype0_*/sum_kernel_*.
   # ---------------------------------------------------------------------------
   - name: Run inference tests
     command: >-

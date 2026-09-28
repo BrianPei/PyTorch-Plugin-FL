@@ -196,6 +196,9 @@ FOREIGN: dict[str, str] = {
     "TRITON_ENABLE_TASKQUEUE": "the FlagTree Ascend Triton launch queue",
     "COMPILE_ARCH": "Enflame's tops compiler architecture",
     "HB_DNN_USER_DEFINED_L2M_SIZES": "the BPU hbdk runtime's L2M sizing",
+    "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER": (
+        "Inductor's choice between its static Triton launcher and Triton's own"
+    ),
 }
 
 
@@ -405,6 +408,13 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
         "0 (off)",
         "Leave the FlagGems Python layer unregistered (C++ stub-only mode)",
     ),
+    "FLAGOS_STARTUP_PROFILE": (
+        SCOPE_RUNTIME,
+        "full",
+        "Choose full import-time framework integration or minimal startup with "
+        "explicit activation. FlagTree, FlagGems, and FlagCX remain required "
+        "dependencies in both profiles",
+    ),
     # --- Runtime diagnostics ---------------------------------------------
     "FLAGOS_LOG": (
         SCOPE_RUNTIME,
@@ -471,13 +481,39 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
         "0 (off)",
         "Disable the optional Apex multi-tensor compatibility layer",
     ),
+    "FLAGOS_DISABLE_FLEX_ATTENTION_COMPAT": (
+        SCOPE_RUNTIME,
+        "0 (off)",
+        "Leave flex_attention's hard-coded {cuda, cpu, xpu, hpu} device gate "
+        "alone, so a flagos tensor is refused at the entry point as it is "
+        "upstream. Set 1 to measure a platform against that gate unchanged",
+    ),
     "FLAGOS_DISABLE_QWENIMAGE_ROPE": (
         SCOPE_RUNTIME,
         "0 (off)",
-        "Leave diffusers' Qwen-Image rotary-embedding table alone. On GCU torch_fl "
-        "registers the flagos device there, which is what keeps the rotation off "
-        "the complex exponential diffusers would otherwise fall back to; set 1 to "
-        "measure that difference. A capability switch, not a route switch",
+        "Leave diffusers' Qwen-Image rotary-embedding table alone. On the "
+        "flagos device (GCU, Ascend, ...) torch_fl registers that device there, "
+        "which is what keeps the rotation off the complex exponential diffusers "
+        "would otherwise fall back to -- a path the backend may not be able to "
+        "run at all; set 1 to measure that difference. A capability switch, not "
+        "a route switch",
+    ),
+    # --- Distributed -----------------------------------------------------
+    "FLAGOS_DIST_REDIRECT_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Answer a plain init_process_group(backend='gloo') / new_group request "
+        "with the flagos backend when the process accelerator is the flagos "
+        "device. Set 0 to keep the requested backend, which then rejects flagos "
+        "tensors. See torch_fl/comm/process_group.py",
+    ),
+    "FLAGOS_DIST_STAGED_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Allow the host-staged gloo inner backend: the last fallback tier when no "
+        "vendor communicator (FlagCX/NCCL/HCCL/MCCL) is available. It needs no "
+        "vendor library but copies every flagos operand device->host->device. Set "
+        "0 to fail loudly instead of staging",
     ),
     "FLAGOS_DIST_FORCE_NCCL": (
         SCOPE_TEST,

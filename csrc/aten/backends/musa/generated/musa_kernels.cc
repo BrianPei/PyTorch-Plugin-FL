@@ -1715,9 +1715,11 @@ at::Tensor GeScalarKernelMusa(const at::Tensor& self, const at::Scalar& other) {
 REGISTER_IMPL_TO_DISPATCHER(GeScalarFn, ge_scalar_dispatcher, Backend::kMusa, GeScalarKernelMusa)
 
 at::Tensor MmKernelMusa(const at::Tensor& self, const at::Tensor& mat2) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("mm", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("mm", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -1743,9 +1745,11 @@ at::Tensor MmKernelMusa(const at::Tensor& self, const at::Tensor& mat2) {
 REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kMusa, MmKernelMusa)
 
 at::Tensor BmmKernelMusa(const at::Tensor& self, const at::Tensor& mat2) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("bmm", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("bmm", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -1771,10 +1775,11 @@ at::Tensor BmmKernelMusa(const at::Tensor& self, const at::Tensor& mat2) {
 REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kMusa, BmmKernelMusa)
 
 at::Tensor& MmOutKernelMusa(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    out.copy_(at::mm(self.cpu(), mat2.cpu()));
-    return out;
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("mm.out", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("mm.out", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -1798,10 +1803,11 @@ at::Tensor& MmOutKernelMusa(const at::Tensor& self, const at::Tensor& mat2, at::
 REGISTER_IMPL_TO_DISPATCHER(MmOutFn, mm_out_dispatcher, Backend::kMusa, MmOutKernelMusa)
 
 at::Tensor& BmmOutKernelMusa(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    out.copy_(at::bmm(self.cpu(), mat2.cpu()));
-    return out;
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("bmm.out", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("bmm.out", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -2102,8 +2108,9 @@ at::Tensor PrivSoftmaxKernelMusa(const at::Tensor& self, int64_t dim, bool half_
   // output holds no elements, so the allocation above is already the
   // answer. Return it on-device without launching.
   if (out.numel() == 0) return out;
+  auto self_c = self.contiguous();
 
-  musa_ops::MudnnTensorWrapper t_self(self);
+  musa_ops::MudnnTensorWrapper t_self(self_c);
   musa_ops::MudnnTensorWrapper t_out(out);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::SOFTMAX);
@@ -3035,11 +3042,14 @@ at::Tensor AddmmKernelMusa(
     const at::Tensor& mat2,
     const at::Scalar& beta,
     const at::Scalar& alpha) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat1.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    return at::addmm(self.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha)
-        .to(self.device());
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("addmm", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat1.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("addmm", mat1.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("addmm", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = mat1.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -3105,11 +3115,14 @@ at::Tensor BaddbmmKernelMusa(
     const at::Tensor& mat2,
     const at::Scalar& beta,
     const at::Scalar& alpha) {
-  if (!musa_ops::MudnnSupportsArithmeticDtype(self.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat1.scalar_type()) ||
-      !musa_ops::MudnnSupportsArithmeticDtype(mat2.scalar_type())) {
-    return at::baddbmm(self.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha)
-        .to(self.device());
+  if (!musa_ops::MudnnSupportsMatmulDtype(self.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("baddbmm", self.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat1.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("baddbmm", mat1.scalar_type());
+  }
+  if (!musa_ops::MudnnSupportsMatmulDtype(mat2.scalar_type())) {
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("baddbmm", mat2.scalar_type());
   }
   std::vector<int64_t> out_shape = mat1.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -3179,8 +3192,9 @@ at::Tensor PrivLogSoftmaxKernelMusa(const at::Tensor& self, int64_t dim, bool ha
   // output holds no elements, so the allocation above is already the
   // answer. Return it on-device without launching.
   if (out.numel() == 0) return out;
+  auto self_c = self.contiguous();
 
-  musa_ops::MudnnTensorWrapper t_self(self);
+  musa_ops::MudnnTensorWrapper t_self(self_c);
   musa_ops::MudnnTensorWrapper t_out(out);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::LOGSOFTMAX);
@@ -3206,8 +3220,10 @@ at::Tensor PrivSoftmaxBackwardDataKernelMusa(
   int64_t d = dim < 0 ? dim + output.dim() : dim;
   auto grad_input = at::empty(output.sizes(), output.options());
 
-  musa_ops::MudnnTensorWrapper t_go(grad_output);
-  musa_ops::MudnnTensorWrapper t_out(output);
+  auto grad_output_c = grad_output.contiguous();
+  auto output_c = output.contiguous();
+  musa_ops::MudnnTensorWrapper t_go(grad_output_c);
+  musa_ops::MudnnTensorWrapper t_out(output_c);
   musa_ops::MudnnTensorWrapper t_gi(grad_input);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::SOFTMAX);
@@ -3236,8 +3252,10 @@ at::Tensor PrivLogSoftmaxBackwardDataKernelMusa(
   int64_t d = dim < 0 ? dim + output.dim() : dim;
   auto grad_input = at::empty(output.sizes(), output.options());
 
-  musa_ops::MudnnTensorWrapper t_go(grad_output);
-  musa_ops::MudnnTensorWrapper t_out(output);
+  auto grad_output_c = grad_output.contiguous();
+  auto output_c = output.contiguous();
+  musa_ops::MudnnTensorWrapper t_go(grad_output_c);
+  musa_ops::MudnnTensorWrapper t_out(output_c);
   musa_ops::MudnnTensorWrapper t_gi(grad_input);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::LOGSOFTMAX);

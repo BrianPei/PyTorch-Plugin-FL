@@ -21,9 +21,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch_fl"
-# Version is computed in setup.py: the MetaX self-contained build appends a
-# local segment (e.g. 0.1.0+metax3.8.1) via FLAGOS_WHEEL_LOCAL. A static value
-# here would override setup()'s version, so it must be declared dynamic.
+# Version is computed in setup.py: it names the supported PyTorch minor line and
+# the MetaX self-contained build appends a local segment (e.g.
+# 2.10.0+metax3.8.1) via FLAGOS_WHEEL_LOCAL. A static value here would override
+# setup()'s version, so it must be declared dynamic.
 description = "FlagGems operators as a custom PyTorch device (flagos)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -56,15 +57,17 @@ dynamic = ["version", "dependencies"]
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "black",
-    "isort",
+    # Pinned to the version CI installs in .github/workflows/lint.yml so a local
+    # `ruff` behaves identically to the gate.
+    "ruff==0.15.12",
 ]
 # FlagCX enables the heterogeneous unified-comm inner backend for distributed
 # (ProcessGroupFlagOS tries it first, then falls back to the vendor-native
 # backend — NCCL/HCCL). It is a hardware-specific compiled artifact (per-vendor
-# adaptor + CCL) with no PyPI release, so it must be built from source:
-# https://github.com/FlagOpen/FlagCX (see docs/architecture/distributed-flagcx.md).
-# This extra is a marker only; installing it does not fetch a wheel.
+# adaptor + CCL). Published wheels live on the matching vendor indexes at
+# resource.flagos.net, so the installer must select a toolkit-compatible index
+# and version (see .github/version-pins.env and docs/architecture/distributed-flagcx.md).
+# This extra declares the dependency but does not select a vendor index.
 flagcx = [
     "flagcx",
 ]
@@ -83,8 +86,24 @@ include = ["torch_fl*", "accelerator*", "csrc.runtime.accelerator*"]
 
 # Native libs (libtorch_fl.so) are built via setup.py cmdclass; editable install must
 # run build_ext — see EditableWheelWithCmake in setup.py.
-[tool.setuptools]
-py-modules = []
-
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.ruff]
+# Repo-owned baseline. The values below reproduce ruff's built-in defaults,
+# which is what CI ran before this config existed, so committing it is
+# behavior-neutral for the existing tree. A stricter profile lands separately.
+line-length = 88
+# Inferred from requires-python; stated explicitly so local runs and CI agree
+# even if the interpreter or ruff default changes.
+target-version = "py38"
+
+[tool.ruff.lint]
+# ruff's default rule set, spelled out so a future ruff release cannot silently
+# change what this repository checks.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+# Defaults, made explicit for the same reason.
+quote-style = "double"
+indent-style = "space"

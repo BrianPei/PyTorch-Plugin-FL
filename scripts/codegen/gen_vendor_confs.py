@@ -169,10 +169,14 @@ EXTRA_ROUTED = {"scaled_dot_product_attention"}
 #
 # The gap set is per-platform, not a FlagGems defect: the kernel works elsewhere,
 # but this platform's triton backend cannot run it, so the op is forced back to
-# boxing. MetaX's and DCU's live in codegen_ops.py (flaggems_forced_cuda plus the
-# per-platform additions) and are recovered here by diffing that platform's
-# existing conf against backends_flaggems.conf, rather than restated -- one
-# source of truth, and the per-op diagnosis stays in the codegen comments. PPU's
+# boxing. MetaX's and DCU's are recovered here by diffing that platform's
+# existing conf -- an op FlagGems covers whose conf line reads `cuda` is a gap
+# that platform measured, so the set is read back from the artifact instead of
+# restated, and the per-op diagnosis is in BOXING_GAP_NOTES below. That round
+# trip only holds while this script is the confs' sole writer: codegen_ops.py
+# wrote backends_metax.conf and backends_dcu.conf as well until #459, from
+# fallback sets that had drifted away from the confs, so a documented full
+# regeneration silently reverted the pins the diff had recovered. PPU's
 # is a literal (BOXING_TRITON_GAPS) because it is vendor-first no longer, and the
 # diff cannot tell a gap from a policy exception on a flaggems-first platform.
 BOXING_PLATFORMS = {
@@ -265,9 +269,132 @@ BOXING_GAP_NOTES = {
         "whenever the layer is built without a bias, which is how norm_out is",
         "built; with the pipeline loaded as bfloat16 (sweep.py's torch_dtype)",
         "that is add.Tensor(bf16_tensor, 0.0).",
+        "scatter_add_, argmin, mean and mean.dim are pinned to cuda for a",
+        "correctness reason, on FlagGems kernels that return a wrong answer or",
+        "raise rather than on anything the DCU backend cannot compile. Each was",
+        "measured on DCU with DAS boxing and FlagGems over the same tensor, both",
+        "arms in a fresh process and the build held fixed:",
+        "scatter_add_ with an index that is a valid PyTorch view(...).expand(...)",
+        "of stride (1, 0) -- logically (340, 12), physically 340 elements --",
+        "mismatches all 120 output elements, max |diff| 284.0, while boxing",
+        "matches all 120; the FlagGems 2-D path walks the index as if it were",
+        "contiguous and addresses through logical offset 4079, which is a silent",
+        "wrong answer here and an HSA VMFault on other allocations. Reported as",
+        "FlagGems issue #6448, with the same defect already filed as #6017.",
+        "argmin over a 20-column reduction returns 20, outside the valid [0, 19],",
+        "because the 32-lane kernel does not mask the tail; the survey cannot see",
+        "it, since its profiles reduce over the whole of a power-of-two row.",
+        "Reported as FlagGems issue #6447.",
+        "mean and mean.dim raise ZeroDivisionError on an empty reduction --",
+        "empty(0).mean() and empty(2, 0).mean(dim=1) -- where ATen returns NaN, so",
+        "a shape-agnostic call site turns a defined result into an exception.",
+        "Reported as FlagGems issue #6333.",
+        "The conf is overload-granular and cannot express a shape condition, so",
+        "the safe direction is the whole family on the boxing kernel --",
+        "scatter_add, scatter_add.out, argmin.out, mean.out and mean.dtype_out",
+        "were already there -- and the routes can be re-enabled per op with",
+        "FLAGOS_OP_<name>=flaggems once the FlagGems side is repaired.",
+        "native_batch_norm is pinned to cuda for an availability reason, one",
+        "level below the kernels: the route does not fail, it cannot be",
+        "entered. This op is routed through the FlagGems *Python* path, and",
+        "the generated kernel for it calls flag_gems.native_batch_norm",
+        "(csrc/aten/generated/flaggems_python_kernels.cc), a symbol the",
+        "FlagGems cohort pinned in this environment (5.3.4.post1.dev1) does",
+        "not export: it has batch_norm, batch_norm_backward and",
+        "_batch_norm_no_update, but no native_batch_norm. The Python call",
+        "resolves the attribute at run time, so the route dies with",
+        "AttributeError: module 'flag_gems.ops' has no attribute",
+        "'native_batch_norm' -- on every call, training or eval, and for any",
+        "shape. Measured on DCU, 2026-09-28, as nn.BatchNorm2d over a",
+        "(2, 4, 8, 8) fp32 input: the flaggems arm raises that AttributeError",
+        "for train=True and train=False alike, while the cuda arm returns a",
+        "result matching ATen (max |diff| 4.8e-07) and leaves the input",
+        "unmodified. Reported as Torch-FL issue #295, which mirrors FlagGems",
+        "issue #6332; on the FlagGems revision #295 measured (5.4.0rc2.post1)",
+        "the symbol exists, so what #295 saw was wrong output and a mutated",
+        "input rather than a missing entry point. Both revisions agree on the",
+        "conclusion -- the route is unusable for this op -- and the pin is the",
+        "same repair either way.",
+        "The rest of the family stays where it is, and deliberately: pinning",
+        "it wholesale would trade this failure for another. Measured on the",
+        "same build, native_batch_norm_backward matches ATen on both arms, and",
+        "_batch_norm_no_update is the inverse of this op -- it matches ATen on",
+        "flaggems and raises 'Expected tensor to have CPU Backend' on cuda, so",
+        "it must stay on flaggems. Only native_batch_norm moves.",
+        "_native_batch_norm_legit and its variants were already on cuda.",
+        "slice_backward and silu_backward are pinned to cuda for two hcu",
+        "backend gaps rather than for wrong answers: both gems kernels are",
+        "correct where they can run, and neither can run here. slice_backward",
+        "faults the hardware -- 'Invalid address access' -- and only once the",
+        "grad it produced is consumed by MIOpen's convolution_backward",
+        "(tests/integration/ops/test_conv1d_dispatch.py, C=6144 depthwise), so",
+        "it is an hcu codegen bug rather than a shape/stride mismatch on our",
+        "side: the kernel's own output metadata and values check out when",
+        "measured on its own. silu_backward calls tl.math.div_rn, whose",
+        "lowering is the same div_rn shim the div.*_mode entries above are",
+        "pinned for -- it returns None on the hcu backend, and here the None",
+        "reaches the builder, so compilation dies with AttributeError:",
+        "'NoneType' object has no attribute 'type'. MetaX pins slice_backward",
+        "too, for a cause that is not this one (an out-of-bounds Xnack fault",
+        "inside the gems kernel); the two entries overlap by coincidence.",
+        "The .out / .grad_input spellings are spelled cuda as well, but that",
+        "is not a gap: FlagGems does not cover those overloads.",
+    ),
+    "metax": (
+        "MetaX is FlagGems-first like every generated conf, but the ops",
+        "triton-metax or flag_gems cannot run on the flagos device are pinned",
+        "to cuda and reach the boxing kernel (maca libtorch_cuda via mcblas).",
+        "The fallback has to be cuda and not a metax-native backend: the",
+        "hand-written mxcc backend is not registered in the MetaX boxing wheel",
+        "(FLAGOS_BUILD_VENDOR=OFF).",
+        "mm/bmm and their .out spellings are the FlagGems SPLIT_K kwarg",
+        "triton-metax rejects; mean.dim is FlagGems' non-inner-dim path, which",
+        "builds a CUDA context that fails on triton-metax.",
+        "add.Tensor, div.Scalar and div.Tensor are the scalar-arithmetic group:",
+        "MetaX Triton cannot lower it once FlagGems normalizes the scalar to a",
+        "tensor overload and promotes it to f64, because the compiler then",
+        "rejects f64 -> bf16. _conj is a contract pin rather than a compile",
+        "one: ATen's conj is a lazy view that sets the Conjugate bit and leaves",
+        "the storage alone, while FlagGems' kernel materializes the value.",
+        "sort and sort.stable, plus the matmul -> relu -> sum.dim_IntList",
+        "workload, are held for the profiler: the MetaX FlagGems C++ sort path",
+        "corrupts that workload, and the contract above is what MetaX activity",
+        "correlation is being stabilized against.",
+        "The rest are flag_gems kernels that guard on tensor.device.type",
+        'against flag_gems.device (== "cuda") and so fail on a flagos device',
+        "either by falling back to torch.<op>, which re-enters flagos_python",
+        "dispatch and recurses, or by raising ValueError('Inputs must be cuda",
+        "tensors ...'): embedding_dense_backward, i0, reflection_pad2d,",
+        "soft_margin_loss, special_i0e, special_i1, im2col, zero and the",
+        "mul_.Tensor group among them.",
+        "slice_backward is held for a fault rather than a wrong answer: gem's",
+        "slice_backward_kernel reads out of bounds on large tensors (a",
+        "grad_output [1, 6144, 35] scattered into [1, 6144, 32], from the",
+        "conv1d backward of a linear-attention model), and on MetaX that",
+        "Xnack/ATU fault (0x8) disables the whole process's mcruntime -- every",
+        "later op fails with mcErrorIllegalAddress -- so the bounds-safe boxing",
+        "kernel is the only way back.",
+        "slice.Tensor is held on a vestigial assertion: flag_gems/ops/slice.py",
+        "rejects complex64 and complex128, while its body is a pure as_strided",
+        "view that never consults a dtype, and diffusers'",
+        "QwenImageTransformer2DModel slices complex rotary frequencies.",
+        "Reported upstream as FlagGems issue #6356; the entry can come out when",
+        "that lands.",
+        "Most of the rest were measured by the 2026-09-15 differential survey",
+        "of the 166 ops MetaX gained at the FlagGems 5.4.0rc2.post1 ceiling,",
+        "which reached each op on both routes with one host-built operand pair.",
+        "The per-op verdicts, and the five flagged ops that fail on both routes",
+        "and are therefore not held, are grouped in",
+        "tests/integration/ops/test_metax_flaggems.py; the survey itself is in",
+        "docs/reference/operator-support.md.",
+        "This set is not restated here: gen_vendor_confs.py reads it back from",
+        "backends_metax.conf on every run (see BOXING_PLATFORMS), so a pin is",
+        "recorded by the route it takes in this file, and the gap does not",
+        "drift away from the conf the way it did while codegen_ops.py wrote a",
+        "second copy from a stale literal (issue #459).",
     ),
     "ppu": (
-        "47 of the 482 FlagGems-covered ops are pinned to cuda; the other 435",
+        "49 of the 482 FlagGems-covered ops are pinned to cuda; the other 433",
         "route to flaggems. mm/bmm are the first four (FlagGems issue #6225:",
         "PPU rejects the _hygon kernel's num_ldmatrixes kwarg) and 33 are the",
         "2026-09-15 overload survey's measured route-dependent failures. Four",
@@ -275,10 +402,12 @@ BOXING_GAP_NOTES = {
         "`padding` from the rank, so every profile fails ATen's arity check",
         "before the device guard behind it can fire, and that guard is the",
         "device-name mismatch the CUDA alignment fixes and leaves alone on every",
-        "other vendor. The last six came from the CI steps that survey cannot",
+        "other vendor. The last eight came from checks that survey cannot",
         "see: the addmm family, whose autotune picks a BLOCK_SIZE_K < 16 config",
-        "on small-K shapes that the ppu triton rejects in tl.dot, and _conj,",
-        "which FlagGems materializes instead of setting the Conjugate bit. See",
+        "on small-K shapes that the ppu triton rejects in tl.dot; _conj, which",
+        "FlagGems materializes instead of setting the Conjugate bit; _unsafe_view,",
+        "whose FlagGems reshape can silently return a copy; and slice.Tensor,",
+        "whose FlagGems route rejects complex dtypes. See",
         "BOXING_TRITON_GAPS, which carries each op's failure, and",
         "docs/reference/operator-support.md for the full survey.",
     ),
@@ -347,6 +476,23 @@ BOXING_TRITON_GAPS = {
         # the boxing kernel. The value-level overload survey cannot see this
         # one: eager materialization is numerically indistinguishable. --
         "_conj",
+        # -- ATen's `_unsafe_view` has the same aliasing/error contract as view:
+        # a viewable layout aliases the input, while an incompatible stride
+        # raises RuntimeError. FlagGems implements it as `reshape`, which may
+        # silently allocate a copy for that incompatible stride. Measured on
+        # PPU: a viewable input aliases on both routes, but a non-contiguous
+        # transpose returns a non-aliasing tensor on FlagGems where CUDA boxing
+        # raises "view size is not compatible". Keep the kernel generated for
+        # explicit A/B diagnosis, but preserve the default PyTorch contract. --
+        "_unsafe_view",
+        # -- Qwen-Image-2.1 slices a complex64 rotary-embedding cache from the
+        # second denoising step onward. FlagGems' slice wrapper asserts that
+        # complex64/complex128 are unsupported before reaching its as_strided
+        # implementation, while the CUDA boxing route preserves the complex
+        # dtype and view semantics. Measured on PPU in the PR #342 full 40-step
+        # case: the FlagGems route aborts at step 2 with that assertion; boxing
+        # completes the same slice contract. --
+        "slice.Tensor",
         # -- FlagGems' reflection-padding wrappers reject a flagos operand before
         # they reach a kernel, and the overload survey cannot see it: the harness
         # derives `padding` from the tensor rank, so ATen's arity check fails
@@ -601,6 +747,133 @@ FLAGGEMS_PYTHON_PLATFORMS = {"ascend", "metax", "dcu", "gcu", "musa", "ppu"}
 # exactly these two overloads. matmul is not in the FlagGems coverage this conf
 # is generated from and already routes to `ascend`. Not yet filed upstream.
 #
+# ascend: topk returns all zeros -- both the values and the indices -- and does it
+# silently, for every shape measured. On Ascend910 with CANN 9.0.0, FlagTree
+# 0.6.2a1+ascend3.5 and FlagGems 6d31db9aa, `torch.topk(randn(128, device=...), 5)`
+# answers [0.0, 0.0, 0.0, 0.0, 0.0] / [0, 0, 0, 0, 0] against a CPU reference of
+# [3.4105, 2.5672, 2.3025, 2.3022, 1.9218] / [59, 69, 89, 45, 122]. The FlagGems
+# body is reached -- its `GEMS TOPK` debug line fires -- and calling
+# flag_gems.ops.topk directly on the same operand returns the same zeros in 0.02s,
+# so the shared entry point is what is wrong, not this conf's plumbing.
+#
+# The indices are what identifies the failure. topk_single_stage_kernel stores
+# `sorted_idx`, which is built from `tl.where(mask, cols, mask_index_val)` -- for
+# this shape every element of it is a distinct value in 0..127, and the pad is
+# INT32_MIN. Five zeros cannot be sorted output from that. The values buffer is
+# built the same way, from `x_val` padded with float("-inf"). Neither buffer holds
+# anything the kernel could have put there, so the store never lands: this is an
+# empty output, not a mis-sorted one. (N=128 with k=5 has HAS_TLE False and
+# x.is_cuda False on this backend, so topk.py's radix-TLE fast path is skipped and
+# the single-stage bitonic kernel above is the one that runs.) The compile is also
+# pathological rather than merely wrong at the margin -- bishengir-compile spends
+# minutes on a single (shape, k) pair, and the large-N shape in the same family is
+# already recorded as blowing the unified-buffer budget (`randperm(2000)` through
+# topk.py, "ub overflow, requires 10092544 bits").
+#
+# Ascend implements topk through aclnnTopk (csrc/aten/backends/ascend/topk.cc), so
+# the route back is free -- and it is exact: with FLAGOS_FORCE_BACKEND=vendor the
+# same call returns the CPU reference values and indices, 0 zeros. This is what
+# un-blocks tests/integration/test_compute_device_index.py::test_tuple_returning_op,
+# which is itself blocked from CI by issue #391. Not yet filed upstream.
+#
+# ascend: sum.dim_IntList, because the FlagGems kernel reduces a bool operand in
+# i1 -- which turns the reduction into an "any" and makes the count wrong. Two
+# defects sit behind it, both in the non-fp16 branch of `sum_dim_kernel`
+# (flag_gems/ops/sum.py:229):
+#
+#   * `cdtype = inp.dtype.element_ty` (:242) leaves a bool input accumulating in
+#     i1, where `_sum += a` (:257) is a bitwise OR and `tl.sum` (:258) over i1 is
+#     an "any". Every row holding at least one True reduces to `1` and every row
+#     holding none to `0`, in the correct int64 dtype, so nothing downstream can
+#     tell the count is wrong. Measured on Ascend with the FlagGems route forced
+#     back: a `(1, 52)` bool tensor with 52 Trues returns `[1]`, with 40 Trues
+#     `[1]`, with 1 True `[1]`, with no Trues `[0]`; a `(3, 52)` tensor whose rows
+#     hold 52/0/52 Trues returns `[1, 0, 1]` along dim=1 and `[1, 1, 1, 1]` along
+#     dim=0, where the CPU returns `[1, 0, 1]` and `[2, 2, 2, 2]`.
+#   * the same i1 accumulate is rejected outright by BiShengIR on the
+#     multi-dimension path, so `mask.sum(dim=(0, 1))` is a hard RuntimeError
+#     rather than a wrong answer:
+#         loc("_sum"(.../flag_gems/ops/sum.py:257:16)): error: 'hivm.hir.vadd' op
+#         failed to verify that operand at idx 0 and 1 should have element type
+#         16-bit signless integer or 32-bit signless integer or 16-bit float or
+#         32-bit float or 64-bit signless integer
+#
+# The float, fp16 and int64 paths are numerically correct, so this is a dtype
+# gap that a per-op conf entry spends more than it needs to. It is written that
+# way anyway because the mechanism this repo has for a dtype gap
+# (`FlagGemsRejectsOpDtype` in csrc/aten/common.cc) exists to keep an op on
+# FlagGems for the dtypes that work, and the only thing keeping `sum.dim_IntList`
+# there for float would be an unmeasured speed claim -- aclnnReduceSum is exact
+# for every dtype. The survey's 2d-f32, 4d-f32, 1d-f32, 2d-f16, 2d-i64 and
+# 2d-f32-strided profiles all PASS; the 2d-bool profile is the one that is WRONG.
+#
+# `mask = row_mask and col_mask` (:254) is not part of this. It reads like a
+# Python `and` that would return the second operand and drop the row check, and
+# Triton warns about it on every launch ("Logical operators 'and' and 'or' are
+# deprecated for non-scalar tensors"), but the front end lowers a BoolOp between
+# block tensors to `logical_and` (`visit_BoolOp`, folding its operands through
+# `_apply_binary_method`; triton/compiler/code_generator.py:1575-1587), so the
+# mask is correct and only the spelling is deprecated.
+#
+# The full reduction is unaffected: `mask.sum()` routes through `sum`, not
+# `sum.dim_IntList`, and returns `tensor([52], dtype=torch.int64)` correctly.
+#
+# This is what blocks the Qwen-Image text encoder on Ascend. diffusers'
+# `QwenImagePipeline._extract_masked_hidden` does `bool_mask.sum(dim=1)` and
+# feeds the result to `torch.split`, so the wrong [1] becomes
+# `RuntimeError: split_with_sizes: split sizes sum to 1 but tensor has 52
+# elements along dim 0` -- a crash three frames away from its cause.
+#
+# Ascend implements sum.dim_IntList through aclnnReduceSum
+# (SumDimIntlistKernelAscend in csrc/aten/backends/ascend/generated/), so the
+# route back is free. That kernel needed a fix of its own before the move was
+# correct -- it did not apply torch's no-dtype promotion and returned the input
+# dtype, so a bool sum came back `tensor([True])` rather than int64 counts; the
+# promotion now lives in codegen_ascend.py's `_reduce_dtype_prologue`. With both
+# in place `mask.sum(dim=1)` returns `[52]` and `mask.sum(dim=(0,1))` returns
+# `[52]`, bit-identical to the CPU. Not yet filed upstream.
+#
+# ascend: gelu and gelu_backward, both `approximate` spellings and every dtype,
+# because the failure is in the kernels rather than at a dispatch boundary.
+# Three of flag_gems/ops/gelu.py's four kernels evaluate `pow(x_fp32, 2)` --
+# `gelu_tanh` (:43), `gelu_backward_none` (:54) and `gelu_backward_tanh` (:67,
+# :69) -- and `pow` there is `tl_extra_shim.pow`. The Python int literal `2`
+# reaches triton-ascend's libdevice binding as an int32 operand, and the table
+# that resolves it has no `(float32, int32)` overload:
+#
+#     triton.compiler.errors.CompilationError: at 3:71:
+#     def gelu_tanh(x):
+#         x_fp32 = x.to(tl.float32)
+#         output = 0.5 * x * (1 + tanh(x_fp32 * 0.79788456 * (1 + 0.044715 * pow(x_fp32, 2))))
+#     KeyError((triton.language.float32, triton.language.int32))
+#
+# The column is the `pow(` call. `gelu_none` is the one kernel in the file with
+# no `pow` and the only one that compiles, so `approximate="none"` runs and
+# `approximate="tanh"` cannot launch at all; `gelu_backward_none` uses the same
+# construct, so a fwd+bwd graph is unbuildable whichever forward spelling is
+# chosen. This is what blocks the Qwen-Image transformer on Ascend, and it is not
+# avoidable there: diffusers' `QwenImageFeedForward` builds its activation with
+# `approximate="tanh"` (models/activations.py:85, reached from
+# transformer_qwenimage.py), so all 60 blocks take the failing route.
+#
+# Measured with tests/manual/flaggems_overload_survey.py against the pre-fix conf
+# (SHA-256 9d24378804775bda932f4572f94b1984b88fd069d659e16187c5ce8dab80918e), which
+# is where the two ops part company: `gelu_backward` FAILED on every float
+# profile -- 2d-f32, 4d-f32, 1d-f32, 2d-f16, 2d-f32-strided -- with the KeyError
+# above, so no per-dtype escape could state it, while `gelu` came back STRICT
+# because the survey drives the default `approximate="none"` spelling only. The
+# gap in `gelu` is argument-valued, and the conf keys on the ATen overload, so
+# the only way to route the tanh call away from FlagGems is to move the overload.
+#
+# Ascend implements both ops through aclnnGeluV2 / aclnnGeluBackwardV2
+# (GeluKernelAscend / GeluBackwardKernelAscend in
+# csrc/aten/backends/ascend/generated/), so the route back is free. Measured on
+# Ascend910 with CANN 9.0.0, FlagTree 0.6.2a1+ascend3.5 and FlagGems 6d31db9aa
+# over the three gate shapes the transformer actually feeds it -- (2, 4096, 24),
+# (1, 32, 3584), (2, 8, 256) -- forward and backward, both `approximate`
+# spellings: max|d| 4.8e-07 forward and 1.3e-06 backward against a float64 CPU
+# reference, all finite. Not yet filed upstream.
+#
 # musa: index_add and randn_like/randn were the first entries in this set (#275,
 # 2026-09-15), recorded as "index_add returns all zeros instead of accumulating"
 # and "randn crashes unpacking generator state". Neither signature reproduces.
@@ -815,6 +1088,8 @@ NATIVE_TRITON_GAPS = {
         "exponential_",
         "ge.Scalar",
         "ge.Tensor",
+        "gelu",
+        "gelu_backward",
         "gt.Scalar",
         "gt.Tensor",
         "le.Scalar",
@@ -833,6 +1108,8 @@ NATIVE_TRITON_GAPS = {
         "randperm",
         "sort",
         "sort.stable",
+        "sum.dim_IntList",
+        "topk",
     },
     "gcu": {
         # Pointwise overloads broken by ATen's float64 wrapped-number boxing.
@@ -853,6 +1130,32 @@ NATIVE_TRITON_GAPS = {
         "sub.Tensor",
         "sub_.Tensor",
         # Factory / creation ops that widen to a 64-bit element type.
+        #
+        # `new_ones` is here because flag_gems' `new_ones` is a thin wrapper over
+        # its `ones` kernel: `flag_gems/ops/new_ones.py:51` runs
+        # `ones_kernel[grid_fn](out, N, BLOCK_SIZE=1024)`, whose i64 instantiation
+        # is the one at `flag_gems/ops/ones.py:32` that GCU300 cannot lower. It is
+        # the only member of the `new_*` family that reaches the generated op list
+        # at all -- `new_empty`, `new_zeros` and `new_full` have no conf entry and
+        # no registration, so they were never routed and were always correct --
+        # and that left it as the one factory a model could not call on an int64
+        # tensor. `_update_model_kwargs_for_generation` makes that call on every
+        # generation step, at `transformers/generation/utils.py:991`
+        # (`attention_mask.new_ones((attention_mask.shape[0], num_new_tokens))`),
+        # so the generate half of the BERT cohort failed there with
+        # `RuntimeError: Pipeline run failed: PassManager execution failed`.
+        #
+        # Unlike its siblings, `new_ones` does not stop here. `ones`, `zeros` and
+        # `full` have no vendor entry point that takes a caller-supplied shape, so
+        # taking them off the FlagGems route leaves the ATen composite to
+        # decompose on the device into the `empty` + `fill_`/`zero_` pair
+        # codegen_gcu.py claims. `topsatenNewOnes` does take the shape, and
+        # codegen_gcu.py emits a kernel for it, so `new_ones` is served natively:
+        # membership in this set is what removes it from FlagGems coverage, and
+        # the native kernel behind it is what `route()` then falls through to.
+        # Drop the entry and the route returns to `flaggems` even with the kernel
+        # registered; keep the entry and remove the kernel and it falls back to
+        # `none`.
         "arange",
         "arange.start",
         "arange.start_step",
@@ -860,6 +1163,7 @@ NATIVE_TRITON_GAPS = {
         "full",
         "full_like",
         "linspace",
+        "new_ones",
         "ones",
         "ones_like",
         "scalar_tensor",
@@ -1220,6 +1524,23 @@ NATIVE_TRITON_GAPS = {
         "_conj",
         "add.Tensor",
         "add_.Tensor",
+        # addmm/baddbmm: FlagGems' MThreads matmul kernels lose fp64, and they
+        # lose it in two different ways. `_mthreads/ops/baddbmm.py` declares an
+        # `IS_FP64` constexpr that `_baddbmm_launch` never passes to the kernel,
+        # so the accumulator is unconditionally float32 and the fp64 call
+        # raises in the Triton front end. `_mthreads/ops/addmm.py` downcasts
+        # both operands to float32 before the dot, so an fp64 call returns a
+        # float32 answer without saying so. Measured on the MUSA CI runner with
+        # flag_gems 5.4.0 and torch 2.10.0+cpu, 64x64x64 against a CPU fp64
+        # reference: `baddbmm` raised `CompilationError` and `addmm` returned a
+        # float32-grade answer (the gap tracks the fp32 operand rounding, and
+        # its size moves with the seed; the downcast is the stable fact). The
+        # vendor kernel that takes both over is T_ADDMM
+        # in codegen_mudnn.py; the route and this entry are two halves of one
+        # claim. FlagGems is told about the two kernels separately, and these
+        # entries come off when a release no longer ships the defect.
+        "addmm",
+        "baddbmm",
         "div.Tensor",
         "div.Tensor_mode",
         "div_.Tensor",
@@ -1280,15 +1601,16 @@ TILEOPS_PLATFORMS = set()
 # boxing_cpp_ops(). test_metax_conf_keeps_mm_boxed pins the exception.
 #
 # Verification on this route is not the same as being routed on it: five of these
-# also sit in `metax_triton_fallback` (codegen_ops.py) for a reason recorded
-# there, and route_boxing() checks that gap set first, so the conf keeps `bmm`,
-# `bmm.out`, `sort`, `sort.stable` and `sum.dim_IntList` on the boxing kernel and
-# only 12 of the 17 reach flaggems_cpp. Measured again on the C550 host while
+# also sit in MetaX's boxing gap set, which route_boxing() checks first, so the
+# conf keeps `bmm`, `bmm.out`, `sort`, `sort.stable` and `sum.dim_IntList` on the
+# boxing kernel and only 12 of the 17 reach flaggems_cpp. That set is read back
+# from backends_metax.conf (see BOXING_PLATFORMS) and its per-op reasons are in
+# BOXING_GAP_NOTES["metax"]. Measured again on the C550 host while
 # reviewing this set: forcing `bmm` or `mm` onto the C++ route with
 # `FLAGOS_OP_bmm=flaggems_cpp` fails on the fp32 inputs `aten::bmm` must serve
 # ("soft-lowp matrix kernel requires a low-precision input"), while `sort` and
 # `embedding` compute the host answer there -- `sort`'s pin is its profiler
-# interaction, not its values, as the codegen_ops.py entry says.
+# interaction, not its values, as the note says.
 METAX_CPP_MEASURED = {
     "_softmax",
     "_softmax_backward_data",

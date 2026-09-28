@@ -64,10 +64,13 @@ jobs:
       - name: Prepare DCU build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_dcu.sh
+        run: bash .github/scripts/set_env.sh --platform dcu
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform dcu --check-build-env
 
       - name: Install wheel
         run: python -m pip install --force-reinstall --no-deps dist/*.whl

@@ -43,6 +43,8 @@
 
 #include <aten/common.h>
 
+#include "dataparallel_comm.h"
+
 namespace {
 
 // Forward declarations
@@ -486,6 +488,28 @@ PyObject* _set_backend_config_path(PyObject* self, PyObject* arg) {
   END_HANDLE_TH_ERRORS
 }
 
+// Publishes the flagos implementations of torch._C's DataParallel comm
+// primitives. See torch_fl/csrc/dataparallel_comm.cc for what they are and why
+// they cannot be left to the CUDA ones. Safe to call more than once.
+PyObject* _init_data_parallel_comm(PyObject* self, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+  torch_fl::comm::InitDataParallelComm();
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+// Marks this thread as scattering on behalf of a flagos-placed DataParallel and
+// returns the value it replaced, so a wrapper can restore it in a `finally`.
+PyObject* _set_scatter_scope(PyObject* self, PyObject* arg) {
+  HANDLE_TH_ERRORS
+  const bool previous = torch_fl::comm::SetScatterScope(THPUtils_unpackBool(arg));
+  if (previous) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+  END_HANDLE_TH_ERRORS
+}
+
 static PyMethodDef methods[] = {
     {"_init", _initExtension, METH_NOARGS, nullptr},
     {"_get_default_generator", _getDefaultGenerator, METH_O, nullptr},
@@ -508,6 +532,8 @@ static PyMethodDef methods[] = {
     {"_memory_reserved", _memory_reserved, METH_O, nullptr},
     {"_reset_peak_memory_stats", _reset_peak_memory_stats, METH_O, nullptr},
     {"_set_backend_config_path", _set_backend_config_path, METH_O, nullptr},
+    {"_init_dataparallel_comm", _init_data_parallel_comm, METH_NOARGS, nullptr},
+    {"_set_scatter_scope", _set_scatter_scope, METH_O, nullptr},
     {nullptr, nullptr, 0, nullptr}};
 
 extern "C" FLAGOS_EXPORT PyObject* initFlagosModule(void) {

@@ -48,6 +48,14 @@ DEVICE_B = "flagos:1"
 # Expected backend can be "musa" (mudnn native) or "flagos_python" (FlagGems)
 _OPS = {
     "mm": ("a @ b", "flagos_python"),  # FlagGems coverage
+    # Both are in NATIVE_TRITON_GAPS['musa'] because FlagGems' mthreads addmm
+    # downcasts fp64 operands to float32 and its baddbmm never passes IS_FP64
+    # to the kernel; see TestMusaMatmulFp64.
+    "addmm": ("torch.addmm(a, a, b)", "musa"),
+    "baddbmm": (
+        "torch.baddbmm(a.unsqueeze(0), a.unsqueeze(0), b.unsqueeze(0))",
+        "musa",
+    ),
     # FlagGems' pointwise promotion cannot serve a bf16 tensor against the
     # float64 0-dim tensor ATen boxes a Python-float operand into: the
     # mthreads LLVM lowering has no double overload for
@@ -137,6 +145,165 @@ class TestMusaDispatch:
         assert "[flagos dispatch] mm.out -> flagos_python" in result.stderr, (
             f"Expected flagos_python dispatch log, got:\n{result.stderr}"
         )
+
+
+# fp64 -- the one dtype every mudnn MatMul/BatchMatMul entry point rejects, and
+# the one the FlagGems MThreads addmm/baddbmm lose as well. One entry per overload
+# whose kernel gates on MudnnSupportsMatmulDtype. `mm`/`bmm` and their out= forms
+# default to FlagGems and only meet the musa kernel under an explicit override;
+# `addmm`/`baddbmm` meet it by default, because the conf routes them there.
+_FP64_MATMULS = {
+    "mm": (False, "a @ b", "ad @ bd"),
+    "bmm": (True, "torch.bmm(a, b)", "torch.bmm(ad, bd)"),
+    "mm.out": (False, "_mm_out(a, b)", "_mm_out(ad, bd)"),
+    "bmm.out": (True, "_bmm_out(a, b)", "_bmm_out(ad, bd)"),
+    "addmm": (False, "torch.addmm(bias, a, b)", "torch.addmm(biasd, ad, bd)"),
+    "baddbmm": (True, "torch.baddbmm(bias, a, b)", "torch.baddbmm(biasd, ad, bd)"),
+}
+
+
+def _op_env(op):
+    """`FLAGOS_OP_<op>`, with the dot of an out= overload written as `__`.
+
+    common.cc's override loop mangles `mm.out` into `FLAGOS_OP_mm__out`; setting
+    the un-mangled name is silently ignored, and a test that set it would be
+    measuring the default route while claiming to measure the override.
+    """
+    return "FLAGOS_OP_" + op.replace(".", "__")
+
+
+# The out= forms need an explicit destination; every other operand is generated
+# here so both legs see the same seed. The device leg reports either the refusal
+# or the value, so one prologue serves every route under test, default and
+# pinned alike.
+_FP64_MATMUL_PROLOGUE = """
+import torch, torch_fl
+torch.manual_seed(42)
+dev = torch.device({device!r})
+shape = (4, 64, 64) if {batched} else (64, 64)
+a = torch.randn(shape, dtype=torch.float64)
+b = torch.randn(shape, dtype=torch.float64)
+bias = torch.randn(shape, dtype=torch.float64)
+ad, bd, biasd = a.to(dev), b.to(dev), bias.to(dev)
+def _mm_out(x, y):
+    out = torch.empty(x.shape[:-1] + (y.shape[-1],), dtype=x.dtype, device=x.device)
+    torch.mm(x, y, out=out)
+    return out
+def _bmm_out(x, y):
+    out = torch.empty(x.shape[:-1] + (y.shape[-1],), dtype=x.dtype, device=x.device)
+    torch.bmm(x, y, out=out)
+    return out
+reference = {reference}
+try:
+    answer = {expression}
+except RuntimeError as exc:
+    print("raise", str(exc).splitlines()[0])
+else:
+    torch.flagos.synchronize()
+    drift = (answer.double().cpu() - reference.double().cpu()).abs().max()
+    print("ok", float(drift), answer.dtype)
+"""
+
+
+class TestMusaMatmulFp64:
+    """fp64 matmul is refused on the musa route rather than computed on the host.
+
+    `MudnnSupportsDtype` maps `at::kDouble` -- the type has a `Tensor::Type` --
+    and the arithmetic predicate the matmul kernels gate on inherited that. mudnn
+    itself has no fp64 matmul: `Run` and `RunWithBiasAdd` both answer
+    `NOT_SUPPORTED in MatMul::Run, Reason: unsupported data type
+    DOUBLE,DOUBLE,DOUBLE,,DOUBLE`, the same for BatchMatMul (mudnn v3300). So
+    `MudnnSupportsMatmulDtype` is what decides between the device and the refusal,
+    and the refusal is the point: the conf routes the matmul family to `musa`, and
+    a route that names the vendor backend must not hand back a tensor the CPU
+    computed. The error names the op, the dtype, the dtypes that do work, and
+    moving the operands with `.cpu()` -- the host path, which is the only one
+    there is: no runtime override reaches the CPU fallback for these ops (see
+    `test_fp64_none_override_is_not_a_host_path`).
+    """
+
+    @pytest.mark.musa
+    @pytest.mark.parametrize("op", ["addmm", "baddbmm"])
+    def test_fp64_default_route_reaches_musa_and_raises(self, op):
+        """addmm/baddbmm are routed to the vendor backend at fp64 and refuse there."""
+        batched, reference, expression = _FP64_MATMULS[op]
+        code = _FP64_MATMUL_PROLOGUE.format(
+            device=DEVICE, batched=batched, reference=reference, expression=expression
+        )
+        env = os.environ.copy()
+        env["FLAGOS_LOG"] = "dispatch"
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, result.stderr
+        assert f"[flagos dispatch] {op} -> musa" in result.stderr, (
+            f"Expected musa dispatch for {op}, got:\n{result.stderr}"
+        )
+        status, _, detail = result.stdout.strip().splitlines()[-1].partition(" ")
+        assert status == "raise", result.stdout
+        assert detail.startswith(f"{op}: "), detail
+        assert "float64" in detail, detail
+        for working in ("float32", "float16", "bfloat16"):
+            assert working in detail, detail
+        assert "`.cpu()`" in detail, detail
+        # The refusal must not offer the `none` override as a way out: it selects
+        # an empty dispatcher slot and raises instead of computing.
+        assert f"FLAGOS_OP_{op}=none" not in detail, detail
+
+    @pytest.mark.musa
+    @pytest.mark.parametrize("op", sorted(_FP64_MATMULS))
+    def test_fp64_pinned_to_musa_raises(self, op):
+        """FLAGOS_OP_<op>=musa at fp64 refuses instead of computing on the host.
+
+        `mm`/`bmm` and their `out=` forms default to FlagGems and only meet this
+        path under the override, so the case is reached for all six overloads.
+        """
+        batched, reference, expression = _FP64_MATMULS[op]
+        code = _FP64_MATMUL_PROLOGUE.format(
+            device=DEVICE, batched=batched, reference=reference, expression=expression
+        )
+        env = os.environ.copy()
+        env[_op_env(op)] = "musa"
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, f"{op} fp64: {result.stderr}"
+        status, _, detail = result.stdout.strip().splitlines()[-1].partition(" ")
+        assert status == "raise", result.stdout
+        # The `mm.out` spelling is what makes the override take: `FLAGOS_OP_mm.out`
+        # is silently ignored by common.cc's `__` mangling and the op would stay on
+        # its FlagGems route, so reaching the refusal at all is the assertion.
+        assert detail.startswith(f"{op}: "), detail
+        assert "float64" in detail, detail
+        assert "`.cpu()`" in detail, detail
+
+    @pytest.mark.musa
+    @pytest.mark.parametrize("op", ["addmm", "baddbmm"])
+    def test_fp64_none_override_is_not_a_host_path(self, op):
+        """`FLAGOS_OP_<op>=none` raises at runtime; it does not compute on the host.
+
+        `none` is a registration-time conf value: codegen skips `m.impl()` for it so
+        the call reaches the boxed cpu_fallback. The matmul family is registered --
+        mudnn owns the kernels -- so the runtime override selects an empty slot and
+        the dispatcher raises its conf/registration-disagreement message instead of
+        producing a tensor. That is why the refusal in the kernel points at
+        `.cpu()`: an override that reads plausibly but cannot work is worse than no
+        hint, and this test is what keeps it out of the message.
+        """
+        batched, reference, expression = _FP64_MATMULS[op]
+        code = _FP64_MATMUL_PROLOGUE.format(
+            device=DEVICE, batched=batched, reference=reference, expression=expression
+        )
+        env = os.environ.copy()
+        env[_op_env(op)] = "none"
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, env=env
+        )
+        assert result.returncode == 0, result.stderr
+        status, _, detail = result.stdout.strip().splitlines()[-1].partition(" ")
+        assert status == "raise", result.stdout
+        assert "no accelerated impl on this platform" in detail, detail
+        assert "registered on PrivateUse1" in detail, detail
 
 
 class TestMusaEmptyInplace:
@@ -833,6 +1000,179 @@ class TestMusaDegenerateStride:
         loss = model(input_ids=input_ids, labels=labels).loss
         loss.backward()
         assert loss.device.type == "flagos"
+
+
+# A view of a (4, 3, 512) tensor, once against the device tensor and once
+# against the CPU one, plus why the layout matters. Each is non-contiguous in a
+# different way, so a predicate that only special-cased one of them would show
+# up as a failure on the others.
+_STRIDED_SOFTMAX_VIEWS = [
+    (
+        "slice_last",
+        "x[:, -1, :]",
+        "x_cpu[:, -1, :]",
+        "stride over the leading dim, dense inner",
+    ),
+    (
+        "transpose",
+        "x[0].t()",
+        "x_cpu[0].t()",
+        "the reduced dim is the strided one",
+    ),
+    (
+        "expand",
+        "x[0, 0:1].expand(8, 512)",
+        "x_cpu[0, 0:1].expand(8, 512)",
+        "0-stride broadcast dim",
+    ),
+    (
+        "step_slice",
+        "x[0, 0, ::2]",
+        "x_cpu[0, 0, ::2]",
+        "1-D with a step of 2",
+    ),
+]
+
+
+def _run_strided_softmax_probe(body: str) -> subprocess.CompletedProcess:
+    """Run `body` with both softmax kernels pinned to mudnn.
+
+    Pinning matters: `_softmax` is routed to FlagGems by default, so an
+    unpinned run would pass whether or not the mudnn kernel can handle the
+    layout. The table is read once and cached, so the env has to be in place
+    before the interpreter loads it -- hence a subprocess rather than an
+    in-process `monkeypatch.setenv`.
+    """
+    env = os.environ.copy()
+    env.update(
+        {
+            "FLAGOS_LOG": "dispatch",
+            "FLAGOS_OP__softmax": "musa",
+            "FLAGOS_OP__log_softmax": "musa",
+            "FLAGOS_OP__softmax_backward_data": "musa",
+            "FLAGOS_OP__log_softmax_backward_data": "musa",
+        }
+    )
+    code = (
+        "import torch, torch.nn.functional as F, torch_fl\n"
+        "torch.manual_seed(0)\n"
+        f"x_cpu = torch.randn(4, 3, 512, requires_grad=True)\n"
+        f"x = x_cpu.detach().to('{DEVICE}').requires_grad_(True)\n"
+        f"{body}\n"
+        "torch.flagos.synchronize()\n"
+        "print('PROBE OK')\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env
+    )
+
+
+def _assert_ran_on_musa(result: subprocess.CompletedProcess, ops: tuple) -> None:
+    assert result.returncode == 0, f"probe failed:\n{result.stdout}{result.stderr}"
+    assert "PROBE OK" in result.stdout, result.stdout
+    for op in ops:
+        assert f"[flagos dispatch] {op} -> musa" in result.stderr, (
+            f"{op} did not reach the mudnn backend, so this proves nothing:\n"
+            f"{result.stderr}"
+        )
+
+
+class TestMusaSoftmaxStrided:
+    """Softmax must materialize a strided operand before handing it to mudnn.
+
+    mudnn's ``Softmax::Run``/``RunBwd`` derive their index arithmetic from the
+    stride descriptor and validate it up front, rejecting anything that is not
+    dense C-contiguous (``SoftmaxRun only support contiguous tensor``,
+    INVALID_PARAMETER) instead of falling back to a strided read the way
+    ``Reduce`` does. ``MudnnTensorWrapper``'s size-1 stride rewrite (issue #240)
+    does not help here: these layouts are genuinely strided on a dim of extent
+    greater than one, so only a copy can satisfy the check.
+
+    The backward is what makes this reachable in practice rather than
+    theoretical. ``y.sum().backward()`` hands the kernel an ``ones``-broadcast
+    gradient whose strides are all 0 -- autograd needs one element, not 512, to
+    describe it -- so the forward's own ``output`` operand is dense while
+    ``grad_output`` is not, and only one of the two operands trips the
+    validation. That is the path Qwen3's ``test_custom_4d_attention_mask``
+    takes (issue #262), and the forward-input half of it is issue #268.
+    """
+
+    @pytest.mark.musa
+    @pytest.mark.parametrize(
+        "dev_view,cpu_view,reason",
+        [case[1:] for case in _STRIDED_SOFTMAX_VIEWS],
+        ids=[case[0] for case in _STRIDED_SOFTMAX_VIEWS],
+    )
+    def test_strided_forward_matches_cpu(self, dev_view, cpu_view, reason):
+        """A strided input gives the same answer as its dense copy."""
+        result = _run_strided_softmax_probe(
+            f"y = F.softmax({dev_view}, -1)\n"
+            f"y_ref = F.softmax({cpu_view}, -1)\n"
+            "torch.testing.assert_close(y.cpu(), y_ref, rtol=1e-4, atol=1e-4)"
+        )
+        _assert_ran_on_musa(result, ("_softmax",))
+
+    @pytest.mark.musa
+    def test_broadcast_gradient_matches_cpu(self):
+        """`logits[:, -1, :].softmax(-1).sum().backward()` -- the #262 repro.
+
+        The gradient of the strided view has to be scattered back into the
+        dense input, so a wrong answer here would also mean a wrong answer for
+        every causal-LM attention weight.
+        """
+        result = _run_strided_softmax_probe(
+            "view, view_cpu = x[:, -1, :], x_cpu[:, -1, :]\n"
+            "F.softmax(view, -1).sum().backward()\n"
+            "F.softmax(view_cpu, -1).sum().backward()\n"
+            "torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)"
+        )
+        _assert_ran_on_musa(result, ("_softmax", "_softmax_backward_data"))
+
+    @pytest.mark.musa
+    def test_strided_transpose_gradient_matches_cpu(self):
+        """The gradient itself arrives strided, not just non-broadcast.
+
+        `y.t()` reverses which dim the reduction ran over, so autograd's
+        grad_output is a transpose of the forward input rather than a
+        broadcast of a single element -- a different stride pattern reaching
+        the same validation.
+        """
+        result = _run_strided_softmax_probe(
+            "F.softmax(x[0], -1).t().sum().backward()\n"
+            "F.softmax(x_cpu[0], -1).t().sum().backward()\n"
+            "torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)"
+        )
+        _assert_ran_on_musa(result, ("_softmax", "_softmax_backward_data"))
+
+    @pytest.mark.musa
+    def test_strided_log_softmax_matches_cpu(self):
+        """log_softmax shares both templates, so it shares the fix."""
+        result = _run_strided_softmax_probe(
+            "F.log_softmax(x[:, -1, :], -1).sum().backward()\n"
+            "F.log_softmax(x_cpu[:, -1, :], -1).sum().backward()\n"
+            "torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)"
+        )
+        _assert_ran_on_musa(result, ("_log_softmax", "_log_softmax_backward_data"))
+
+    @pytest.mark.musa
+    def test_contiguous_input_still_matches_cpu(self):
+        """The dense forward is unchanged, and pays no copy.
+
+        `Tensor::contiguous()` on an already dense tensor returns the same
+        tensor, so the guard is a branch rather than a materialization and the
+        kernel still reads the caller's storage.
+
+        The backward half of this case failed before the fix as well: autograd
+        builds `sum()`'s gradient as a broadcast no matter how the forward
+        input was laid out, so a dense forward input does not exempt the
+        backward from the copy.
+        """
+        result = _run_strided_softmax_probe(
+            "F.softmax(x, -1).sum().backward()\n"
+            "F.softmax(x_cpu, -1).sum().backward()\n"
+            "torch.testing.assert_close(x.grad.cpu(), x_cpu.grad, rtol=1e-4, atol=1e-4)"
+        )
+        _assert_ran_on_musa(result, ("_softmax", "_softmax_backward_data"))
 
 
 class TestMusaAutograd:

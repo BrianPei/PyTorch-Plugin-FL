@@ -898,16 +898,20 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 """
 )
 
-# mm/bmm. mudnn's MatMul and BatchMatMul both want a workspace maintainer (the
+# mm/bmm. The unsupported-dtype arm of this template and of mm.out/addmm below
+# refuses on purpose -- see MATMUL_CATEGORIES. mudnn's MatMul and BatchMatMul
+# both want a workspace maintainer (the
 # query returned 0 bytes for the shapes probed, but the argument is mandatory).
 # Operands are made contiguous here: unlike the elementwise ops, a GEMM's inner
 # layout requirements are not something the stride descriptor alone guarantees,
 # so this keeps mm(a.t(), b) correct rather than fast.
 T_MATMUL = """\
 at::Tensor {kernel}(const at::Tensor& self, const at::Tensor& mat2) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    return at::{at_op}(self.cpu(), mat2.cpu()).to(self.device());
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -931,10 +935,11 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 
 T_MATMUL_OUT = """\
 at::Tensor& {kernel}(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    out.copy_(at::{at_op}(self.cpu(), mat2.cpu()));
-    return out;
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -1107,6 +1112,16 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 # `half_to_float` asks for a float output from a half input, which mudnn's
 # Softmax does not express (out dtype must match in), so that combination runs
 # on the host. ACCURATE is the max-subtracting algorithm, matching aten.
+#
+# Unlike Reduce, Softmax reads its input through the *index* arithmetic that
+# mudnn derives from the stride descriptor, and its validation rejects anything
+# that is not dense C-contiguous -- `SoftmaxRun only support contiguous tensor`,
+# INVALID_PARAMETER -- rather than falling back to a strided read. So a strided
+# input (a slice, a transpose, an expanded broadcast) has to be materialized
+# here. `is_contiguous()` is the right test even though MudnnTensorWrapper
+# already normalizes size-1 strides: the predicate only ignores size-1 dims,
+# whose stride the wrapper rewrites to the C-contiguous value, so anything it
+# reports as non-contiguous is genuinely strided and would be rejected.
 T_SOFTMAX_FWD = """\
 at::Tensor {kernel}(const at::Tensor& self, int64_t dim, bool half_to_float) {{
   if (!musa_ops::{dtype_pred}(self.scalar_type()) || half_to_float) {{
@@ -1114,8 +1129,9 @@ at::Tensor {kernel}(const at::Tensor& self, int64_t dim, bool half_to_float) {{
   }}
   int64_t d = dim < 0 ? dim + self.dim() : dim;
   auto out = at::empty(self.sizes(), self.options());
-{empty_guard}
-  musa_ops::MudnnTensorWrapper t_self(self);
+{empty_guard}  auto self_c = self.contiguous();
+
+  musa_ops::MudnnTensorWrapper t_self(self_c);
   musa_ops::MudnnTensorWrapper t_out(out);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::{mode});
@@ -1133,6 +1149,14 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 # y*(g - sum(g*y)) exactly. `input_dtype` only tells us what the forward input
 # was; when it differs from the gradient's dtype aten wants a converting
 # backward, which mudnn does not express, so that combination goes to the host.
+#
+# RunBwd enforces the same dense-contiguity validation as Run, on both of its
+# operands. `grad_output` is the one that genuinely arrives strided: autograd
+# hands the backward a broadcasted `ones` whenever the softmax output is summed
+# (`y.sum().backward()` gives a grad_output of stride 0 everywhere), which is
+# how the qwen3 tests reach this. `output` is the forward's own dense
+# allocation in every path we dispatch, but the same guard is applied so a
+# direct `_softmax_backward_data` call with a strided output cannot trip it.
 T_SOFTMAX_BWD = """\
 at::Tensor {kernel}(
     const at::Tensor& grad_output,
@@ -1148,8 +1172,10 @@ at::Tensor {kernel}(
   int64_t d = dim < 0 ? dim + output.dim() : dim;
   auto grad_input = at::empty(output.sizes(), output.options());
 
-  musa_ops::MudnnTensorWrapper t_go(grad_output);
-  musa_ops::MudnnTensorWrapper t_out(output);
+  auto grad_output_c = grad_output.contiguous();
+  auto output_c = output.contiguous();
+  musa_ops::MudnnTensorWrapper t_go(grad_output_c);
+  musa_ops::MudnnTensorWrapper t_out(output_c);
   musa_ops::MudnnTensorWrapper t_gi(grad_input);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::{mode});
@@ -1895,11 +1921,14 @@ at::Tensor {kernel}(
     const at::Tensor& mat2,
     const at::Scalar& beta,
     const at::Scalar& alpha) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat1.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    return at::{at_op}(self.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha)
-        .to(self.device());
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat1.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat1.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = mat1.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -2795,6 +2824,24 @@ ARITHMETIC_CATEGORIES = {
     "reduce_indices",
 }
 
+# The categories whose kernel drives a mudnn MatMul/BatchMatMul. Their dtype
+# reach is narrower than arithmetic's: every matmul entry point rejects DOUBLE
+# ("NOT_SUPPORTED in MatMul::Run, unsupported data type DOUBLE,DOUBLE,DOUBLE,,
+# DOUBLE", measured on mudnn v3300), even though the type maps in
+# ToMudnnDataType. These kernels use MudnnSupportsMatmulDtype, and where that
+# predicate says no they raise (MusaRaiseUnsupportedMatmulDtype) instead of
+# falling back to the host the way the other categories do. A dtype the vendor
+# cannot serve on this route is a dtype the config cannot deliver: `addmm = musa`
+# has to mean the op ran on the device, not that the tensor came back from the
+# CPU. Every other category keeps its .cpu() fallback, because the dtypes their
+# predicates reject (complex, quantized, fp8) have no device path at all, and
+# refusing them would take away ops that work today.
+MATMUL_CATEGORIES = {
+    "matmul",
+    "matmul_out",
+    "addmm",
+}
+
 # The mudnn class each category configures, for symbol validation.
 CATEGORY_CLASS = {
     "metadata_view": None,  # pure ATen metadata; no mudnn symbol to validate
@@ -3052,10 +3099,17 @@ def main():
             fn=fn,
             disp=disp,
             at_op=AT_OP_OVERRIDES.get(op, base),
+            # The name the conf spells and the FLAGOS_OP_ loop reads, which for
+            # an out= variant is the overload (`mm.out`) and not the base op the
+            # mudnn tag carries. A template that refuses a dtype names its op
+            # with this, so the message uses the spelling the conf uses.
+            route_key=op,
             empty_guard=empty_guard(EMPTY_GUARD_RETURN.get(cat, "out")),
             promote_integral="true" if base == "sum" else "false",
             dtype_pred=(
-                "MudnnSupportsArithmeticDtype"
+                "MudnnSupportsMatmulDtype"
+                if cat in MATMUL_CATEGORIES
+                else "MudnnSupportsArithmeticDtype"
                 if cat in ARITHMETIC_CATEGORIES
                 else "MudnnSupportsDtype"
             ),

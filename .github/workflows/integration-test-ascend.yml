@@ -74,10 +74,13 @@ jobs:
       - name: Prepare Ascend build environment
         env:
           CI_STAGE: build
-        run: bash .github/scripts/set_env_ascend.sh
+        run: bash .github/scripts/set_env.sh --platform ascend
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform ascend --check-build-env
 
       - name: Install wheel and test dependencies
         run: python -m pip install --force-reinstall --no-deps dist/*.whl

@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
+import json
 import re
 import runpy
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import setuptools
-from setuptools import Distribution
+from setuptools import Distribution, Extension
 from setuptools.command.build_ext import build_ext
 
 
@@ -52,6 +56,7 @@ def test_build_ext_stages_generated_build_config(
     monkeypatch, tmp_path, clean_kernel_env
 ):
     _, setup_kwargs = _load_setup(monkeypatch)
+    assert "scripts/tools/torch-fl-preflight" in setup_kwargs["scripts"]
     source_root = tmp_path / "source"
     package_root = source_root / "torch_fl"
     package_root.mkdir(parents=True)
@@ -64,6 +69,16 @@ def test_build_ext_stages_generated_build_config(
         setup_globals,
         "build_deps",
         lambda: setup_globals["_write_build_config"](),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(_C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=False)),
+    )
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "2.10.0+cpu" if name == "torch" else None,
     )
     monkeypatch.setattr(build_ext, "run", lambda self: None)
 
@@ -78,6 +93,16 @@ def test_build_ext_stages_generated_build_config(
         'ACCELERATOR = "musa"\n'
         'KERNELS = ("flaggems", "vendor")\n'
     )
+    compatibility = json.loads(
+        (tmp_path / "wheel" / "torch_fl" / "compatibility.json").read_text()
+    )
+    assert compatibility["platform"] == "musa"
+    assert compatibility["wheel_version"] == "2.10.0"
+    assert compatibility["build"]["kernels"] == ["flaggems", "vendor"]
+    assert compatibility["build"]["vendor_torch_libraries"] is False
+    assert compatibility["build"]["distributions"]["torch"] == "2.10.0+cpu"
+    assert compatibility["build"]["sdk_version"] is None
+    assert compatibility["build"]["vendor_torch_version"] is None
 
 
 def test_build_config_is_executable_python(monkeypatch, tmp_path, clean_kernel_env):
@@ -206,3 +231,176 @@ def test_impossible_kernel_switch_raises_instead_of_being_ignored(
     # And a platform with no pin has no such objection.
     monkeypatch.setenv("FLAGOS_BUILD_FLAGGEMS_CPP", "1")
     assert namespace["_kernel_switches"]("ppu")["FLAGOS_BUILD_FLAGGEMS_CPP"] is True
+
+
+def _platform_table() -> dict:
+    return json.loads((ROOT / "cmake" / "flagos_platforms.json").read_text())
+
+
+def test_platform_table_is_internally_consistent():
+    """Every accelerator row is complete, and each pin agrees with its default.
+
+    cmake/flagos_platforms.json is the single source setup.py and CMake read; a
+    missing default, or a pin that disagrees with the default, would resolve
+    differently on the two sides -- the drift the table exists to prevent.
+    """
+    table = _platform_table()
+    switches = table["kernel_switches"]
+    assert len(switches) == 5 and len(set(switches)) == 5
+    assert set(table["kernel_set_names"]) == set(switches)
+
+    required = (
+        "project_languages",
+        "runtime_dir",
+        "bundle_libdir",
+        "vendor_torch_libraries",
+        "wheel_local",
+        "use_macro",
+        "writes_platform_marker",
+        "c10_cuda_no_cmake_configure",
+        "kernel_defaults",
+        "pins",
+    )
+    for accelerator, row in table["accelerators"].items():
+        for field in required:
+            assert field in row, (accelerator, field)
+        assert isinstance(row["vendor_torch_libraries"], bool), accelerator
+        assert set(row["kernel_defaults"]) == set(switches), accelerator
+        assert all(
+            isinstance(value, bool) for value in row["kernel_defaults"].values()
+        ), accelerator
+        for name, pin in row["pins"].items():
+            assert name in switches, (accelerator, name)
+            assert pin["value"] is row["kernel_defaults"][name], (accelerator, name)
+            assert pin["reason"], (accelerator, name)
+        assert "CUDA" in row["project_languages"] or row["project_languages"] == [
+            "CXX",
+            "C",
+        ], accelerator
+
+
+def test_cmake_declares_every_kernel_switch():
+    """Root and csrc CMakeLists option() cover exactly the table's switches.
+
+    A switch in the table but not declared with option() -- or the reverse -- is
+    exactly the drift this fixed: FLAGOS_BUILD_TILEOPS was missing from the root
+    explicit-request loop, so a contradictory -D was not rejected there.
+    """
+    switches = set(_platform_table()["kernel_switches"])
+    for relative in ("CMakeLists.txt", "csrc/CMakeLists.txt"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        declared = set(re.findall(r"^option\((FLAGOS_BUILD_\w+)", text, re.M))
+        assert declared == switches, (relative, declared ^ switches)
+
+
+def test_setup_resolves_the_table_defaults(monkeypatch, clean_kernel_env):
+    """setup.py's resolved defaults are the table's, for every accelerator.
+
+    Ties the Python consumer to the shared source directly, rather than through
+    the hand-written expected sets above.
+    """
+    namespace, _ = _load_setup(monkeypatch)
+    for accelerator, row in _platform_table()["accelerators"].items():
+        assert namespace["_kernel_switches"](accelerator) == row["kernel_defaults"], (
+            accelerator
+        )
+
+
+def _make_minimal_dtk(root):
+    """Just enough of a DTK tree for the DCU _flagos_nccl link set to resolve."""
+    for relative in (
+        "cuda/cuda-12/include/cuda.h",
+        "include/rccl/nccl.h",
+        "lib/librccl.so",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+
+def _make_minimal_vendor_torch_lib(root):
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("libc10_hip.so", "libtorch_hip.so"):
+        (root / name).touch()
+
+
+def _dcu_bridge_env(monkeypatch, tmp_path):
+    """Point a DCU build at throwaway DTK and vendor torch/lib trees."""
+    dtk = tmp_path / "dtk"
+    vendor_lib = tmp_path / "vendor-torch" / "lib"
+    _make_minimal_dtk(dtk)
+    _make_minimal_vendor_torch_lib(vendor_lib)
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "dcu")
+    monkeypatch.setenv("ROCM_PATH", str(dtk))
+    monkeypatch.setenv("FLAGOS_VENDOR_TORCH_LIB", str(vendor_lib))
+
+
+def test_build_ext_appends_the_dcu_comm_bridge_target(
+    monkeypatch, tmp_path, clean_kernel_env
+):
+    """A DCU build must describe the bridge, so setuptools builds and stages it.
+
+    It has to be in ext_modules from _get_setup_kwargs() rather than appended by
+    the build_ext command: finalize_options fills ext_map/_needs_stub and
+    get_outputs from that list before run(), and the inplace copy back into
+    torch_fl/comm/_nccl_ext/ is driven by it (issue #366).
+    """
+    _dcu_bridge_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["setup.py", "build_ext"])
+
+    _, setup_kwargs = _load_setup(monkeypatch)
+
+    assert [extension.name for extension in setup_kwargs["ext_modules"]] == [
+        "torch_fl._C",
+        "torch_fl.comm._nccl_ext._flagos_nccl",
+    ]
+
+
+def test_metadata_only_pass_does_not_resolve_the_dcu_link_set(
+    monkeypatch, tmp_path, clean_kernel_env
+):
+    """egg_info/sdist must not need DTK to be installed.
+
+    FLAGOS_ACCELERATOR=dcu with no DTK anywhere is exactly the metadata case: it
+    resolves, but only because the gate keeps the bridge out of the target list.
+    """
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "dcu")
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path / "missing-dtk"))
+    monkeypatch.setattr(sys, "argv", ["setup.py", "egg_info"])
+
+    _, setup_kwargs = _load_setup(monkeypatch)
+
+    assert [extension.name for extension in setup_kwargs["ext_modules"]] == [
+        "torch_fl._C"
+    ]
+
+
+def test_build_ext_adds_torch_paths_to_the_comm_bridge_only(
+    monkeypatch, clean_kernel_env
+):
+    """Only the bridge target gains torch's include/library paths and link set.
+
+    torch_fl._C is a C stub over libtorch_bindings.so and must not inherit the
+    c10/torch/torch_cpu link set the pybind factory needs.
+    """
+    # Stubbed rather than imported: torch.utils.cpp_extension reports the paths
+    # of the *installed* torch, and importing the real one from this checkout
+    # pulls in torch_fl's device-backend preload.
+    cpp_extension = SimpleNamespace(
+        include_paths=lambda: ["/torch/include"],
+        library_paths=lambda: ["/torch/lib"],
+    )
+    monkeypatch.setitem(sys.modules, "torch.utils.cpp_extension", cpp_extension)
+
+    namespace, _ = _load_setup(monkeypatch)
+    bridge_name = namespace["_load_nccl_ext_builder"]().WHEEL_EXTENSION_NAME
+    bridge = Extension(name=bridge_name, sources=["nccl_backend.cpp"])
+    other = Extension(name="torch_fl._C", sources=["torch_fl/csrc/stub.c"])
+    command = SimpleNamespace(extensions=[other, bridge])
+
+    namespace["BuildExtWithCmake"]._prepare_nccl_extension(command)
+
+    assert bridge.include_dirs == ["/torch/include"]
+    assert bridge.library_dirs == ["/torch/lib"]
+    assert bridge.libraries == ["c10", "torch", "torch_cpu"]
+    assert other.include_dirs == [] and other.libraries == []

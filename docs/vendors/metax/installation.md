@@ -52,7 +52,7 @@ FLAGOS_ACCELERATOR=metax \
 
 **Parameters:**
 - `FLAGOS_VENDOR_TORCH_LIB`: Path to the `torch+metax` wheel's `torch/lib` directory (source of forked libtorch)
-- `FLAGOS_WHEEL_LOCAL`: Local version tag (e.g., `metax3.8.1` → wheel version `0.1.0+metax3.8.1`), identifying the target MACA/driver version
+- `FLAGOS_WHEEL_LOCAL`: Local version tag (e.g., `metax3.8.1` → wheel version `2.10.0+metax3.8.1`), identifying the target MACA/driver version
 
 #### Step 2: Bundle the Forked Libtorch
 
@@ -74,7 +74,7 @@ cp build/lib.*/torch_fl/_C.*.so build/lib.*/torch_fl/
 python setup.py bdist_wheel --skip-build --bdist-dir "$(mktemp -d)"
 ```
 
-The result is `dist/torch_fl-0.1.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1.1 GB — it bundles the forked libtorch and exceeds PyPI's 100 MB limit; distribute via private index or direct transfer).
+The result is `dist/torch_fl-2.10.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1.1 GB — it bundles the forked libtorch and exceeds PyPI's 100 MB limit; distribute via private index or direct transfer).
 
 ### Installation on Target Host
 
@@ -82,7 +82,7 @@ The result is `dist/torch_fl-0.1.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1.
 
 ```bash
 pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
-pip install torch_fl-0.1.0+metax3.8.1-cp312-cp312-linux_x86_64.whl
+pip install torch_fl-2.10.0+metax3.8.1-cp312-cp312-linux_x86_64.whl
 ```
 
 #### Runtime Configuration
@@ -279,7 +279,7 @@ pip install "git+https://github.com/FlagOpen/FlagGems.git@5a58df410c551c4f4eb41d
 
 The FlagGems revision is load-bearing, not cosmetic. A generated kernel calls its operator by package-level name (`flag_gems.<name>`), resolved by `getattr` at dispatch time (`csrc/aten/backends/flagos/python_op_caller.cc:GetFunc`), so a cohort that does not define one of those names fails exactly the routes that use it. The revision above resolves all 666 names the checked-in `csrc/aten/generated/flaggems_python_kernels.cc` calls; `.github/scripts/set_env_metax.sh` measures that ratio before every integration job and refuses to run when it is not `0/666`.
 
-That measurement has an import-order requirement of its own, because the setup venv runs the stock `torch+cpu` wheel: its `torch/lib` carries no `libtorch_cuda.so`, so `torch.cuda.is_available()` is `False` until `torch_fl` has relinked that directory to the MetaX libtorch. In that state the MetaX Triton backend reports itself inactive (`triton/backends/metax/driver.py:is_active`), and `flag_gems` reaches `triton.runtime.driver.active` while it is being imported (`flag_gems.fused` -> `pointwise_dynamic` -> `triton.runtime.jit.parse` -> the Triton hint manager's backend lookup), so a bare `import flag_gems` in the venv fails with `RuntimeError: 0 active drivers ([]). There should only be one.` — the FlagGems install is fine, the probe is simply running too early. The ratio is therefore taken in a process that imports `torch_fl` first, at the end of the setup script rather than beside the FlagGems install, since `torch_fl` is not importable until `setup.py build_ext` has run. The same rule applies to any ad-hoc check against the venv: `import torch_fl`
+That measurement has an import-order requirement of its own, because the setup venv runs the stock `torch+cpu` wheel: its `torch/lib` carries no `libtorch_cuda.so`, so `torch.cuda.is_available()` is `False` until `torch_fl` has selected the MetaX libtorch through a private facade. In that state the MetaX Triton backend reports itself inactive (`triton/backends/metax/driver.py:is_active`), and `flag_gems` reaches `triton.runtime.driver.active` while it is being imported (`flag_gems.fused` -> `pointwise_dynamic` -> `triton.runtime.jit.parse` -> the Triton hint manager's backend lookup), so a bare `import flag_gems` in the venv fails with `RuntimeError: 0 active drivers ([]). There should only be one.` — the FlagGems install is fine, the probe is simply running too early. The ratio is therefore taken in a process that imports `torch_fl` first, at the end of the setup script rather than beside the FlagGems install, since `torch_fl` is not importable until `setup.py build_ext` has run. The same rule applies to any ad-hoc check against the venv: `import torch_fl`
 first, or the device surface is not there yet.
 
 ### Runtime Configuration
@@ -312,6 +312,91 @@ Multi-GPU distributed training routes through the NCCL-shaped `mccl` fallback. T
 
 MetaX carries FSDP2 and Qwen3 training parity work in repository history, but these tests are not part of the CI manifest. Model-level validation remains a manual exercise on MetaX hardware.
 
+## fp32 Matmul Precision (TF32)
+
+An fp32 `mm`/`bmm` on MetaX computes in fp32 by default. The MetaX container
+image used by this project's CI does not: it exports
+
+```bash
+TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+```
+
+ATen reads that variable while it initialises its TF32 state, so it is applied
+before any user code runs and before the device is touched:
+
+```python
+torch.backends.cuda.matmul.allow_tf32      # True
+torch.backends.cuda.matmul.fp32_precision  # 'tf32'
+```
+
+MACA's GEMM then takes its TF32 kernel for an fp32 product — profiling an fp32
+`addmm` in that process names `mcblas__Mck_tf32gemm_tn_..._tf32_...` — which is
+the documented meaning of the variable and is what PyTorch asked for. The vendor
+kernel is faithful to that setting; `torch_fl` never changes it, and no routing
+change recovers the bits, because the same setting is inherited by every other
+vendor GEMM the process reaches (fp32 `scaled_dot_product_attention` on the
+MetaX build is served from the vendor path and loses precision the same way).
+This is a property of the deployment environment, not of the wheel.
+
+The loss is ~900x, whatever the op and shape. Relative Frobenius error against an
+fp64 CPU reference, 5 shapes × 20 seeds on a C550:
+
+| computation | relative error |
+| --- | --- |
+| fp32 (`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0`) | 6.0e-08 .. 2.9e-07 |
+| TF32 (image default) | 2.6e-04 .. 3.3e-04 |
+
+Check it in one line:
+
+```bash
+python -c "
+import torch_fl, torch
+torch.manual_seed(0)
+a, b = torch.randn(64, 128), torch.randn(128, 32)
+got = torch.mm(a.to('flagos:0'), b.to('flagos:0')).cpu().double()
+ref = torch.mm(a.double(), b.double())
+print('relative error:', ((got - ref).norm() / ref.norm()).item())
+# ~3e-07 is fp32, ~3e-04 is TF32
+"
+```
+
+### Turning it off
+
+Set the variable to `0` (or leave it unset) **before the process starts** — `0` is
+the explicit-off spelling, and it is what cancels an inherited `1`. Unset and `0`
+are numerically identical; a non-numeric value such as `false` or an empty string
+raises a `UserWarning` and is treated as off.
+
+```bash
+TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0 python your_script.py
+```
+
+For a process that cannot change its environment, the setting is reachable
+in-process, and the legacy accessor is the one to use:
+
+```python
+torch.backends.cuda.matmul.allow_tf32 = False   # clean: no warning, both accessors stay readable
+```
+
+`torch.backends.cuda.matmul.fp32_precision = "ieee"` also takes effect, but it
+moves the object to the new API alone, and reading `allow_tf32` afterwards then
+raises `RuntimeError: ... mix of the legacy and new APIs to set the TF32 status
+for cublas matmul`. Setting `allow_tf32` repairs that state, so it is the setter
+to reach for if either API has already been touched.
+
+`torch_fl`'s own CI pins `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0` in
+`.github/configs/metax.yml` (`integration_environment`), so the MetaX
+integration job measures fp32 rather than TF32.
+`tests/integration/test_dtype_coverage.py` holds the resulting precision to 1e-5
+relative, which fails if that pin is dropped. MetaX is the platform those two
+cases were measured on. Ascend is the one backend that cannot meet the bound and
+does not claim to — its cube takes HF32 by request, the switch the
+`MM_RTOL`/`MM_ATOL` comment in `tests/integration/test_ops.py` and issue #409 are
+about — so they are xfailed there. No other platform was measured; what the
+cases rest on for them is their own code, not a routing table: the FlagGems
+`mm`/`bmm` pass `allow_tf32=False` to `tl.dot` explicitly, and MUSA's `mudnn`
+handle is refreshed from `at::globalContext().allowTF32CuBLAS()` on every call.
+
 ## Troubleshooting
 
 ### Import Error: `undefined symbol` from libtorch
@@ -328,7 +413,7 @@ MetaX carries FSDP2 and Qwen3 training parity work in repository history, but th
 
 ### `import torch_fl` fails with configuration errors or missing libraries
 
-**Cause:** the MetaX-specific import-time setup (libtorch relink, `torch.cuda`
+**Cause:** the MetaX-specific import-time setup (libtorch selection, `torch.cuda`
 shim) did not run.
 
 **Fix:** confirm the wheel was built for MetaX (`FLAGOS_ACCELERATOR=metax`, recorded at
