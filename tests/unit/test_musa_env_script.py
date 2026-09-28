@@ -47,6 +47,120 @@ def run_shell(body, **environment):
     )
 
 
+def fake_build_tools(site, *, editable=True, frontend=True):
+    site.mkdir(parents=True, exist_ok=True)
+    setuptools = site / "setuptools"
+    commands = setuptools / "command"
+    commands.mkdir(parents=True)
+    version = "64.0.0" if editable else "59.6.0"
+    (setuptools / "__init__.py").write_text(f"__version__ = {version!r}\n")
+    (commands / "__init__.py").touch()
+    if editable:
+        (commands / "editable_wheel.py").write_text("class editable_wheel: pass\n")
+    if frontend:
+        (site / "build.py").write_text("__version__ = '1.4.0'\n")
+
+
+@pytest.mark.parametrize(
+    "editable,frontend,usable",
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_build_tools_require_real_imports(tmp_path, editable, frontend, usable):
+    root = tmp_path / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(root)], check=True
+    )
+    site = next((root / "lib").glob("python*/site-packages"))
+    fake_build_tools(site, editable=editable, frontend=frontend)
+    result = run_shell(
+        shell_function("musa_validate_build_tools")
+        + '\nmusa_validate_build_tools\necho "AUTOLOAD=$TORCH_DEVICE_BACKEND_AUTOLOAD"',
+        VENV_PYTHON=str(root / "bin/python"),
+        TORCH_DEVICE_BACKEND_AUTOLOAD="1",
+    )
+    assert (result.returncode == 0) == usable, result.stdout + result.stderr
+    if usable:
+        assert "editable_wheel available" in result.stdout
+        assert "AUTOLOAD=1" in result.stdout
+    else:
+        assert "ModuleNotFoundError" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "default",
+        "override",
+        "relative_override",
+        "repo_fallback",
+        "disabled",
+        "blocked",
+    ],
+)
+def test_pip_cache_is_created_in_a_writable_location(tmp_path, mode):
+    custom = tmp_path / "custom cache"
+    if mode == "blocked":
+        custom.touch()
+    result = run_shell(
+        'cd "$CACHE_BASE"\n'
+        + shell_function("musa_prepare_pip_cache")
+        + '\nmusa_prepare_pip_cache\necho "CACHE=${PIP_CACHE_DIR:-}"',
+        CACHE_BASE=str(tmp_path),
+        RUNNER_TEMP="" if mode == "repo_fallback" else str(tmp_path / "job"),
+        REPO_ROOT=str(tmp_path / "repo"),
+        PIP_CACHE_DIR=(
+            "custom cache"
+            if mode == "relative_override"
+            else str(custom)
+            if mode in ("override", "blocked")
+            else ""
+        ),
+        PIP_RETRY_NO_CACHE="1" if mode == "disabled" else "0",
+    )
+    if mode == "blocked":
+        assert result.returncode != 0
+        assert "MUSA pip cache must be owned and writable" in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    if mode == "disabled":
+        assert "CACHE=\n" in result.stdout
+        assert not (tmp_path / "job").exists()
+        return
+    expected = {
+        "default": tmp_path / "job/pip-cache/musa",
+        "override": custom,
+        "relative_override": custom,
+        "repo_fallback": tmp_path / "repo/.ci/pip-cache/musa",
+    }[mode]
+    assert f"CACHE={expected}" in result.stdout
+    assert expected.is_dir()
+    assert expected.stat().st_uid == os.geteuid()
+    assert os.access(expected, os.W_OK)
+
+
+def test_cache_directory_is_persisted_to_later_ci_steps(tmp_path):
+    # Exercise the actual export block rather than just its helper.
+    start = SCRIPT.rindex('if [[ -n "${GITHUB_ENV:-}" ]]; then')
+    end = SCRIPT.index('\ncd "$REPO_ROOT"', start)
+    names = (
+        "PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH FLAGOS_ACCELERATOR MUSA_HOME "
+        "FLAGOS_BUILD_VENDOR FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS "
+        "FLAGOS_DISABLE_CUDA_ASSETS MTHREADS_VISIBLE_DEVICES CPATH LIBRARY_PATH "
+        "LD_LIBRARY_PATH"
+    ).split()
+    environment = {name: "" for name in names if name != "PATH"}
+    github_env = tmp_path / "github-env"
+    cache = tmp_path / "cache"
+    result = run_shell(
+        shell_function("export_ci_env", COMMON) + "\n" + SCRIPT[start:end],
+        **environment,
+        PIP_CACHE_DIR=str(cache),
+        GITHUB_ENV=str(github_env),
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"PIP_CACHE_DIR={cache}\n" in github_env.read_text()
+
+
 @pytest.mark.parametrize(
     "condition,usable",
     [
@@ -267,6 +381,8 @@ def test_isolated_setup_reconciles_existing_and_fresh_environments(
         'else\n  exec "$REAL_PYTHON" "$@"\nfi\n'
     )
     bootstrap.chmod(0o755)
+    build_tools = tmp_path / "build-tools"
+    fake_build_tools(build_tools)
     # Fail rather than touching the host if the setup unexpectedly calls apt.
     apt = tmp_path / "apt-get"
     apt.write_text("#!/bin/bash\necho UNEXPECTED_APT >&2\nexit 1\n")
@@ -276,15 +392,30 @@ def test_isolated_setup_reconciles_existing_and_fresh_environments(
     prebuilt = scenario.endswith("prebuilt")
     result = run_shell(
         f'source "{COMMON_PATH}"\n'
-        'pip_retry() { printf "PIP %s\\n" "$*"; }\n'
+        "pip_retry() {\n"
+        '  printf "PIP %s\\n" "$*"\n'
+        '  if [[ "$*" == *"setuptools>="* ]]; then\n'
+        '    cp -a "$STUB_BUILD_TOOLS/." "$STUB_VENV_SITE/"\n'
+        "  fi\n"
+        "}\n"
         'install_cpu_torch() { echo "CPU_TORCH_INSTALL $CPU_TORCH_VERSION"; }\n'
         + SCRIPT[start:end]
         + '\necho "AUTOLOAD=$TORCH_DEVICE_BACKEND_AUTOLOAD"',
         REAL_PYTHON=sys.executable,
+        STUB_BUILD_TOOLS=str(build_tools),
+        STUB_VENV_SITE=str(
+            root
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        ),
         TORCH_FL_BOOTSTRAP_PYTHON=str(bootstrap),
         TORCH_FL_PREBUILT_MUSA_VENV=str(root if prebuilt else tmp_path / "absent"),
         TORCH_FL_VENV_ROOT="" if prebuilt else str(root),
         REPO_ROOT=str(REPO_ROOT),
+        RUNNER_TEMP=str(tmp_path / "job"),
+        PIP_CACHE_DIR="",
+        PIP_RETRY_NO_CACHE="0",
         CI_STAGE=stage,
         CPU_TORCH_VERSION="2.10.0",
         PIP_INDEX_URL_ARG="https://example.invalid/simple",
@@ -303,6 +434,9 @@ def test_isolated_setup_reconciles_existing_and_fresh_environments(
     assert marker.exists() == (scenario in ("reused", "prebuilt") or prebuilt)
     assert "--upgrade" not in result.stdout
     assert "ninja build" in result.stdout
+    assert "setuptools>=64" in result.stdout
+    assert "editable_wheel available" in result.stdout
+    assert f"MUSA pip cache: {tmp_path / 'job/pip-cache/musa'}" in result.stdout
     assert ("transformers>=4.51,<5" in result.stdout) == (stage == "integration")
     assert ("CPU_TORCH_INSTALL" in result.stdout) == (
         scenario in ("fresh", "invalid_local", "stale_prebuilt", "noncpu_prebuilt")

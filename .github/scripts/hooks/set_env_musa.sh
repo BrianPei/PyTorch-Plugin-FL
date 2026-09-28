@@ -99,6 +99,33 @@ export PYTHONPATH=""
 # The shared retry helper already supports caching; opt in only for MUSA.
 PIP_RETRY_NO_CACHE="${PIP_RETRY_NO_CACHE:-0}"
 
+musa_prepare_pip_cache() {
+  [[ "${PIP_RETRY_NO_CACHE:-0}" == "1" ]] && return 0
+  # GitHub containers may inherit a HOME whose pip cache is owned by another
+  # user. Use the writable job workspace instead; honour explicit overrides.
+  local cache_dir="${PIP_CACHE_DIR:-${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache/musa}"
+  if ! mkdir -p "$cache_dir" || [[ ! -O "$cache_dir" || ! -w "$cache_dir" ]]; then
+    echo "::error::MUSA pip cache must be owned and writable by the current user: $cache_dir" >&2
+    return 1
+  fi
+  cache_dir="$(cd "$cache_dir" && pwd -P)"
+  export PIP_CACHE_DIR="$cache_dir"
+  echo "MUSA pip cache: $PIP_CACHE_DIR"
+}
+
+musa_validate_build_tools() {
+  # setup.py imports editable_wheel even for a non-editable native build.
+  # Validate real imports after provisioning, before any large wheel download.
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$VENV_PYTHON" - <<'PY'
+import build
+import setuptools
+from setuptools.command.editable_wheel import editable_wheel
+
+print(f"Build frontend: {build.__version__}")
+print(f"Setuptools: {setuptools.__version__} (editable_wheel available)")
+PY
+}
+
 musa_venv_is_isolated() {
   venv_is_usable || return 1
   TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$VENV_PYTHON" - "$VENV_ROOT" <<'PY'
@@ -211,8 +238,12 @@ fi
 
 # Reconcile build dependencies even in a prebuilt venv (older images lack
 # pypa/build). No --upgrade: satisfied requirements need no download.
+musa_prepare_pip_cache
+# editable_wheel was added in setuptools 64. The distro's 59.6.0 satisfies
+# the older >=45 metadata floor but cannot import the current setup.py.
 pip_retry --index-url "$PIP_INDEX_URL_ARG" \
-  'pip>=23' 'setuptools>=45' wheel 'cmake>=3.18' ninja build
+  'pip>=23' 'setuptools>=64' wheel 'cmake>=3.18' ninja build
+musa_validate_build_tools
 if ! musa_cpu_torch_is_usable 2>/dev/null; then
   # Request the local +cpu version explicitly: torch==2.10.0 alone also
   # considers a preinstalled non-CPU 2.10.0 build satisfied.
@@ -393,6 +424,9 @@ if [[ -n "${GITHUB_PATH:-}" ]]; then
 fi
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   export_ci_env PATH VIRTUAL_ENV PYTHONNOUSERSITE PYTHONPATH FLAGOS_ACCELERATOR MUSA_HOME FLAGOS_BUILD_VENDOR FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS FLAGOS_DISABLE_CUDA_ASSETS MTHREADS_VISIBLE_DEVICES CPATH LIBRARY_PATH LD_LIBRARY_PATH
+  if [[ -n "${PIP_CACHE_DIR:-}" ]]; then
+    export_ci_env PIP_CACHE_DIR
+  fi
   if [[ -n "${FLAGCX_TORCH_BACKEND:-}" ]]; then
     printf 'FLAGCX_TORCH_BACKEND=%s\n' "$FLAGCX_TORCH_BACKEND" >> "$GITHUB_ENV"
   fi
