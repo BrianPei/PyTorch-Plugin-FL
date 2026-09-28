@@ -111,6 +111,20 @@ def test_preflight_imports_torch_fl_before_flaggems():
     assert source.index("import torch_fl") < source.index("import flag_gems")
 
 
+def _hybrid_runtime_gate():
+    """Extract only the dependency gate; importing the suite requires hardware."""
+    path = REPO_ROOT / "tests/integration/ops/test_musa_flaggems.py"
+    tree = ast.parse(path.read_text())
+    gate = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_require_flaggems_mthreads"
+    )
+    module = ast.Module(body=[gate], type_ignores=[])
+    return compile(module, str(path), "exec")
+
+
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
     """Install import doubles without loading torch or a vendor runtime."""
@@ -164,6 +178,43 @@ def runtime(monkeypatch, tmp_path):
 
     monkeypatch.setattr(importlib.metadata, "distribution", distribution)
     return state, modules
+
+
+def test_hybrid_gate_does_not_register_flaggems_ops(runtime):
+    _, modules = runtime
+    modules["torch_fl"].flagos.device_count = lambda: 1
+
+    def forbidden_registration(*args, **kwargs):
+        raise AssertionError("the dependency gate must not replace torch_fl dispatch")
+
+    modules["flag_gems"].enable = forbidden_registration
+    namespace = {"torch_fl": modules["torch_fl"], "pytest": pytest}
+    exec(_hybrid_runtime_gate(), namespace)
+    namespace["_require_flaggems_mthreads"]()
+
+
+@pytest.mark.parametrize("missing", ["device", "kernels", "mthreads", "flag_gems"])
+def test_hybrid_gate_still_checks_runtime_requirements(runtime, monkeypatch, missing):
+    state, modules = runtime
+    modules["torch_fl"].flagos.device_count = lambda: 0 if missing == "device" else 1
+    if missing == "kernels":
+        state["kernels"] = ("vendor",)
+    elif missing == "mthreads":
+        modules["triton.backends"].backends = {}
+    elif missing == "flag_gems":
+        original_import = builtins.__import__
+
+        def import_without_flaggems(name, *args, **kwargs):
+            if name == "flag_gems":
+                raise ModuleNotFoundError("No module named 'flag_gems'")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_flaggems)
+
+    namespace = {"torch_fl": modules["torch_fl"], "pytest": pytest}
+    exec(_hybrid_runtime_gate(), namespace)
+    with pytest.raises(pytest.skip.Exception):
+        namespace["_require_flaggems_mthreads"]()
 
 
 def test_preflight_accepts_the_musa_stack(runtime, capsys):
