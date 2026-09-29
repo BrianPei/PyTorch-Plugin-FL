@@ -247,9 +247,9 @@ integration_tests:
       python -m pytest tests/integration/test_math_bits_contract.py
       -v -m math_bits --tb=short
 
-  # Revalidate real MCPTI capture and trace export on the current runner. The
-  # shared fixture no longer skips MetaX, so a tracer crash or a missing
-  # capability fails this group instead of leaving all 12 cases untested.
+  # All 12 cases skip on MetaX: the suite's platform table gates them on
+  # "MetaX profiler trace export is currently unstable". The group is kept so the
+  # gate is exercised and its removal is what unblocks real coverage here.
   - name: Unified profiler contract
     command: >-
       python -m pytest tests/integration/test_profiler_contract.py
