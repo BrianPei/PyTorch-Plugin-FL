@@ -264,10 +264,9 @@ def profiler_capabilities():
 def profile_result():
     """Capture one common workload and export it as a Chrome trace.
 
-    The MetaX MCPTI tracer currently segfaults while Kineto processes the
-    captured trace, before any contract assertion can run. Keep the shared
-    contract honest by skipping the fixture on that platform until the tracer
-    can safely export this workload.
+    Run the same capture and export workload on MetaX as on the other platforms.
+    Its MCPTI tracer previously crashed during Kineto trace processing; keeping
+    that path enabled makes the hardware job report whether the issue persists.
 
     Shape and iteration count are kept identical to ``_run_traced_ops()`` in
     test_profiler_parity.py, which is the workload proven to emit every activity
@@ -283,9 +282,6 @@ def profile_result():
     reroutes the matmul away from cuBLAS removes the memset for a reason that has
     nothing to do with workload size. See its docstring.
     """
-    if detect_platform() == "metax":
-        pytest.skip("MetaX profiler trace export is currently unstable")
-
     torch = _torch_module()
     device = _torch_device()
     x = torch.randn(1024, 1024, device=device)

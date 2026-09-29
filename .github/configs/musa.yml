@@ -254,26 +254,15 @@ integration_tests:
       python -m pytest tests/integration/test_compile.py
       -v -s --tb=short
 
-  # Triage phase: ordered last so a murand failure cannot block the functional
-  # groups above. As of 2026-08-28 the CI runner's murand (vendor RNG library)
-  # is broken -- murandGenerateUniform/Normal fail with LAUNCH_FAILURE and
-  # randperm returns garbage (err 700 illegal memory access), while single-
-  # device reproducibility is healthy. docs/vendors/musa/installation.md
-  # recorded the RNG suite passing on S5000 on 2026-08-17, so this is a
-  # driver/toolkit/image regression on this runner, not a torch_fl code defect.
-  #
-  # To let the pipeline complete end to end, -k deselects the four classes
-  # that exercise murand's seed-source / multi-device / distribution / dropout
-  # paths (TestRngSeedSource, TestRngMultiDevice, TestRngDistribution,
-  # TestRngDropout) -- 37 items, 25 of them real failures. The 80-item
-  # TestRngReproducible (single-device same-seed / different-seed) still runs
-  # and stays green. Drop the -k line once murand is fixed. --tb=line stays
-  # to cap any future randperm assert diff.
+  # Revalidate the full main-ops RNG suite on the current runner, including the
+  # previously excluded seed-source, multi-device, distribution and dropout
+  # classes (37 items). Keep this group last: an illegal-memory-access failure
+  # can poison the MUSA context, but must not prevent the earlier functional
+  # groups from running. --tb=line caps any future randperm assert diff.
   - name: Run unified RNG tests
     command: >-
       python -m pytest tests/integration/ops/test_rng_dispatch.py
       -m "main_ops"
-      -k "not TestRngSeedSource and not TestRngMultiDevice and not TestRngDistribution and not TestRngDropout"
       -v -s --tb=line
 
   # ---------------------------------------------------------------------------
