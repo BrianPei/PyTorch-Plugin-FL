@@ -32,6 +32,10 @@ esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# XPU-RT 5.37.1 requires this to be set before the first import of torch or
+# torch_fl, including the import used to validate the vendor interpreter.
+export XPU_ENABLE_PROFILER_TRACING="${XPU_ENABLE_PROFILER_TRACING:-1}"
+
 select_vendor_python() {
   local candidate="${TORCH_FL_VENDOR_PYTHON:-}"
   if [[ -n "$candidate" && "$candidate" != */* ]]; then
@@ -74,9 +78,6 @@ python -m pip install cmake
 export ACCELERATOR=kunlun
 export XPU_ROOT="${XPU_ROOT:-/usr/local/xpu}"
 export XCUDART_ROOT="${XCUDART_ROOT:-/usr/local/xcudart}"
-# XPU-RT 5.37.1 requires this to be set before the first import of torch or
-# torch_fl, otherwise import exits with "Runtime profiler is disabled".
-export XPU_ENABLE_PROFILER_TRACING="${XPU_ENABLE_PROFILER_TRACING:-1}"
 # XPU_CUPTI_ENABLE_DEVICE is intentionally NOT set. Binding the profiler to
 # all 8 devices (0,1,...,7) causes CUPTI cuptiActivityEnable to fail with
 # error 17 (etiEventSamplingSetMode) in every dispatch subprocess, aborting
