@@ -349,9 +349,22 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
     ),
     "FLAGOS_WHEEL_LOCAL": (
         SCOPE_BUILD,
-        "SDK-derived",
-        "Local version label for the wheel (e.g. metax3.8.1), for dev builds "
-        "that must pin the exact SDK",
+        "The platform's wheel_local from cmake/flagos_platforms.json",
+        "Local version label for the wheel -- the SDK it was built against, in "
+        "the spelling the vendor's own wheels use (2.10.0+cuda13.3, "
+        "2.10.0+dtk2604). It is the build variant, not the publishing target: "
+        "the artifact goes to one lane, flagos-pypi-<vendor>, so the lane is "
+        "already implied and does not appear in the name. Overriding it is for "
+        "a dev build that must pin something else",
+    ),
+    "FLAGOS_WHEEL_PRERELEASE": (
+        SCOPE_BUILD,
+        "Unset",
+        "PEP 440 pre-release suffix for the wheel version (rc1, a1, b1), for "
+        "cutting a release candidate. The release workflow sets it from the tag, "
+        "so v2.10.0rc1 produces torch_fl-2.10.0rc1+cuda13.3; PEP 440 sorts that "
+        "below 2.10.0, so installing torch_fl==2.10.0 does not pick the "
+        "candidate up",
     ),
     "FLAGOS_SKIP_CUDA_ASSETS": (
         SCOPE_BUILD,

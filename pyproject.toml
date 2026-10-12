@@ -22,12 +22,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torch_fl"
 # Version is computed in setup.py: it names the supported PyTorch minor line and
-# the MetaX self-contained build appends a local segment (e.g.
-# 2.10.0+metax3.8.1) via FLAGOS_WHEEL_LOCAL. A static value here would override
-# setup()'s version, so it must be declared dynamic.
+# appends the platform's SDK local segment (e.g. 2.10.0+cuda13.3) from
+# cmake/flagos_platforms.json. A static value here would override setup()'s
+# version, so it must be declared dynamic.
 description = "FlagGems operators as a custom PyTorch device (flagos)"
 readme = "README.md"
-requires-python = ">=3.8"
+# Computed in setup.py from FLAGTREE_PYTHON_VERSION_<platform> in
+# .github/version-pins.env. Not a range: a FlagTree build exists for exactly one
+# cp tag and torch_fl links it, so each platform has a single usable interpreter
+# (3.12 on cuda/gcu/metax/ppu, 3.10 on dcu/musa, 3.11 on ascend). The wheel
+# filename already carries the cp tag; this makes the resolver say so instead of
+# failing later inside the extension.
 license = {text = "Apache-2.0"}
 authors = [
     {name = "FlagGems Team"}
@@ -37,10 +42,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # flag_gems is the default operator source for the flagos device: its Triton
@@ -52,7 +56,7 @@ classifiers = [
 # Declared dynamic so setup.py can drop flag_gems/triton on platforms built in
 # pure-boxing mode (FLAGOS_ACCELERATOR=dcu), where PyPI's NVIDIA-targeted triton wheel
 # is the wrong artifact — DTK ships its own. See _install_requires() in setup.py.
-dynamic = ["version", "dependencies"]
+dynamic = ["version", "dependencies", "requires-python"]
 
 [project.optional-dependencies]
 dev = [
@@ -61,16 +65,13 @@ dev = [
     # `ruff` behaves identically to the gate.
     "ruff==0.15.12",
 ]
-# FlagCX enables the heterogeneous unified-comm inner backend for distributed
-# (ProcessGroupFlagOS tries it first, then falls back to the vendor-native
-# backend — NCCL/HCCL). It is a hardware-specific compiled artifact (per-vendor
-# adaptor + CCL). Published wheels live on the matching vendor indexes at
-# resource.flagos.net, so the installer must select a toolkit-compatible index
-# and version (see .github/version-pins.env and docs/architecture/distributed-flagcx.md).
-# This extra declares the dependency but does not select a vendor index.
-flagcx = [
-    "flagcx",
-]
+# There was a `flagcx` extra here, declaring a bare `flagcx` for the
+# heterogeneous unified-comm inner backend. It is gone because the package is
+# now a pinned requirement on every platform that has a build for it (CUDA,
+# DCU, GCU, MetaX, MUSA -- see _flagos_sibling_requires in setup.py), and the
+# extra could not have worked where it was not: `flagcx` is not on PyPI, and the
+# build is per-vendor (`0.14.0rc2.post2+dtk2604`). The four platforms without a
+# pin have no FlagCX build at all and fall back to the NCCL-shaped route.
 
 [project.entry-points."torch.backends"]
 # PyTorch calls this at the end of `import torch`, so processes torch_fl does not

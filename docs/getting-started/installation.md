@@ -9,6 +9,7 @@
 | Ascend | `FLAGOS_ACCELERATOR=ascend` | Native ACLNN operator backend, FlagGems via FlagTree (Triton 3.5) | [Ascend Installation](../vendors/ascend/installation.md) |
 | PPU | `FLAGOS_ACCELERATOR=ppu` | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK, bundling its own libtorch into `lib_ppu/` | [PPU Installation](../vendors/ppu/installation.md) |
 | Hygon DCU | `FLAGOS_ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | [DCU Installation](../vendors/dcu/installation.md) |
+| Kunlunxin (Kunlun P800) | `FLAGOS_ACCELERATOR=kunlunxin` | CUDA boxing against the Kunlun XPU SDK's CUDA-shaped runtime | [Kunlunxin Installation](../vendors/kunlunxin/installation.md) |
 | Enflame GCU | `FLAGOS_ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64 ops | [GCU Installation](../vendors/gcu/installation.md) |
 | Moore Threads MUSA | `FLAGOS_ACCELERATOR=musa` | FlagGems-first Triton kernels, native `mudnn` backend as fallback, with CPU fallback for unrouted ops | [MUSA Installation](../vendors/musa/installation.md) |
 | D-Robotics BPU | `FLAGOS_ACCELERATOR=bpu` | No eager kernel sets are built; eager ops run on CPU | [BPU Installation](../vendors/bpu/installation.md) |
@@ -18,13 +19,64 @@
 
 All platforms require:
 
-- **Python**: 3.8 or later
+- **Python**: one version per platform, not a range — 3.12 on CUDA/GCU/MetaX/PPU, 3.10 on DCU/MUSA, 3.11 on Ascend. A FlagTree build exists for exactly one cp tag and the wheel links it, so `Requires-Python` names a single interpreter. See the platform table in the [Compatibility Matrix](../reference/compatibility.md).
 - **PyTorch**: 2.10.x (`>=2.10,<2.11`) — generated ATen bindings are tied to this minor line
 - **CMake**: 3.18 or later
 - **C++ build toolchain**: A working C++17 compiler (GCC 7+, Clang 5+, or MSVC 2017+)
 - **Platform SDK/runtime**: The vendor-specific SDK, compiler, and runtime libraries for your accelerator
 
 Platform-specific requirements (CUDA toolkit version, vendor SDK paths, additional dependencies) are documented in each platform's installation guide.
+
+## Runtime Dependencies and the Package Index
+
+A wheel declares the four things it needs and cannot work without: `torch`, and
+the three packages built outside this repository — **FlagTree** (the Triton build
+carrying the vendor's backend), **FlagGems** (the operator source) and **FlagCX**
+(the distributed backend). They are pinned to the exact versions the wheel was
+built against, taken from
+[`.github/version-pins.env`](../../.github/version-pins.env), which is the same
+file the CI setup scripts read. Nothing about them is a range: `flagtree` and
+`flagcx` are not on PyPI at all, `flag_gems` there is an older cohort than the
+one the per-op routing tables in `torch_fl/configs/backends_*.conf` were
+generated against, and a FlagTree build is per-platform (its package name carries
+the vendor's Triton backend, e.g. `0.7.0rc2+hcu3.6` for DCU).
+
+That means the index has to carry more than one location. Which one serves what:
+
+| Requirement | Where it is published |
+|---|---|
+| `torch_fl` | `flagos-pypi-<vendor>` — the lane named by the wheel's local version (`2.10.0+hygon` → `flagos-pypi-hygon`) |
+| `flag_gems`, `flagcx` | the same vendor lane |
+| `flagtree` | `flagos-pypi-hosted`, for every platform |
+| `torch==2.10.0+cpu` | `https://download.pytorch.org/whl/cpu` |
+| everything else (`packaging`, `PyYAML`, `numpy`, …) | PyPI (or a mirror) |
+
+So a single `--index-url` has to name a **group repository** that contains all of
+those. Where one is not configured, list them instead — this is the DCU case, and
+it resolves (torch_fl 2.10.0+hygon on a cp310 target):
+
+```bash
+BASE=https://resource.flagos.net/repository
+pip install \
+  --index-url       "$BASE/flagos-pypi-hygon/simple/" \
+  --extra-index-url "$BASE/flagos-pypi-hosted/simple/" \
+  --extra-index-url "$BASE/pypi-proxy/simple/" \
+  --extra-index-url "https://download.pytorch.org/whl/cpu" \
+  torch_fl==2.10.0+hygon
+```
+
+Two things that are easy to get wrong here:
+
+- **The vendor lane alone is not enough**, even for the platforms whose lane
+  already carries all three FlagOS packages: `flag_gems` itself declares
+  `packaging>=26.0` and `PyYAML==6.0.1`, which the lanes do not serve.
+- **`flagtree` is not in most lanes.** It is fetched from `flagos-pypi-hosted`,
+  which is how the CI scripts are already split (`FLAGTREE_INDEX_URL` versus
+  `FLAGGEMS_INDEX_URL` in `.github/scripts/hooks/set_env_*.sh`).
+
+If your environment provisions the stack itself — as CI does, installing the
+wheel with `--no-deps` and each sibling through its own hook — pass `--no-deps`
+and keep that arrangement.
 
 ## Source Installation Contract
 

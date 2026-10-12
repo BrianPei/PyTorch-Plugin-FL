@@ -55,6 +55,12 @@ def clean_kernel_env(monkeypatch):
 def test_build_ext_stages_generated_build_config(
     monkeypatch, tmp_path, clean_kernel_env
 ):
+    # The wheel version is resolved from the environment when setup.py is read,
+    # before anything patches the module global, so the ambient platform has to
+    # be the one under test or the manifest's wheel_version describes another
+    # platform's build. That was invisible while only one platform had a local
+    # version segment.
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "musa")
     _, setup_kwargs = _load_setup(monkeypatch)
     assert "scripts/tools/torch-fl-preflight" in setup_kwargs["scripts"]
     source_root = tmp_path / "source"
@@ -97,7 +103,9 @@ def test_build_ext_stages_generated_build_config(
         (tmp_path / "wheel" / "torch_fl" / "compatibility.json").read_text()
     )
     assert compatibility["platform"] == "musa"
-    assert compatibility["wheel_version"] == "2.10.0"
+    # The local segment is the platform's `wheel_local` from
+    # cmake/flagos_platforms.json -- the SDK the wheel was built against.
+    assert compatibility["wheel_version"] == "2.10.0+musa5.2.0"
     assert compatibility["build"]["kernels"] == ["flaggems", "vendor"]
     assert compatibility["build"]["vendor_torch_libraries"] is False
     assert compatibility["build"]["distributions"]["torch"] == "2.10.0+cpu"
@@ -404,3 +412,45 @@ def test_build_ext_adds_torch_paths_to_the_comm_bridge_only(
     assert bridge.library_dirs == ["/torch/lib"]
     assert bridge.libraries == ["c10", "torch", "torch_cpu"]
     assert other.include_dirs == [] and other.libraries == []
+
+
+def test_a_pre_release_suffix_lands_between_the_version_and_the_sdk(
+    monkeypatch, clean_kernel_env
+):
+    """`v2.10.0rc1` has to be buildable, and PEP 440 puts the suffix first.
+
+    The release workflow sets this from the tag; the version then reads
+    `2.10.0rc1+cuda13.3`, which sorts below `2.10.0` so a plain
+    `pip install torch_fl==2.10.0` does not pick the candidate up.
+    """
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "dcu")
+    monkeypatch.setenv("FLAGOS_WHEEL_PRERELEASE", "rc1")
+
+    _, setup_kwargs = _load_setup(monkeypatch)
+
+    assert setup_kwargs["version"] == "2.10.0rc1+dtk2604"
+
+
+def test_no_pre_release_suffix_leaves_the_release_version_alone(
+    monkeypatch, clean_kernel_env
+):
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "dcu")
+    monkeypatch.delenv("FLAGOS_WHEEL_PRERELEASE", raising=False)
+
+    _, setup_kwargs = _load_setup(monkeypatch)
+
+    assert setup_kwargs["version"] == "2.10.0+dtk2604"
+
+
+@pytest.mark.parametrize("value", ["final", "rc", "1", "rc1.post1", ""])
+def test_an_unusable_pre_release_value_is_refused(monkeypatch, clean_kernel_env, value):
+    """Guessing here would publish under a version nobody asked for."""
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "cuda")
+    monkeypatch.setenv("FLAGOS_WHEEL_PRERELEASE", value)
+
+    if value == "":
+        _, setup_kwargs = _load_setup(monkeypatch)
+        assert setup_kwargs["version"] == "2.10.0+cuda13.3"
+        return
+    with pytest.raises(ValueError, match="PEP 440 pre-release"):
+        _load_setup(monkeypatch)

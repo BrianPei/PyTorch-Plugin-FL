@@ -46,13 +46,15 @@ cd PyTorch-Plugin-FL
 FLAGOS_ACCELERATOR=metax \
   FLAGOS_BUILD_VENDOR=OFF \
   FLAGOS_VENDOR_TORCH_LIB=<path-to-torch+metax>/torch/lib \
-  FLAGOS_WHEEL_LOCAL=metax3.8.1 \
   python setup.py bdist_wheel
 ```
 
 **Parameters:**
 - `FLAGOS_VENDOR_TORCH_LIB`: Path to the `torch+metax` wheel's `torch/lib` directory (source of forked libtorch)
-- `FLAGOS_WHEEL_LOCAL`: Local version tag (e.g., `metax3.8.1` → wheel version `2.10.0+metax3.8.1`), identifying the target MACA/driver version
+- `FLAGOS_WHEEL_LOCAL`: Optional. The wheel's local version label defaults to the
+  platform's SDK (`maca3.8.1.3` → `2.10.0+maca3.8.1.3`), which distinguishes it
+  from the same platform built against another MACA — the metax lane carries
+  both. Override it only for a dev build that must pin something else.
 
 #### Step 2: Bundle the Forked Libtorch
 
@@ -74,7 +76,7 @@ cp build/lib.*/torch_fl/_C.*.so build/lib.*/torch_fl/
 python setup.py bdist_wheel --skip-build --bdist-dir "$(mktemp -d)"
 ```
 
-The result is `dist/torch_fl-2.10.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1.1 GB — it bundles the forked libtorch and exceeds PyPI's 100 MB limit; distribute via private index or direct transfer).
+The result is `dist/torch_fl-2.10.0+maca3.8.1.3-cp312-cp312-linux_x86_64.whl` (~1.1 GB — it bundles the forked libtorch and exceeds PyPI's 100 MB limit; distribute via private index or direct transfer).
 
 ### Installation on Target Host
 
@@ -82,7 +84,7 @@ The result is `dist/torch_fl-2.10.0+metax3.8.1-cp312-cp312-linux_x86_64.whl` (~1
 
 ```bash
 pip install torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
-pip install torch_fl-2.10.0+metax3.8.1-cp312-cp312-linux_x86_64.whl
+pip install torch_fl-2.10.0+maca3.8.1.3-cp312-cp312-linux_x86_64.whl
 ```
 
 #### Runtime Configuration
@@ -257,9 +259,11 @@ outside a FlagTree environment.
 
 ## FlagGems on MetaX
 
-The MetaX boxing wheel compiles the FlagGems Python dispatch slot by default, and `backends_metax.conf` is FlagGems-first and is the only conf a MetaX boxing build ships. `import torch_fl` therefore routes 592 of the conf's 2037 ops to the FlagGems Python path and 12 to the FlagGems C++ path on its own; the rest fall back to the CUDA boxing kernel (`mm`/`bmm`/`mean.dim`/`sum.dim_IntList` and other ops `triton-metax` cannot compile — FlagGems uses a SPLIT_K kwarg or a CUDA-context path `triton-metax` rejects).
+The MetaX boxing wheel compiles the FlagGems Python dispatch slot by default, and `backends_metax.conf` is FlagGems-first and is the only conf a MetaX boxing build ships. `import torch_fl` therefore routes 594 of the conf's 2037 ops to the FlagGems Python path and 10 to the FlagGems C++ path on its own; the rest fall back to the CUDA boxing kernel (`mm`/`bmm`/`mean.dim`/`sum.dim_IntList` and other ops `triton-metax` cannot compile — FlagGems uses a SPLIT_K kwarg or a CUDA-context path `triton-metax` rejects).
 
-One of the 592 is not a leaf op: `scaled_dot_product_attention` is a composite, and its conf key is read by the private-use kernel itself rather than by the dispatcher, so the route is taken only for the shapes `FlagGemsEligible` in `csrc/aten/sdp_choice_stub.cc` admits — bf16, 4-D, head_dim 128, sequence length 1024 or more, and no mask, causal flag or `scale`. Every other shape falls through to the boxing kernel under the same conf key. Set `FLAGOS_OP_scaled_dot_product_attention=cuda` to take the boxing route everywhere.
+The ten `flaggems_cpp` routes need a FlagGems built for MACA (the `cpp/` half, `-DFLAGGEMS_BACKEND=MACA`) linked into the wheel; without it the dispatcher sees an empty C++ slot and boxes them. `_softmax` and `embedding` are on the Python path rather than the C++ one until that C++ wiring lands — see *Native Backend Route Changes* in the operator-support reference.
+
+One of the 594 is not a leaf op: `scaled_dot_product_attention` is a composite, and its conf key is read by the private-use kernel itself rather than by the dispatcher, so the route is taken only for the shapes `FlagGemsEligible` in `csrc/aten/sdp_choice_stub.cc` admits — bf16, 4-D, head_dim 128, sequence length 1024 or more, and no mask, causal flag or `scale`. Every other shape falls through to the boxing kernel under the same conf key. Set `FLAGOS_OP_scaled_dot_product_attention=cuda` to take the boxing route everywhere.
 
 There is no switch that turns this on: routing is a property of the build (`torch_fl/__init__.py:_select_backend_config`), not of an environment variable. The practical consequence is that FlagGems is a runtime **dependency** rather than an option — an op routed to a FlagGems backend whose callable is absent raises at dispatch instead of falling back to boxing.
 
@@ -277,7 +281,7 @@ pip install flagtree==0.6.1+metax3.6 \
 pip install "git+https://github.com/FlagOpen/FlagGems.git@5a58df410c551c4f4eb41d31887cd75fd596804a"
 ```
 
-The FlagGems revision is load-bearing, not cosmetic. A generated kernel calls its operator by package-level name (`flag_gems.<name>`), resolved by `getattr` at dispatch time (`csrc/aten/backends/flagos/python_op_caller.cc:GetFunc`), so a cohort that does not define one of those names fails exactly the routes that use it. The revision above resolves all 666 names the checked-in `csrc/aten/generated/flaggems_python_kernels.cc` calls; `.github/scripts/set_env_metax.sh` measures that ratio before every integration job and refuses to run when it is not `0/666`.
+The FlagGems revision is load-bearing, not cosmetic. A generated kernel calls its operator by package-level name (`flag_gems.<name>`), resolved by `getattr` at dispatch time (`csrc/aten/backends/flagos/python_op_caller.cc:GetFunc`), so a cohort that does not define one of those names fails exactly the routes that use it. The revision above resolves all 667 names the checked-in `csrc/aten/generated/flaggems_python_kernels.cc` calls; `.github/scripts/set_env_metax.sh` measures that ratio before every integration job and refuses to run when it is not `0/667`.
 
 That measurement has an import-order requirement of its own, because the setup venv runs the stock `torch+cpu` wheel: its `torch/lib` carries no `libtorch_cuda.so`, so `torch.cuda.is_available()` is `False` until `torch_fl` has selected the MetaX libtorch through a private facade. In that state the MetaX Triton backend reports itself inactive (`triton/backends/metax/driver.py:is_active`), and `flag_gems` reaches `triton.runtime.driver.active` while it is being imported (`flag_gems.fused` -> `pointwise_dynamic` -> `triton.runtime.jit.parse` -> the Triton hint manager's backend lookup), so a bare `import flag_gems` in the venv fails with `RuntimeError: 0 active drivers ([]). There should only be one.` — the FlagGems install is fine, the probe is simply running too early. The ratio is therefore taken in a process that imports `torch_fl` first, at the end of the setup script rather than beside the FlagGems install, since `torch_fl` is not importable until `setup.py build_ext` has run. The same rule applies to any ad-hoc check against the venv: `import torch_fl`
 first, or the device surface is not there yet.
@@ -427,7 +431,7 @@ is involved any more.
 
 ### FlagGems: `ModuleNotFoundError: No module named 'flag_gems'`
 
-**Cause:** `backends_metax.conf` routes 592 ops to the FlagGems Python path by default — 591 leaf ops plus the `scaled_dot_product_attention` composite described in *FlagGems on MetaX* — and `csrc/aten/backends/flagos/python_op_caller.cc:GetFunc` resolves each kernel by `getattr` on `flag_gems` at dispatch time. Without the package those routes raise rather than fall back to boxing. The composite is the one route that can be turned off without the package: `FLAGOS_OP_scaled_dot_product_attention=cuda` returns it to the CUDA boxing kernel and leaves every other route alone.
+**Cause:** `backends_metax.conf` routes 594 ops to the FlagGems Python path by default — 593 leaf ops plus the `scaled_dot_product_attention` composite described in *FlagGems on MetaX* — and `csrc/aten/backends/flagos/python_op_caller.cc:GetFunc` resolves each kernel by `getattr` on `flag_gems` at dispatch time. Without the package those routes raise rather than fall back to boxing. The composite is the one route that can be turned off without the package: `FLAGOS_OP_scaled_dot_product_attention=cuda` returns it to the CUDA boxing kernel and leaves every other route alone.
 
 **Fix:** Install FlagGems and a MetaX FlagTree Triton as shown in *FlagGems on MetaX* above. When reusing a copy that is already on the machine, check that it resolves the names rather than that it reports a version: an editable source tree reports `flag_gems.__version__ == "0.0.0"`.
 

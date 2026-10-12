@@ -94,15 +94,21 @@ PY
     "torch==$CPU_TORCH_VERSION_DEFAULT"
   PIP_RETRY_PYTHON=/opt/venv/bin/python pip_retry --index-url "$PIP_INDEX_URL_DEFAULT" \
     build cmake ninja setuptools wheel pytest patchelf
-  export FLAGOS_WHEEL_LOCAL=metax3.8.1.3
   export PYTHONPATH=""
 else
   export FLAGOS_VENDOR_TORCH_LIB=/opt/vendor-libtorch/lib
   # This image stages only the shared libraries, without torch/version.py.
   # The image's vendor core is built against the pinned 2.10.0 Python wheel.
   export TORCH_FL_VENDOR_TORCH_VERSION=2.10.0
-  export FLAGOS_WHEEL_LOCAL=metax3.8.0
 fi
+# FLAGOS_WHEEL_LOCAL is deliberately not set here. The wheel's local segment is
+# the vendor name ("metax"), taken from the wheel_local column of
+# cmake/flagos_platforms.json, so the two images above produce the same
+# artifact name and it stays a property of the source rather than of whichever
+# image happens to build it. The distinction these lines used to encode -- MACA
+# 3.8.1.3 against 3.8.0 -- belongs in FLAGOS_SDK_VERSION, which
+# torch_fl/compatibility.json records; nothing sets it today, so the manifest
+# reports the SDK as unknown for both. See docs/reference/environment-variables.md.
 export PATH="/opt/venv/bin:/opt/maca/tools/cu-bridge/bin:/opt/maca/mxgpu_llvm/bin:/opt/maca/bin:$PATH"
 export VIRTUAL_ENV=/opt/venv
 export PYTHONNOUSERSITE=1
@@ -125,7 +131,7 @@ export FLAGOS_DISABLE_CUDA_ASSETS=1
 # record. The retired FLAGOS_USE_FLAGGEMS switch
 # used to select a separate backends_flaggems.conf; nothing reads it any more,
 # so setting it here would misdescribe the build -- the FlagGems Python path is
-# on for the 592 ops the conf routes to it either way.
+# on for the 594 ops the conf routes to it either way.
 export FLAGOS_BUILD_FLAGGEMS_CPP=0
 export FLAGOS_BUILD_FLAGGEMS=1
 
@@ -175,7 +181,7 @@ PY
 # the MetaX FlagTree build -- the one whose "metax" backend is the one the
 # generated kernels were measured on -- rather than the triton-metax the image
 # carries beside its own MetaX torch install. FlagGems is required because
-# backends_metax.conf routes 592 ops to the Python FlagGems path by default
+# backends_metax.conf routes 594 ops to the Python FlagGems path by default
 # (FLAGOS_BUILD_FLAGGEMS=1 above compiles the dispatcher slot).
 #
 # Both are installed into the venv rather than linked out of the image, so the
@@ -270,7 +276,7 @@ fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf '%s=%s\n' PATH "$PATH" >> "$GITHUB_ENV"
-  export_ci_env VIRTUAL_ENV PYTHONNOUSERSITE FLAGOS_ACCELERATOR MACA_PATH MACA_HOME FLAGOS_BUILD_VENDOR FLAGOS_METAX_CUDART_SHIM FLAGOS_DISABLE_CUDA_ASSETS FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS FLAGOS_WHEEL_LOCAL FLAGOS_VENDOR_TORCH_LIB TORCH_FL_VENDOR_TORCH_VERSION LD_LIBRARY_PATH LIBRARY_PATH CPATH
+  export_ci_env VIRTUAL_ENV PYTHONNOUSERSITE FLAGOS_ACCELERATOR MACA_PATH MACA_HOME FLAGOS_BUILD_VENDOR FLAGOS_METAX_CUDART_SHIM FLAGOS_DISABLE_CUDA_ASSETS FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS FLAGOS_VENDOR_TORCH_LIB TORCH_FL_VENDOR_TORCH_VERSION LD_LIBRARY_PATH LIBRARY_PATH CPATH
   if [[ -n "${FLAGCX_TORCH_BACKEND:-}" ]]; then
     printf 'FLAGCX_TORCH_BACKEND=%s\n' "$FLAGCX_TORCH_BACKEND" >> "$GITHUB_ENV"
   fi
@@ -346,7 +352,7 @@ if [[ "$CI_STAGE" == "integration" ]]; then
     FLAGGEMS_GAP="$(gems_cohort_gap python torch_fl || true)"
     if [[ -z "$FLAGGEMS_GAP" ]]; then
       echo "::error::The venv cannot import flag_gems even with torch_fl" \
-           "imported first; the 592 FlagGems routes in backends_metax.conf have" \
+           "imported first; the 594 FlagGems routes in backends_metax.conf have" \
            "nothing to call."
       exit 1
     fi

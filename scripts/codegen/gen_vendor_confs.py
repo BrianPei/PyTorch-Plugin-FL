@@ -193,6 +193,14 @@ BOXING_PLATFORMS = {
     # every CUDA FlagGems route; a separate conf is what lets the two platforms
     # disagree about mm/bmm. Filed upstream as FlagGems issue #6225.
     "ppu": "backends_ppu.conf",
+    # Kunlunxin XPU is a CUDA-ABI boxing platform like dcu/ppu/metax: its SDK
+    # ships a CUDA-shaped runtime (cuda_runtime.h + libcudart.so.12) and the
+    # vendor torch registers kernels under the CUDA dispatch key, so every op
+    # routes to the shared CUDA boxing kernels. No FlagGems route is generated
+    # yet (kunlunxin is absent from FLAGGEMS_PYTHON_PLATFORMS /
+    # FLAGGEMS_CPP_PLATFORMS), which makes this conf uniformly BOXING_FALLBACK
+    # until the measured allowlist lands in a follow-up.
+    "kunlunxin": "backends_kunlunxin.conf",
 }
 BOXING_FALLBACK = "cuda"
 
@@ -619,6 +627,12 @@ FLAGGEMS_CPP_PLATFORMS = {"metax"}
 # compile the Python caller and may use the measured FlagGems coverage --
 # including PPU, whose FlagTree install (triton with the `ppu` backend) is
 # what set_env_ppu.sh provisions.
+#
+# Kunlunxin is deliberately absent. Its P800 port brings up the CUDA boxing path
+# only; the FlagGems Python allowlist (5 measured routes on the 2.9 line) is a
+# follow-up, so backends_kunlunxin.conf routes every covered op to the boxing
+# kernel rather than claiming coverage the P800 has not run. Add kunlunxin here
+# only together with that measurement, so the gate and the conf stay in step.
 FLAGGEMS_PYTHON_PLATFORMS = {"ascend", "metax", "dcu", "gcu", "musa", "ppu"}
 
 # Ops a native-kernel vendor must keep on its own kernel because that platform's
@@ -727,25 +741,46 @@ FLAGGEMS_PYTHON_PLATFORMS = {"ascend", "metax", "dcu", "gcu", "musa", "ppu"}
 # workaround, and both are silent. Ascend implements all twelve overloads
 # through aclnn, so the route back is free. Not yet filed upstream.
 #
-# ascend: mm and mm.out, for the same defect MetaX routes around below -- the
-# Ascend tune config tunes a kernel that cannot accept one of its own keys.
+# ascend: mm and mm.out used to be pinned here for a FlagGems tuner defect, and
+# are no longer. The pin recorded that the Ascend tune config tunes a kernel
+# that cannot accept one of its own keys:
 # flag_gems/runtime/backend/_ascend/tune_configs.yaml declares
 # BLOCK_M/BLOCK_N/BLOCK_K/SPLIT_K for `mm:`, while the kernel that key is fetched
-# for -- flag_gems/ops/mm.py:mm_kernel_general, wrapped in
-# `@libtuner(configs=runtime.get_tuned_config("mm"))` and reached from `mm` /
-# `mm_out` through the general path -- takes only
-# BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/IS_FP64. The first call therefore dies inside
-# the autotuner's own benchmark run, before any kernel is compiled, with
-# "KeyError: 'Keyword argument SPLIT_K was specified but unrecognised'" raised
-# from triton/spec/ascend/runtime/jit.py:_pack_args. Measured on Ascend910 /
-# CANN 9.0.0 / FlagTree 0.6.2a1+ascend3.5 against the revision CI pins (FlagGems
-# d45285ba) and against master (6d31db9aa); the yaml entry and the kernel
-# signature are identical in both. Ascend has aclnn kernels for both overloads,
-# so the route back is free. The rest of the family is unaffected: bmm, bmm.out
-# and addmm run on FlagGems and match a float64 CPU reference to 1.6e-7
-# relative, three orders tighter than the aclnn path's 1.7e-4, so the gap is
-# exactly these two overloads. matmul is not in the FlagGems coverage this conf
-# is generated from and already routes to `ascend`. Not yet filed upstream.
+# for -- flag_gems/ops/mm.py:mm_kernel_general, reached from `mm` / `mm_out`
+# through the general path -- takes only BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/
+# IS_FP64. The first call would die inside the autotuner's own benchmark run,
+# before any kernel was compiled, with "KeyError: 'Keyword argument SPLIT_K was
+# specified but unrecognised'" from triton/spec/ascend/runtime/jit.py:_pack_args.
+# That was measured on Ascend910 / CANN 9.0.0 / FlagTree 0.6.2a1+ascend3.5
+# against FlagGems d45285ba and 6d31db9aa.
+#
+# It does not reproduce on the current cohort. Measured on Ascend910C / CANN
+# 9.0.0 / FlagTree 0.7.0+ascend3.5 / FlagGems 5.4.0: the yaml still declares
+# SPLIT_K for `mm:` (lines 98/103/108) and runtime.get_tuned_config("mm") still
+# returns the three Config objects carrying it, but the first call succeeds. The
+# key never reaches _pack_args because FlagGems' own LibEntry.run no longer
+# forwards **kwargs to the kernel at all -- it collects the arguments from the
+# wrapped kernel's signature (self.jit_function.params, then
+# self.signature.parameters) and launches positionally as
+# `kernel[grid[0:3]](*all_args)` (flag_gems/utils/libentry.py:1472-1622), so a
+# config key the kernel does not declare is dropped instead of passed to the
+# argument packer. Confirmed with a cold cache -- a fresh HOME, which leaves
+# both the triton compile cache and ~/.flaggems/config_cache empty -- so a
+# cached tuned config is not the reason, and in a fresh process whose
+# `[flagos dispatch]` line reads `mm -> flaggems`.
+#
+# Routing them here also fixes numerics the runtime-conformance suite reads. At
+# 64x64 with a fixed seed, FlagGems matches an fp32 CPU reference to 8.6e-6
+# max-abs; the aclnn route returns 4.7e-3, which misses a rtol=atol=1e-3
+# comparison at the near-zero entries. The aclnn cube ops run fp32 operands
+# through `get_cube_math_type(true)`, i.e. cubeMathType=1, which downcasts them
+# to HF32; ALLOW_HF32=0 does not change the result, so the downcast is the mode
+# the kernel asks for and not a CANN default to tune away.
+# The rest of the family is unaffected: bmm, bmm.out and addmm already run on
+# FlagGems and match a float64 CPU reference to 1.6e-7 relative, three orders
+# tighter than the aclnn path's 1.7e-4. matmul is not in the FlagGems coverage
+# this conf is generated from and still routes to `ascend`. The FlagGems tuner
+# defect itself is still unfiled upstream.
 #
 # ascend: topk returns all zeros -- both the values and the indices -- and does it
 # silently, for every shape measured. On Ascend910 with CANN 9.0.0, FlagTree
@@ -1096,8 +1131,6 @@ NATIVE_TRITON_GAPS = {
         "le.Tensor",
         "lt.Scalar",
         "lt.Tensor",
-        "mm",
-        "mm.out",
         "mul_.Tensor",
         "native_dropout",
         "native_dropout_backward",
@@ -1171,7 +1204,21 @@ NATIVE_TRITON_GAPS = {
         "zero_",
         "zeros",
         "zeros_like",
-        # Index/offset arithmetic that legalizes to a 64-bit extension.
+        # The rest of this group is here because what these ops legalize to
+        # cannot run on GCU either, but the two routes they land on are not the
+        # same one, so they are listed by what they fall through to.
+        #
+        # `embedding` is served natively: `topsatenEmbedding` is a pure gather
+        # and codegen_gcu.py emits the kernel for it, so its membership here is
+        # what keeps FlagGems off the route and lets route() fall through to
+        # `gcu` -- the same pairing as `new_ones` above. Before the native kernel
+        # existed the set closed the FlagGems route with nothing behind it, so
+        # the op routed to `none` and every lookup in a model reached the
+        # cpu_fallback.
+        #
+        # `floor_divide`, `index_add`, `nll_loss_backward`, `nll_loss_forward`
+        # and `sort` have no topsaten entry point, so they stay on `none` and
+        # reach that same cpu_fallback deliberately.
         "embedding",
         "floor_divide",
         "floor_divide_.Tensor",
@@ -1318,6 +1365,25 @@ NATIVE_TRITON_GAPS = {
         "cummin",
         "logcumsumexp",
         "logcumsumexp.out",
+        # `cat` reached FlagGems when the tensorlist_dim codegen category gave
+        # `aten::cat(Tensor[] tensors, int dim)` a Python route, and the FlagGems
+        # route does not compile on this vendor. Measured 2026-10-12 on Enflame
+        # GCU S60, GCU integration suite:
+        # tests/integration/ops/test_cat_dispatch.py::TestCatKvCacheAppend,
+        # `torch.cat([k_prefill, k_new], dim=-2)` over concatenands of differing
+        # sizes, raised
+        # `triton.compiler.errors.CompilationError: AssertionError('Mismatched
+        # type for dim_size_in between then block (int32) and else block
+        # (int64)')` out of
+        # flag_gems/runtime/backend/_enflame/gcu300/ops/cat.py:291
+        # (cat_copy_row_kernel_4). It is an Enflame-side compile bug in the
+        # FlagGems `cat` kernel, not a routing mistake: the kernel merges the two
+        # per-concatenand size scalars into one variable and the GCU300 front end
+        # rejects the int32/int64 join. Membership here closes the FlagGems route
+        # so `cat` falls back to the vendor kernel T_CAT in codegen_gcu.py --
+        # the route it took before the reroute, and one this suite measured
+        # working. Drop the entry if a later FlagGems fixes the kernel.
+        "cat",
         # Everything below comes from the full sweep rather than from targeted
         # probes: tests/manual/flaggems_overload_survey.py --conf
         # torch_fl/configs/backends_gcu.conf run on the S60 at FlagGems master
@@ -1594,32 +1660,49 @@ NATIVE_KERNEL_PREFERRED = set()
 # through the `# tileops` annotation that FLAGOS_FORCE_BACKEND=tileops reads.
 TILEOPS_PLATFORMS = set()
 
-# The 17 FlagGems C++ ops verified on MetaX hardware (of the 18 in the shared C++
-# set). `mm` is the omission and is deliberate: gems' `mm` passes a SPLIT_K kwarg
-# triton-metax rejects, so it stays on the boxing kernel. Recorded here because
-# the conf that used to hold this measurement no longer exists separately; see
-# boxing_cpp_ops(). test_metax_conf_keeps_mm_boxed pins the exception.
+# The FlagGems C++ ops MetaX routes to the C++ path in the build its CI lane and
+# its shipped wheel actually produce. Fifteen of the 18 in the shared C++ set;
+# `mm` is one deliberate omission and the two `*_softmax`-adjacent drops another,
+# both explained below. Recorded here because the conf that used to hold this
+# measurement no longer exists separately; see boxing_cpp_ops().
+# test_metax_conf_keeps_mm_boxed pins the `mm` exception.
+#
+# The `mm` omission: gems' `mm` passes a SPLIT_K kwarg triton-metax rejects, so
+# `mm` stays on the boxing kernel. Measured by forcing it onto the C++ route with
+# `FLAGOS_OP_bmm=flaggems_cpp` on MetaX hardware: it fails on the fp32 inputs
+# `aten::bmm` must serve ("soft-lowp matrix kernel requires a low-precision
+# input").
 #
 # Verification on this route is not the same as being routed on it: five of these
 # also sit in MetaX's boxing gap set, which route_boxing() checks first, so the
 # conf keeps `bmm`, `bmm.out`, `sort`, `sort.stable` and `sum.dim_IntList` on the
-# boxing kernel and only 12 of the 17 reach flaggems_cpp. That set is read back
+# boxing kernel and only 10 of the 15 reach flaggems_cpp. That set is read back
 # from backends_metax.conf (see BOXING_PLATFORMS) and its per-op reasons are in
-# BOXING_GAP_NOTES["metax"]. Measured again on the C550 host while
-# reviewing this set: forcing `bmm` or `mm` onto the C++ route with
-# `FLAGOS_OP_bmm=flaggems_cpp` fails on the fp32 inputs `aten::bmm` must serve
-# ("soft-lowp matrix kernel requires a low-precision input"), while `sort` and
-# `embedding` compute the host answer there -- `sort`'s pin is its profiler
-# interaction, not its values, as the note says.
+# BOXING_GAP_NOTES["metax"]. `sort`'s pin is its profiler interaction, not its
+# values -- it computes the host answer on the C++ route.
+#
+# The two drops: `_softmax` and `embedding` were measured servable through the
+# C++ path on a host whose FlagGems build had the C++ half compiled in, but they
+# are two of the ten ops
+# tests/integration/runtime/runtime_caps.py:RUNTIME_OPS exercises, and the MetaX
+# CI lane installs the pure-Python FlagGems wheel, which ships no
+# liboperators.so. With no `flaggems_fn_` the dispatcher degrades a flaggems_cpp
+# route to the CUDA boxing kernel, so those two entries named a route neither CI
+# nor the shipped build can serve, and the runtime-conformance suite could not go
+# green. The honest measured state for the current build is that they are *not*
+# C++-servable, so they are listed off. Both are also in FLAGGEMS_PYTHON_OPS, so
+# they fall through to `flaggems`; restoring the C++ routing is deferred to the
+# follow-up PR that wires `-DFLAGGEMS_BACKEND=MACA
+# -DFLAGGEMS_BUILD_C_EXTENSIONS=ON`, `FLAGOS_BUILD_FLAGGEMS_CPP=1` and
+# `FLAGGEMS_DIR`/`FLAGGEMS_SOURCE_DIR` into the MetaX CI hook (see the MetaX
+# section of docs/reference/operator-support.md).
 METAX_CPP_MEASURED = {
-    "_softmax",
     "_softmax_backward_data",
     "addmm",
     "addmm.out",
     "argmax",
     "bmm",
     "bmm.out",
-    "embedding",
     "max",
     "max.dim",
     "nonzero",
@@ -2212,7 +2295,15 @@ def build_all(conf_dir: Path) -> dict:
         # `py_here` -- route_boxing() checks the gap set first.
         measured = boxing_measured_python_ops(sparse_conf)
         gaps -= measured
-        py_here = fg_py | measured
+        # Same gate as the native vendors below: a platform whose FlagGems
+        # Python routes are not measured yet is not in FLAGGEMS_PYTHON_PLATFORMS,
+        # so its conf routes nothing to flaggems and every covered op stays on
+        # the boxing kernel. Kunlunxin is the first such boxing platform -- the
+        # P800 port lands the boxing path only and its FlagGems allowlist is a
+        # follow-up -- and this gate is a no-op for metax/dcu/ppu, which are all
+        # in the set. Routing the shared ceiling here instead would claim
+        # coverage the P800 has not run.
+        py_here = (fg_py if platform in FLAGGEMS_PYTHON_PLATFORMS else set()) | measured
         # Only the C++-runtime conf routes to flaggems_cpp; elsewhere the slot is
         # unused and every C++ op is reached through the Python path instead.
         cpp_here = (
