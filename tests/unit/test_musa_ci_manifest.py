@@ -21,6 +21,7 @@ execution. The actual FlagGems and compile suites still require the MUSA runner.
 import ast
 import builtins
 import importlib.metadata
+import runpy
 import shlex
 import subprocess
 import sys
@@ -36,6 +37,13 @@ CONFIGS = REPO_ROOT / ".github" / "configs"
 PREFLIGHT = "Check MUSA FlagTree and FlagGems runtime"
 HYBRID = "Run MUSA FlagGems hybrid tests"
 COMPILE = "Run torch.compile tests with FlagTree"
+PREFLIGHT_TEST = REPO_ROOT / "tests/integration/test_musa_runtime.py"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def register_runtime_marker(pytestconfig):
+    # These CPU checks load the hardware test without integration/conftest.py.
+    pytestconfig.addinivalue_line("markers", "musa: requires MUSA hardware")
 
 
 def _manifest(platform="musa"):
@@ -46,11 +54,22 @@ def _groups(platform="musa"):
     return {group["name"]: group for group in _manifest(platform)["integration_tests"]}
 
 
-def _preflight_source():
-    command = _groups()[PREFLIGHT]["command"]
-    assert command.startswith("python - <<'PY'\n")
-    assert command.endswith("\nPY\n")
-    return command.split("\n", 1)[1].rsplit("\nPY", 1)[0]
+def _preflight_check():
+    return runpy.run_path(str(PREFLIGHT_TEST))[
+        "test_musa_flagtree_and_flaggems_runtime"
+    ]
+
+
+def test_preflight_runs_the_required_runtime_test():
+    assert shlex.split(_groups()[PREFLIGHT]["command"]) == [
+        "python",
+        "-m",
+        "pytest",
+        "tests/integration/test_musa_runtime.py",
+        "-v",
+        "-s",
+        "--tb=short",
+    ]
 
 
 def test_compile_suite_matches_cuda_without_deselects():
@@ -106,12 +125,21 @@ def test_all_manifest_commands_are_valid_shell():
             ["bash", "-n"], input=group["command"], text=True, capture_output=True
         )
         assert result.returncode == 0, (group["name"], result.stderr)
-    ast.parse(_preflight_source())
+    ast.parse(PREFLIGHT_TEST.read_text())
 
 
-def test_preflight_imports_torch_fl_before_flaggems():
-    source = _preflight_source()
-    assert source.index("import torch_fl") < source.index("import flag_gems")
+def test_preflight_imports_torch_fl_before_flaggems(runtime, monkeypatch):
+    imports = []
+    original_import = builtins.__import__
+
+    def track_import(name, *args, **kwargs):
+        if name in ("torch_fl", "flag_gems"):
+            imports.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", track_import)
+    _preflight_check()()
+    assert imports.index("torch_fl") < imports.index("flag_gems")
 
 
 def _hybrid_runtime_gate():
@@ -221,7 +249,7 @@ def test_hybrid_gate_still_checks_runtime_requirements(runtime, monkeypatch, mis
 
 
 def test_preflight_accepts_the_musa_stack(runtime, capsys):
-    exec(_preflight_source(), {})
+    _preflight_check()()
     assert "MUSA compile target: ('musa', 31, 32)" in capsys.readouterr().out
 
 
@@ -242,7 +270,7 @@ def test_preflight_rejects_unusable_runtime(runtime, key, value):
     state, _ = runtime
     state[key] = value
     with pytest.raises(AssertionError):
-        exec(_preflight_source(), {})
+        _preflight_check()()
 
 
 @pytest.mark.parametrize("component", ["accelerator", "triton_backend", "gems_vendor"])
@@ -255,7 +283,7 @@ def test_preflight_rejects_the_wrong_vendor(runtime, component):
     else:
         modules["flag_gems"].vendor_name = "nvidia"
     with pytest.raises(AssertionError):
-        exec(_preflight_source(), {})
+        _preflight_check()()
 
 
 @pytest.mark.parametrize("package", ["flag_gems", "triton"])
@@ -269,7 +297,16 @@ def test_missing_dependencies_fail_instead_of_skipping(runtime, monkeypatch, pac
 
     monkeypatch.setattr(builtins, "__import__", import_without_dependency)
     with pytest.raises(ModuleNotFoundError, match=package):
-        exec(_preflight_source(), {})
+        _preflight_check()()
+
+
+def test_preflight_requires_the_flagtree_distribution(runtime, monkeypatch):
+    def missing_distribution(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", missing_distribution)
+    with pytest.raises(importlib.metadata.PackageNotFoundError, match="flagtree"):
+        _preflight_check()()
 
 
 def test_manifest_checks_run_in_the_cpu_setup_job():
