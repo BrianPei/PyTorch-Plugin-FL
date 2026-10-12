@@ -1365,6 +1365,25 @@ NATIVE_TRITON_GAPS = {
         "cummin",
         "logcumsumexp",
         "logcumsumexp.out",
+        # `cat` reached FlagGems when the tensorlist_dim codegen category gave
+        # `aten::cat(Tensor[] tensors, int dim)` a Python route, and the FlagGems
+        # route does not compile on this vendor. Measured 2026-10-12 on Enflame
+        # GCU S60, GCU integration suite:
+        # tests/integration/ops/test_cat_dispatch.py::TestCatKvCacheAppend,
+        # `torch.cat([k_prefill, k_new], dim=-2)` over concatenands of differing
+        # sizes, raised
+        # `triton.compiler.errors.CompilationError: AssertionError('Mismatched
+        # type for dim_size_in between then block (int32) and else block
+        # (int64)')` out of
+        # flag_gems/runtime/backend/_enflame/gcu300/ops/cat.py:291
+        # (cat_copy_row_kernel_4). It is an Enflame-side compile bug in the
+        # FlagGems `cat` kernel, not a routing mistake: the kernel merges the two
+        # per-concatenand size scalars into one variable and the GCU300 front end
+        # rejects the int32/int64 join. Membership here closes the FlagGems route
+        # so `cat` falls back to the vendor kernel T_CAT in codegen_gcu.py --
+        # the route it took before the reroute, and one this suite measured
+        # working. Drop the entry if a later FlagGems fixes the kernel.
+        "cat",
         # Everything below comes from the full sweep rather than from targeted
         # probes: tests/manual/flaggems_overload_survey.py --conf
         # torch_fl/configs/backends_gcu.conf run on the S60 at FlagGems master
@@ -1641,32 +1660,49 @@ NATIVE_KERNEL_PREFERRED = set()
 # through the `# tileops` annotation that FLAGOS_FORCE_BACKEND=tileops reads.
 TILEOPS_PLATFORMS = set()
 
-# The 17 FlagGems C++ ops verified on MetaX hardware (of the 18 in the shared C++
-# set). `mm` is the omission and is deliberate: gems' `mm` passes a SPLIT_K kwarg
-# triton-metax rejects, so it stays on the boxing kernel. Recorded here because
-# the conf that used to hold this measurement no longer exists separately; see
-# boxing_cpp_ops(). test_metax_conf_keeps_mm_boxed pins the exception.
+# The FlagGems C++ ops MetaX routes to the C++ path in the build its CI lane and
+# its shipped wheel actually produce. Fifteen of the 18 in the shared C++ set;
+# `mm` is one deliberate omission and the two `*_softmax`-adjacent drops another,
+# both explained below. Recorded here because the conf that used to hold this
+# measurement no longer exists separately; see boxing_cpp_ops().
+# test_metax_conf_keeps_mm_boxed pins the `mm` exception.
+#
+# The `mm` omission: gems' `mm` passes a SPLIT_K kwarg triton-metax rejects, so
+# `mm` stays on the boxing kernel. Measured by forcing it onto the C++ route with
+# `FLAGOS_OP_bmm=flaggems_cpp` on MetaX hardware: it fails on the fp32 inputs
+# `aten::bmm` must serve ("soft-lowp matrix kernel requires a low-precision
+# input").
 #
 # Verification on this route is not the same as being routed on it: five of these
 # also sit in MetaX's boxing gap set, which route_boxing() checks first, so the
 # conf keeps `bmm`, `bmm.out`, `sort`, `sort.stable` and `sum.dim_IntList` on the
-# boxing kernel and only 12 of the 17 reach flaggems_cpp. That set is read back
+# boxing kernel and only 10 of the 15 reach flaggems_cpp. That set is read back
 # from backends_metax.conf (see BOXING_PLATFORMS) and its per-op reasons are in
-# BOXING_GAP_NOTES["metax"]. Measured again on the C550 host while
-# reviewing this set: forcing `bmm` or `mm` onto the C++ route with
-# `FLAGOS_OP_bmm=flaggems_cpp` fails on the fp32 inputs `aten::bmm` must serve
-# ("soft-lowp matrix kernel requires a low-precision input"), while `sort` and
-# `embedding` compute the host answer there -- `sort`'s pin is its profiler
-# interaction, not its values, as the note says.
+# BOXING_GAP_NOTES["metax"]. `sort`'s pin is its profiler interaction, not its
+# values -- it computes the host answer on the C++ route.
+#
+# The two drops: `_softmax` and `embedding` were measured servable through the
+# C++ path on a host whose FlagGems build had the C++ half compiled in, but they
+# are two of the ten ops
+# tests/integration/runtime/runtime_caps.py:RUNTIME_OPS exercises, and the MetaX
+# CI lane installs the pure-Python FlagGems wheel, which ships no
+# liboperators.so. With no `flaggems_fn_` the dispatcher degrades a flaggems_cpp
+# route to the CUDA boxing kernel, so those two entries named a route neither CI
+# nor the shipped build can serve, and the runtime-conformance suite could not go
+# green. The honest measured state for the current build is that they are *not*
+# C++-servable, so they are listed off. Both are also in FLAGGEMS_PYTHON_OPS, so
+# they fall through to `flaggems`; restoring the C++ routing is deferred to the
+# follow-up PR that wires `-DFLAGGEMS_BACKEND=MACA
+# -DFLAGGEMS_BUILD_C_EXTENSIONS=ON`, `FLAGOS_BUILD_FLAGGEMS_CPP=1` and
+# `FLAGGEMS_DIR`/`FLAGGEMS_SOURCE_DIR` into the MetaX CI hook (see the MetaX
+# section of docs/reference/operator-support.md).
 METAX_CPP_MEASURED = {
-    "_softmax",
     "_softmax_backward_data",
     "addmm",
     "addmm.out",
     "argmax",
     "bmm",
     "bmm.out",
-    "embedding",
     "max",
     "max.dim",
     "nonzero",

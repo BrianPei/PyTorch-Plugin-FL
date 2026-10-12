@@ -388,6 +388,69 @@ stays hardware-agnostic and identical across the fleet. (The
 `tests/integration/runtime/`, fleet-wide and for every platform; it is not part of
 this change and it is what the second measured run above already exercises.)
 
+### MetaX: `_softmax` and `embedding` leave the FlagGems C++ route this build cannot serve (2026-10-12, MetaX)
+
+**One sentence.** `backends_metax.conf` claimed `flaggems_cpp` for `_softmax` and
+`embedding` — two of the ten ops
+`tests/integration/runtime/runtime_caps.py:RUNTIME_OPS` exercises — against a
+MetaX build whose FlagGems install has no C++ half, so `Dispatcher::GetFn` saw an
+empty `kFlagGemsCpp` slot and degraded both routes to the CUDA boxing kernel,
+which is why the runtime-conformance suite could not reach 32/32; both ops are
+removed from `METAX_CPP_MEASURED` in
+[`scripts/codegen/gen_vendor_confs.py`](../../scripts/codegen/gen_vendor_confs.py)
+and the conf now routes them to `flaggems`.
+
+**Why the route was unservable.** `flaggems_cpp` is `Backend::kFlagGemsCpp` and
+needs `FLAGOS_BUILD_FLAGGEMS_CPP=ON`, i.e. FlagGems' `liboperators.so` built for
+MACA and linked in. The MetaX lane installs the pure-Python FlagGems wheel from
+the internal index, which ships no C++ extension, so nothing can be reached
+through that slot on the hardware as configured. The previously recorded
+measurement — that both ops compute the host answer on the C++ route — was taken
+on a host whose FlagGems build did have the C++ half, and is not in dispute; what
+it does not support is a `flaggems_cpp` entry in a conf served by a build without
+it. The honest measured state for the current build is that these two are **not**
+C++-servable, so `METAX_CPP_MEASURED` no longer lists them. The other ten
+`flaggems_cpp` entries are unaffected: none of them is in `RUNTIME_OPS`, and each
+degrades the same way, so none of them can decide the suite's verdict either way.
+
+**Where the two ops land.** Both are in `FLAGGEMS_PYTHON_OPS`, so
+`route_boxing()` falls through the (now empty for them) `fg_cpp` test to `fg_py`
+and returns `flaggems`; neither reaches `none`, which matters because MetaX is a
+boxing platform and `test_boxing_platforms_have_no_none_entries` asserts that no
+boxing conf carries a `none` entry. Read back from the regenerated file rather
+than assumed: `_softmax = flaggems` and `embedding = flaggems`. `_softmax` is
+spelled `_softmax` in the generated op list (it is not `_safe_softmax`), which is
+the key the change had to land on.
+
+**Route delta.** `flaggems_cpp` 12 -> **10**, `flaggems` 592 -> **594**, `cuda`
+1433 unchanged, total 2037 unchanged, coverage 2037/2037 (100.0%). No other
+platform's conf moves.
+
+**Guard tests.** `tests/unit/test_conf_registration_consistency.py`'s
+`test_conf_route_counts_are_stable` metax row moves to
+`{"flaggems": 594, "cuda": 1433, "flaggems_cpp": 10}`;
+`tests/integration/ops/test_metax_flaggems.py`'s `_MEASURED_FLAGGEMS_ROUTES`
+592 -> 594 and its `_ROUTED_TO_FLAGGEMS["embedding"]` entry moves from the
+`flagos` (C++) log name to `flagos_python`; the module docstrings and
+`test_metax_conf_keeps_mm_boxed`'s docstring follow the new counts.
+
+**Deferred to a follow-up PR.** Restoring the two C++ routes requires the MACA
+FlagGems C++ build in the lane: `-DFLAGGEMS_BACKEND=MACA
+-DFLAGGEMS_BUILD_C_EXTENSIONS=ON`, `FLAGOS_BUILD_FLAGGEMS_CPP=1` and
+`FLAGGEMS_DIR`/`FLAGGEMS_SOURCE_DIR` in the MetaX CI hook. This entry records the
+downgrade only; the restoration is a separate change, and it is the one that
+makes a `flaggems_cpp` claim for these two ops true again.
+
+**Evidence.** Conf SHA-256
+`8af0f654bb27358c93444b5a1674d447d566f6d3c535d591ee80714da7e95a22` ->
+`8a3a2e686b2a89a26bfb367fcfabafb7da88b718362c5c69b7c6196e777cbf3f`.
+`python3 scripts/codegen/gen_vendor_confs.py` run twice leaves the file
+byte-identical and `python3 scripts/codegen/gen_vendor_confs.py --check` exits 0.
+**Not hardware-revalidated in this change**: the route counts and the `flaggems`
+landing are read from the regenerated conf, and the effect on the
+runtime-conformance suite is stated as what the change unblocks, not as a
+32/32 measurement taken here.
+
 ### Ascend: `mm` and `mm.out` return to the FlagGems route, with integral matmul escaping it by dtype (2026-10-12, Ascend 910C)
 
 **One sentence.** Ascend's aclnn cube matmul is driven with a cube-math type of
@@ -7376,6 +7439,160 @@ after, via `nm --undefined-only`); `tests/manual/flaggems_overload_survey.py` wa
 not re-run against the new cohort because the excluded ops cannot run here in
 either arm. That evidence gap is recorded here and in the PR.
 
+## `cat` route changes (2026-10-12)
+
+`cat` was the last route of the runtime-conformance set that TsingMicro could not
+execute, and the only one of the failures whose cause was neither numeric nor
+allocator. The repair is in the platform code generator, not in the prototype
+described by the bring-up above.
+
+Root cause. `aten::cat` has the schema `(Tensor[] tensors, int dim) -> Tensor`.
+`detect_category()` in `scripts/codegen/codegen_ops.py` classifies an op by its
+argument types, and a `Tensor[]` argument files the op under
+`foreach_tensorlist` -- the rank-identical elementwise `_foreach_*` family --
+which is not one of the FlagGems Python categories the generator emits kernels
+for. `cat = flaggems` was therefore a conf entry with no kernel behind it. On
+TsingMicro that does not degrade: the platform takes the `#else` branch of
+`csrc/aten/register.cc` and claims the full generated op list on PrivateUse1, so
+a claimed route with no kernel reaches the dispatcher and raises
+`RuntimeError: PyTorch is not linked with support for cuda devices` instead of
+falling back to CPU.
+
+Repair. `scripts/codegen/codegen_ops.py` gains an explicit
+`_FLAGGEMS_TENSORLIST_DIM` set naming the ops served by the already-declared
+`CallPythonOp_ListI` caller, a membership check in `discover_flaggems_ops()`, and
+a `tensorlist_dim` branch in `gen_flaggems_python_kernel()` that emits
+`CallPythonOp_ListI("<gems_func>", <list_name>, <dim_name>)` with both parameter
+names read from the op's `CppSignature`. Membership is an explicit list and not a
+schema-derived category: `detect_category()` is the thing being worked around,
+and a schema-shaped rule would also have to reason about every `_foreach_*` op
+for which FlagGems has no kernel at all. The regenerated
+`csrc/aten/generated/flaggems_python_kernels.cc` contains
+`CatKernelPython(const at::ITensorListRef & tensors, int64_t dim)` calling
+`CallPythonOp_ListI("flag_gems.cat", tensors, dim)` and
+`REGISTER_IMPL_TO_DISPATCHER(CatFn, cat_dispatcher, Backend::kFlagGems,
+CatKernelPython)`.
+
+**Conf route change.** Regenerating the kernels re-derives the coverage ceiling,
+and the one new entry (`cat`) moves a single op's route across the vendor confs,
+which this report has to record. Measured against the previous revision of each
+conf:
+
+| conf | op | before | after (as this change finally lands) |
+| --- | --- | --- | --- |
+| `backends_ascend.conf` | `cat` | `ascend` | `flaggems  # ascend` |
+| `backends_gcu.conf` | `cat` | `gcu` | `gcu` -- the reroute landed and was reverted on a measured failure, see below |
+| `backends_musa.conf` | `cat` | `musa` | `flaggems  # musa` |
+| `backends_ppu.conf` | `cat` | `cuda` | `flaggems` |
+
+`backends_cuda.conf`, `backends_dcu.conf`, `backends_kunlunxin.conf`,
+`backends_bpu.conf`, `backends_metax.conf` and `backends_tsingmicro.conf` have
+**no route change at all**: `backends_cuda.conf` and `backends_metax.conf` are
+byte-identical to their previous revisions, and the `backends_tsingmicro.conf`
+revision of this change is **comments only**, so that conf's cohort membership is
+unchanged.
+
+The ceiling gains exactly one entry and loses none. `cat` is a new member of the
+FlagGems Python op set, so the checked-in
+`csrc/aten/generated/flaggems_python_kernels.cc` names one more
+`flag_gems.<name>` entry point than the previous revision did -- the count the
+MetaX setup hook measures before every integration job rises from 666 to 667 --
+and every op that was in the set stays in it: `alias_copy.out` keeps its
+`flaggems` route in `backends_metax.conf` and `backends_ppu.conf`. `cat` is not a
+member of `FLAGGEMS_PENDING_NATIVE_OPS`, so nothing withheld it from the
+native-kernel vendors either: `ascend`, `gcu` and `musa` each took the new
+FlagGems route in their conf, and each of those three routes stands on the
+generator's owned evidence rather than on a measurement until that vendor's own
+suite runs. GCU's suite has now run, and `cat` is back on the `gcu` kernel there;
+see the next section.
+
+**TsingMicro -- measured.** `tests/manual/flaggems_overload_survey.py` (version
+6, SHA-256
+`7b01c22ce3a94315f1364df242323e9faac27f2585debfb05030670c7c756cc7`) was run
+scoped to the single affected route against this revision of
+`backends_tsingmicro.conf` (SHA-256
+`842bf4a67f2e3b89c5cdefb42cef43069d8580483a551afeeec02beef7d2a05d`):
+
+```
+python tests/manual/flaggems_overload_survey.py \
+  --conf torch_fl/configs/backends_tsingmicro.conf --ops cat
+[1/1] cat  strict=1 basic_only=0 failed=0 untested=0
+```
+
+All seven profiles -- `2d-f32`, `4d-f32`, `1d-f32`, `2d-f16`, `2d-i64`,
+`2d-bool`, `2d-f32-strided` -- record `PASS` with an empty `detail`, and the run
+summarises to `{"basic_executable": 1, "registered": 1, "strict_support": 1,
+"tested": 1, "verdicts": {"STRICT": 1}}` at rc 0. That is the strongest verdict
+the harness emits: the route is measured against the CPU reference at
+`atol=2e-2, rtol=2e-2` on every profile, including the integer and boolean
+dtypes and the non-contiguous case. The runtime-conformance suite that gates the
+platform is unchanged in its verdict and moves only in its composition:
+`RUNTIME-CONFORMANCE accel=tsingmicro kernels=boxing,flaggems,vendor
+ops_total=10 ops_routed=10 ops_none=0 passed=32 failed=0 skipped=0 errors=0`,
+`PYTEST_RC=0`.
+
+**GCU -- measured, and reverted.** The GCU integration job on the rerouted
+revision failed `tests/integration/ops/test_cat_dispatch.py::TestCatKvCacheAppend`
+-- the KV-cache append shape `torch.cat([k_prefill, k_new], dim=-2)` over
+concatenands of differing sizes -- together with its fp16 large-magnitude
+variant. The call reached the FlagGems Enflame kernel and the compiler rejected
+it:
+
+```
+flag_gems/runtime/backend/_enflame/gcu300/ops/cat.py:291: in _cat_run_kernel
+    cat_copy_row_kernel_4[grid](
+...
+E   triton.compiler.errors.CompilationError: at 34:4:
+E       if pid_t == 0:
+E           in_ptr = in_ptr_a
+E           dim_size_in = dim_size_in_a
+E           dim_offset = dim_offset_a
+E       elif pid_t == 1:
+E
+E   AssertionError('Mismatched type for dim_size_in between then block (int32) and else block (int64)')
+```
+
+That is an Enflame-side compile bug in the FlagGems `cat` kernel, not a routing
+mistake in the conf: `cat_copy_row_kernel_4` selects between the two
+concatenands' size scalars inside the kernel and merges them into one variable,
+and the Enflame GCU300 front end rejects the int32/int64 join across the two
+branches. It is shape- and dtype-dependent rather than universal, which is why
+the route compiles at all and still fails on these two cases.
+
+The counter-measure is the one this codebase uses for an unmeasured or broken
+Enflame FlagGems route: `"cat"` joins `NATIVE_TRITON_GAPS["gcu"]` in
+`scripts/codegen/gen_vendor_confs.py`, with the compile assertion above attached
+as its evidence. Membership in that set closes the FlagGems Python route for
+that one vendor, so `backends_gcu.conf` falls back to the kernel `T_CAT` in
+`codegen_gcu.py` claims -- the topsaten route the conf held before this change,
+and the one the same suite measured green -- while `ascend`, `musa`, `ppu` and
+`tsingmicro` keep the FlagGems route. Every other artifact moves with it: the
+regenerated `gcu_flaggems_register.inc` gains `cat` in its excluded-ops list (the
+list is exactly `sorted(NATIVE_TRITON_GAPS["gcu"])`, 230 entries) and no
+`m.impl()` line changes, because the native registration already claimed `cat`.
+`codegen_gcu_flaggems.py`'s banner is not one of the moving numbers: its
+"further FlagGems ops already claimed by `gcu_register.inc`" figure is
+`len((native & FLAGGEMS_PYTHON_OPS) - pending)`, which does not subtract
+`NATIVE_TRITON_GAPS`, so it stays **103** -- measured, not assumed: recomputing
+both figures against the current tree gives `246` registered here and `103` via
+the native registration, with and without `cat` in the gap set. The GCU row of
+`test_conf_route_counts_are_stable` returns to `{none: 1605, gcu: 179,
+flaggems: 253}`.
+
+**Not revalidated:** the remaining route changes in the table above. No other
+platform is measured here. The scoped survey was run against the TsingMicro
+configuration only, and the GCU measurement is the integration suite's, not a
+probe; no `ascend`, `musa` or `ppu` device was reachable to re-run `--ops cat`
+against the changed confs. So of the four FlagGems gains, GCU's has been
+reverted on evidence and the other three (`ascend`, `musa`, `ppu`) carry only
+the generator's owned evidence -- the regenerated kernels, the re-derived
+ceiling, and the unit coverage in
+[`tests/unit/test_flaggems_tensorlist_dim_route.py`](../../tests/unit/test_flaggems_tensorlist_dim_route.py)
+-- and need a scoped survey run on the corresponding hardware before they can be
+relied on. Read the table as: `cat` reaches FlagGems on TsingMicro by
+measurement, and on `ascend`, `musa` and `ppu` by generator derivation until
+measured.
+
 ## FlagGems Route Removals
 
 The 10 stale-qualname routes fixed on 2026-08-31 are omitted from this section
@@ -9329,6 +9546,7 @@ the recorded result is unchanged.
 
 | Date | Hardware | Cohort | Change | Evidence |
 |---|---|---|---|---|
+| 2026-10-12 | MetaX | MetaX full-coverage conf (2037-route denominator), runtime-conformance subset | `_softmax` and `embedding` leave the `flaggems_cpp` route: both were in `METAX_CPP_MEASURED` (`scripts/codegen/gen_vendor_confs.py`) but the MetaX build carries no FlagGems C++ half, so `Dispatcher::GetFn` degraded the route to the CUDA boxing kernel rather than serving it, and both ops are in `RUNTIME_OPS`. Removed from the measured set; each falls through `route_boxing()` to `flaggems` (both are in `FLAGGEMS_PYTHON_OPS`), so no `none` entry appears on a boxing platform. Route delta `flaggems_cpp` 12 -> **10**, `flaggems` 592 -> **594**, `cuda` 1433 unchanged; total 2037, coverage 2037/2037. Every other platform's conf is byte-identical. Wiring the MACA FlagGems C++ build into the MetaX CI hook and restoring the two routes is a separate follow-up PR. | Conf SHA-256 `8af0f654bb27358c93444b5a1674d447d566f6d3c535d591ee80714da7e95a22` -> `8a3a2e686b2a89a26bfb367fcfabafb7da88b718362c5c69b7c6196e777cbf3f`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` exits 0; `tests/unit/test_conf_registration_consistency.py`, `tests/unit/test_gen_vendor_confs.py`, `tests/unit/test_vendor_conf_single_writer.py` and the full unit suite pass; the metax route counts and the `flaggems` landing are read from the regenerated conf. This unblocks the MetaX runtime-conformance run; no 32/32 result was measured on hardware here. |
 | 2026-10-12 | Ascend 910C (CANN 9.0.0) | Ascend full-coverage conf (2037-route denominator), runtime-conformance subset | `mm` and `mm.out` rerouted from `ascend` back to `flaggems`, the route #272 moved them off, because the vendor route truncates fp32: `mm` reaches `aclnnMm` through the cube path with `ascend::OpPreparation::get_cube_math_type(true)`, i.e. a bare cube-math type of `1`, which downcasts fp32 operands to HF32 (10-bit mantissa). Both ops leave `NATIVE_TRITON_GAPS["ascend"]` in `scripts/codegen/gen_vendor_confs.py` — their recorded `KeyError: Keyword argument SPLIT_K was specified but unrecognised` no longer reproduces, because `LibEntry.run` launches `kernel[grid[0:3]](*all_args)` from the kernel's own signature and drops an undeclared tune key — and `FlagGemsRejectsOpDtype`'s `USE_ASCEND` table in `csrc/aten/common.cc` gains `mm` and `mm.out` over int64/int32/int16/uint8, so integral matmul still takes the cube kernel while `int8` stays on FlagGems (`tl.dot` accepts it). Route delta `flaggems` 221 -> **223**, `ascend` 154 -> **152**, `none` 1662 unchanged; 375 accelerated (18.4%). Every other platform's conf is byte-identical. | Conf SHA-256 `3e6979f6cc9756d3b2cc6c002cb9925056967ee06f62aab17098bb41a3862f0d` -> `2fd28efe4346cf14f5e721164bc6022e07873ebdcb322d8d97d8fc98c7828795`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` exits 0. Same wheel, same host, one revision of the conf apart: pre-fix `RUNTIME-CONFORMANCE accel=ascend kernels=flaggems,vendor ops_total=10 ops_routed=10 ops_none=0 passed=30 failed=2 skipped=0 errors=0` (`2 failed, 30 passed in 220.88s`), both failures fp32 `mm` at `test_runtime_stream.py`'s 64x64 operands — `Greatest absolute difference: 0.004545688629150391 at index (58, 49) (up to 0.001 allowed)`, 92/4096 elements — and post-fix `RUNTIME-CONFORMANCE accel=ascend kernels=flaggems,vendor ops_total=10 ops_routed=10 ops_none=0 passed=32 failed=0 skipped=0 errors=0` (`32 passed in 196.17s`, pytest exit 0). Per dtype at 64x64 `seed 0` against an fp64 CPU reference: fp32 `mm -> flagos_python` 6.344024e-06 vs `mm -> ascend` 4.674678e-03, and 4.674678e-03 with `ALLOW_HF32=0` set, so the downcast is not a reachable knob; fp16 (7.704686e-03) and bf16 (6.220317e-02) are identical on both routes and bf16 is outside 1e-3 on both, so the route neither causes nor fixes it. `FLAGOS_LOG=dispatch` per dtype: int64/int32/int16/uint8 `mm -> ascend` and int8 `mm -> flagos_python`, all equal to a CPU int64 reference. Cold-cache check with `HOME` pointed at an empty directory (`.flaggems` and `.triton` absent) compiles `mm` and returns 6.344024e-06. Survey (harness v6, conf `2fd28efe`): `mm` `{tested 1, STRICT 1}`, `mm.out` `{tested 1, BASIC_ONLY 1}`, `failed 0 untested 0`, exit 0. Regression gate is the existing suite — red on the pre-fix conf, green on this one — plus the updated `test_conf_route_counts_are_stable` snapshot and `test_runtime_dispatch_route.py`'s conf-to-dispatch comparison. Evidence gaps: `mm.out` over int64 raises `RuntimeError: aclnnMmGetWorkspaceSize failed, ret=161002` on **both** arms (post-fix escape and the pre-fix conf's own direct route), so it is pre-existing and not fixed here; the survey has no bf16 profile; the other 221 Ascend `flaggems` routes and every other accelerator are **not revalidated**. |
 | 2026-10-11 | Kunlunxin P800 OAM (new platform row) | Generated full-coverage CUDA-boxing config | New accelerator id `FLAGOS_ACCELERATOR=kunlunxin`. Kunlunxin is a CUDA-ABI boxing platform (the vendor torch registers under the CUDA dispatch key and drives the XPU SDK's CUDA-shaped runtime), added alongside `dcu`/`ppu`/`metax` with `runtime_dir: "cuda"` and `project_languages: ["CXX","C"]`. `backends_kunlunxin.conf` is generated by `scripts/codegen/gen_vendor_confs.py` from `BOXING_PLATFORMS` with fallback `cuda`: **2037 `cuda` / 0 `flaggems` / 0 `none`**. No op is rerouted to a vendor-native or FlagGems backend; kunlunxin is absent from `FLAGGEMS_PYTHON_PLATFORMS`, so no FlagGems route is claimed. No route moved in any other platform's cohort. | Routing countable from the generated file: 2037 ops, all on `cuda`. `gen_vendor_confs.py` twice → empty diff, `--check` exits 0. `tests/unit/test_conf_registration_consistency.py` pins `{"cuda": 2037}`; `test_setup_build.py` validates the new platform row. On a P800 OAM under a stock torch 2.10 build of this port, `import torch_fl`, backend-config selection to `backends_kunlunxin.conf`, `device_count() == 8`, and the boxing device layer on `flagos:1` (`set_device`, `current_device`, allocation, host↔device round-trip, `Stream`, `synchronize`, `empty_cache`) were measured green; **operators on the `cuda` route, including the harness's `mm` check, are not measured** — the vendor XPU runtime on that box is torch-2.9-bound, so eager ops reaching ATen's CUDA dispatch raise `NotImplementedError` under torch 2.10 and validating them requires a vendor torch 2.10 runtime. The FlagGems overload cohort is **not revalidated** on the P800 and this change claims no FlagGems route; the 2.9-line FlagGems allowlist is deferred to a follow-up PR. |
 | 2026-10-10 | TsingMicro TX8 (8 devices) | FlagGems-only routing bring-up (new platform row) | First on-hardware measurement for TsingMicro, and the platform's first documented operator path. The wheel is built `FLAGOS_ACCELERATOR=tsingmicro` against the Kuiper runtime; `cmake/flagos_platforms.json` now sets `writes_platform_marker` for tsingmicro, which makes `csrc/CMakeLists.txt` write the `lib/flagos_platform` marker (tsingmicro was the only accelerator with `writes_platform_marker: false` whose build then silently fell back to `backends_cuda.conf` and died on `AssertionError: Torch not compiled with CUDA enabled`). Two FlagGems-route defects fixed, both required before any route ran: the generated Python tables freeze the generic kernel path (`flag_gems.ops.mm`) while FlagGems' `SpecOpRegistrar` keeps the vendor callable at package top level, so a tuned vendor route resolved to the untuned generic kernel and raised `KeyError: Keyword argument SPLIT_K was specified but unrecognised` (fixed by re-resolving through the package top level in `python_op_caller.cc`); and the philox RNG bridge was gated to MUSA and matched modules by name prefix, so the vendor RNG modules — which bind the helper into their own globals and are not named `flag_gems.*` — kept the unpatched helper and `randn` raised `ValueError: too many values to unpack (expected 2)` (fixed in `torch_fl/__init__.py`). TsingMicro has **no vendor-native kernel fallback**: the FlagGems route is the compute path. FlagGems is not patched — both fixes are in torch_fl's dispatch and compat layers. No route count changed for any other platform, and no other platform is revalidated. | 14-op CPU-parity probe on `flagos:0` (TX8, torch 2.10.0+cpu, FlagTree 0.7.0+tsingmicro3.6, FlagGems 5.4.0 src): `mm` (64x64), `bmm` (4x32x32), `sum`, `mean` and `randn` pass and match the CPU reference (`mm allclose=True`, `randn` finite and distinct across draws). `add`, `mul`, `silu`, `softmax`, `exp`, `relu`, `gelu`, `layer_norm` and the three ops claimed by neither FLAGGEMS_PYTHON_OPS nor the 25 handwritten native registrations (`erfinv`, `lgamma`, `sigmoid`) raise `NotImplementedError: Could not run 'aten::empty_strided' with arguments from the 'CUDA' backend`; `cat` and `rms_norm` raise `RuntimeError: PyTorch is not linked with support for cuda devices`. Both groups trace to one cause — the full generated op list is claimed on PrivateUse1 while FlagGems has no `empty_like` kernel, so the route degrades to `EmptyLikeKernelCuda`; `pointwise_dynamic` allocates every elementwise output through `torch.empty_like`. Registered-but-uncovered ops therefore cannot reach `cpu_fallback`, so `none` is not an available route on this platform. The known fix was prototyped (claim `empty_like` on PrivateUse1 with a memory-format-aware wrapper: `add`/`silu`/`softmax`/`exp`/`relu`/`gelu`/`layer_norm` then all pass against CPU) but is **not** included here; the durable fix is the MUSA pattern, a TsingMicro-scoped `tsingmicro_flaggems_register.inc`. Evidence gap: the standard `flaggems_overload_survey.py` cannot measure this cohort — it selects `flagos_python` entries, and every tsingmicro route is `flaggems`. `pytest` is not installed in the measurement venv, so no test suite was run on this platform; the unit-suite and lint results in the PR are from the CPU dev host and do not exercise these routes. |
