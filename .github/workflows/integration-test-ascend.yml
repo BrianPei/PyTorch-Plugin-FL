@@ -76,21 +76,32 @@ jobs:
         shell: bash
         run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
-      # Cache downloads only; provisioning and dependency installation still run.
-      # Hash the hooks, shared pins and constraints to invalidate changed deps.
-      # Both the segment deadline and the whole-step deadline bound restoration.
-      - name: Restore pip downloads
-        id: pip-cache
+      # Look up first: a transfer timeout can return success with no matched key.
+      # A cold miss may save later; a failed matched transfer must not upload.
+      - name: Look up pip downloads
+        id: pip-cache-lookup
         uses: actions/cache/restore@v4
         continue-on-error: true
-        timeout-minutes: 5
-        env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+        timeout-minutes: 1
         with:
           path: ${{ runner.temp }}/pip-cache
           key: ascend-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_ascend.sh') }}
+          lookup-only: true
           restore-keys: |
             ascend-pip-${{ runner.os }}-
+
+      # Cache downloads only; installation and tests always run.
+      - name: Restore pip downloads
+        id: pip-cache
+        if: ${{ steps.pip-cache-lookup.outcome == 'success' && steps.pip-cache-lookup.outputs.cache-matched-key != '' }}
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: ${{ steps.pip-cache-lookup.outputs.cache-matched-key }}
 
       - name: Prepare Ascend build environment
         env:
@@ -119,13 +130,13 @@ jobs:
         run: python .github/scripts/run_integration_tests.py
 
       # Save outside post-job cleanup so the upload has its own deadline.
-      # Skip exact hits, failed restores and cancelled jobs; cache errors must
-      # not change the build/test result.
+      # Skip exact hits, failed lookups/transfers and cancelled jobs.
+      # Cache errors must not change the build/test result.
       - name: Save pip downloads
-        if: ${{ !cancelled() && steps.pip-cache.outcome == 'success' && steps.pip-cache.outputs.cache-hit != 'true' && steps.pip-cache.outputs.cache-primary-key != '' }}
+        if: ${{ !cancelled() && steps.pip-cache-lookup.outcome == 'success' && steps.pip-cache-lookup.outputs.cache-primary-key != '' && steps.pip-cache-lookup.outputs.cache-hit != 'true' && (steps.pip-cache-lookup.outputs.cache-matched-key == '' || (steps.pip-cache.outcome == 'success' && steps.pip-cache.outputs.cache-matched-key != '')) }}
         uses: actions/cache/save@v4
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 3
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: ${{ steps.pip-cache.outputs.cache-primary-key }}
+          key: ${{ steps.pip-cache-lookup.outputs.cache-primary-key }}

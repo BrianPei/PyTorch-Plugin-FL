@@ -24,7 +24,7 @@
 # PATH and falls through to `python`. `pip_retry` additionally honours
 # PIP_RETRY_PYTHON (a per-call override, used by the CUDA script's several
 # interpreters), PIP_RETRY_TIMEOUT (default 300s) and PIP_RETRY_NO_CACHE
-# (default 1; the CUDA script turns it off to reuse its build cache).
+# (default 1; the shared entrypoint enables caching for every platform).
 #
 # The scripts must keep `set -euo pipefail` in effect; every variable read here
 # is either set by the caller or has a default.
