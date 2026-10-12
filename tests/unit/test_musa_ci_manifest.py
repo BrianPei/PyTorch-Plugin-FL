@@ -86,6 +86,9 @@ def test_runtime_preflight_precedes_the_new_suites_and_rng_stays_last():
     assert len(names) == len(set(names))
     assert names.index("Check isolated MUSA environment") < names.index(PREFLIGHT)
     assert names.index(PREFLIGHT) < names.index(HYBRID) < names.index(COMPILE)
+    assert names.index("Runtime conformance (hardware-agnostic)") < names.index(
+        "Run unified RNG tests"
+    )
     assert names[-1] == "Run unified RNG tests"
 
 
