@@ -13,10 +13,55 @@
 
 | Component | Supported range | Notes |
 |---|---|---|
-| Python | 3.8 or later | From package metadata. Platform SDKs and available wheels may impose a narrower range. |
+| Python | One version per platform | Computed in `setup.py`: a FlagTree build exists for exactly one cp tag and the wheel links it, so the interpreter is fixed — 3.12 on CUDA/GCU/MetaX/PPU, 3.10 on DCU/MUSA, 3.11 on Ascend. `Requires-Python` says so, and the wheel filename repeats it. |
 | PyTorch | 2.10.x (`>=2.10,<2.11`) | Generated ATen bindings are tied to this minor line. |
-| FlagGems | Platform dependent | Installed from PyPI or a vendor-compatible build only where the platform route uses it. |
-| Triton/compiler | Platform dependent | Use the compiler distribution required by the selected accelerator. |
+| FlagGems | The version in `.github/version-pins.env` | Declared as an exact requirement, not a range: the per-op routing tables were generated against one cohort. Published to the platform's vendor lane. |
+| FlagTree | The platform's pin in `.github/version-pins.env` | Declared as an exact requirement and it *is* Triton — the package name carries the vendor's backend (`0.7.0+hcu3.6`, the trailing number being the Triton line). The pin tracks the newest build published to the platform's own lane. Platforms with no FlagTree build declare `triton>=3.5.1` instead. |
+| FlagCX | The platform's pin in `.github/version-pins.env` | Declared only where the vendor runtime has a build (CUDA, DCU, GCU, MetaX, MUSA, Ascend); PPU has none yet, and on the rest the distributed path falls back to the NCCL-shaped route. |
+| Triton/compiler | Comes from FlagTree | Use the compiler distribution required by the selected accelerator. |
+
+The index requirements for installing those are in
+[Installation](../getting-started/installation.md#runtime-dependencies-and-the-package-index).
+
+## Wheel compatibility record
+
+Every built wheel contains `torch_fl/compatibility.json`. It records the selected
+platform and kernel sets, bundled libtorch location, build-time PyTorch version
+and C++ ABI flag, the installed FlagTree/FlagGems/FlagCX versions observed during
+the build, the explicitly declared vendor PyTorch version when one supplies
+device libraries, and the wheel's Python requirements. These fields describe
+the artifact; an observed build version is evidence of testing, not an implicit
+pin on every downstream install. The package's version ranges remain the
+installation contract.
+
+An SDK version is recorded only when the builder sets `FLAGOS_SDK_VERSION` to a
+verified value. An absent value means **unknown**, not compatible with all SDKs.
+For CUDA, DCU, MetaX, and PPU release artifacts, also set
+`FLAGOS_VENDOR_TORCH_VERSION` from the vendor wheel used to source device/core
+libraries. `--release` rejects missing SDK or vendor PyTorch provenance. The
+build-time C++ ABI flag describes the PyTorch interpreter used
+for compilation; a vendor libtorch bundle may have a separate ABI provenance
+that must be checked against the vendor SDK. This manifest does not prove host
+driver compatibility.
+
+Inspect a wheel before importing its native extension:
+
+```bash
+python scripts/tools/torch-fl-preflight --wheel dist/torch_fl-*.whl --platform cuda \
+  --sdk-version 13.3 --check-installed
+```
+
+`--check-installed` checks declared dependency ranges, warns when an installed
+optional package differs from the build environment, and warns when PyTorch is
+within the declared range but not the exact build version. `--check-build-env`
+requires exact build dependency versions and is used by every wheel CI job.
+`--require-sdk` rejects wheels without a declared SDK version. The CLI lives in
+`scripts/tools/torch-fl-preflight` and is installed as the `torch-fl-preflight`
+command. It runs without importing `torch_fl`, so checks do not trigger backend
+import side effects. SDK/driver compatibility still requires platform-specific testing.
+Generate a release table from the final wheel files with
+`python scripts/tools/torch-fl-preflight --wheel dist/*.whl --release --markdown-table`;
+the command fails if any artifact lacks its required provenance.
 
 ## Platform Matrix
 
@@ -24,13 +69,14 @@
 |---|---|---|---|---|---|---|---|---|
 | NVIDIA CUDA | `FLAGOS_ACCELERATOR=cuda` (default) | CUDA boxing over an external `libtorch_cuda.so` | Stable | Experimental (inductor GPU device registered; no CI test step) | Beta (FlagCX + NCCL fallback, DDP live-verified) | Stable (CUPTI parity) | Beta (Python + C++ dispatch paths) | Stable |
 | MetaX | `FLAGOS_ACCELERATOR=metax` | CUDA boxing via `cu-bridge` against the vendor libtorch | Stable (FP16/BF16 autocast and GradScaler measured in boxing mode) | Experimental (vendor Triton and FlagTree MetaX measured on C550; vendor Triton CI-covered) | Experimental (NCCL-shaped `mccl` fallback; not CI-covered) | Experimental (MCPTI parity measured on C550; not CI-covered) | Experimental (Python dispatch; not CI-tested on MetaX) | Stable |
-| Ascend | `FLAGOS_ACCELERATOR=ascend` | Native ACLNN operator backend, FlagGems via FlagTree (Triton 3.5) | Stable (CI-covered ops, RNG suite) | Experimental (inductor measured on 910 against triton-ascend 3.2.0 only; **not** revalidated on FlagTree, three toolchain workarounds, serial compile, no CI step) | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Runtime only (device/runtime events not emitted; profiler parity suite excluded from CI) | Beta (Python dispatch; FlagGems-first conf, float64 routes fall back to ACLNN) | Beta |
+| Ascend | `FLAGOS_ACCELERATOR=ascend` | Native ACLNN operator backend, FlagGems via FlagTree (Triton 3.5) | Stable (CI-covered ops, RNG suite) | Experimental (inductor measured on 910 against triton-ascend 3.2.0 only; **not** revalidated on FlagTree, three toolchain workarounds, serial compile, no CI step) | Experimental (HCCL fallback; architectural routing only, no collective-level CI) | Beta (MSPTI kernel/runtime/flow/memcpy events plus device-time linkage, all CI-covered by the shared contract; parity suite excluded from CI) | Beta (Python dispatch; FlagGems-first conf, float64 and bool `neg` routes fall back to ACLNN) | Beta |
 | PPU | `FLAGOS_ACCELERATOR=ppu` | Same CUDA-boxing path as NVIDIA CUDA, against the PPU's CUDA-13-compatible SDK, bundling its own libtorch | Experimental (FP16/BF16 autocast and GradScaler measured on PPU hardware, not in CI) | Not validated | Experimental (NCCL fallback via vendor-adapted `libnccl.so.2`; not CI-covered) | Not validated on this vendor's tracer | Experimental (vendor-index Triton required) | Experimental |
 | Hygon DCU | `FLAGOS_ACCELERATOR=dcu` | CUDA boxing over the hipified DTK torch build (HIP kernels under the CUDA dispatch key) | Beta (including FP16/BF16 autocast and GradScaler) | Experimental (FlagTree HCU validated on `gfx936`; not in CI) | Experimental (RCCL via DTK; all_reduce/DDP measured on 2 cards, not in CI) | Beta (parity suite runs in CI) | Beta (Python dispatch only) | Beta |
+| Kunlunxin (Kunlun P800) | `FLAGOS_ACCELERATOR=kunlunxin` | CUDA boxing against the Kunlun XPU SDK's CUDA-shaped runtime | Experimental (device count, device index, allocation and host↔device copy measured on a P800 OAM; eager ops not validated — the box's vendor XPU runtime is torch-2.9-bound; not in CI) | Not validated | Not validated | Experimental (CUPTI arm hardened to degrade gracefully when the vendor profiler is unconfigured; not measured on hardware) | Not validated (FlagGems route deferred to a follow-up; the config claims no FlagGems route) | Experimental |
 | Enflame GCU | `FLAGOS_ACCELERATOR=gcu` | Native `libtopsaten.so` operator backend, with CPU fallback for unrouted/int64/float64 ops | Beta (operator, RNG, factory, and AMP suites CI-guarded on S60) | Not validated | Not validated | Runtime only (TOPSPTI collects activities; no device events on a CPU-only Kineto build) | Experimental (Python dispatch, requires vendor Triton) | Beta |
 | Moore Threads MUSA | `FLAGOS_ACCELERATOR=musa` | Native `mudnn` operator backend, with CPU fallback for unrouted ops | Experimental (including FP16/BF16 autocast and GradScaler measured on MTT S5000) | Experimental (MThreads FlagTree forward/backward measured on MTT S5000; vendor runtime required) | Not validated | Experimental (MUPTI device timeline measured on MTT S5000; CPU-Kineto linkage is environment-dependent) | Experimental (Python dispatch, requires vendor Triton) | Experimental |
 | D-Robotics BPU | `FLAGOS_ACCELERATOR=bpu` | No eager kernel sets are built; eager ops run on CPU | Runtime only (CPU fallback for eager) | Experimental (`torch.compile(backend="bpu")` graph path via hbdk4) | Not applicable | Not validated | Not applicable (no per-op kernel build) | Runtime only |
-| TsingMicro | `FLAGOS_ACCELERATOR=tsingmicro` | Runtime/build selector present; no per-op kernel set documented | Runtime only | Not validated | Not validated | Not validated | Not applicable | Runtime only |
+| TsingMicro | `FLAGOS_ACCELERATOR=tsingmicro` | FlagGems-only through a vendor FlagTree/Triton build; no vendor-native kernel fallback | Experimental (matmul and reduction routes measured on TX8; pointwise routes blocked by the `empty_like` registration gap) | Not validated | Not validated | Not validated | Experimental (Python dispatch via the `torch.txda` shim; no CI) | Experimental |
 
 ## Platform Notes
 
@@ -102,10 +148,22 @@ path is not enabled in CI, so those tests run against the native ACLNN backend. 
 (Qwen3) validation exists as a point measurement outside CI — training at 0.82x `torch_npu` on
 real Ascend 910 hardware (`tests/perf/e2e_qwen3_train_ascend.py`) — but
 [`.github/configs/ascend.yml`](../../.github/configs/ascend.yml) (line 110) explicitly defers
-Qwen3 inference/training smoke pending a model mount on the CI runner. Profiler parity is
-explicitly out of scope: the Ascend profiler path does not yet emit device-side event
-categories, and `test_profiler_parity.py` is excluded from CI until it does (same file, lines
-112-117). Distributed support recommends the FlagCX path (see
+Qwen3 inference/training smoke pending a model mount on the CI runner. Profiler *parity* is
+still out of scope — `test_profiler_parity.py` is a diff against a torch-cuda baseline, and
+only the CUDA-boxing platforms can run one — and remains excluded from CI (same file, lines
+112-117). The shared profiler *contract* does run, and the device side of it is live: MSPTI
+emits named kernel, runtime/API, flow, and (under the process-start preload above) memcpy
+activity, and the step was measured on 910 at `11 passed, 1 skipped`. The skip is
+`gpu_memset`, a correct-by-design consequence of routing `torch.zeros()` through
+`aclnnInplaceZero` rather than the allocator (see
+[`docs/architecture/profiler.md`](../architecture/profiler.md)). The device-time
+linkage case is one of the eleven that assert: MSPTI used to stamp every launch with
+the id of the CPU op that started after it, which turned out to be this repository's
+defect rather than the vendor's — `popCorrelation` passed a null out-parameter, which
+CANN rejects without unwinding, so the external-correlation stack grew for the life of
+the process (issue #425). With the pop fixed, the launching
+operator owns its device events and the case asserts on this platform. Distributed support
+recommends the FlagCX path (see
 [`docs/architecture/distributed-flagcx.md`](../architecture/distributed-flagcx.md), lines
 204-208); the native HCCL fallback and the `flagos→npu` zero-copy view are architectural
 routing, not on-hardware-verified collectives (same file, lines 67-75).
@@ -201,6 +259,49 @@ FlagTree-specific result/device checks. The FlagTree wheel must replace the
 active `triton` installation before Python starts; the current DCU CI image
 uses DTK Triton and does not exercise this path.
 
+### Kunlunxin (Kunlun P800)
+
+Kunlunxin has its own `FLAGOS_ACCELERATOR=kunlunxin` value (see
+[`setup.py`](../../setup.py)) and rides the CUDA-boxing path: the P800 XPU SDK
+exposes a CUDA-shaped runtime (`cuda_runtime.h` plus a `libcudart.so.12`
+compatibility shim) and the Kunlun vendor torch registers its kernels under the
+CUDA dispatch key, so the generated PrivateUse1 → CUDA boxing kernels dispatch
+into the vendor libtorch with no handwritten per-operator kernels. The build
+takes the host compiler and does not need `nvcc`. FlagGems C++ stays off
+(`FLAGOS_BUILD_FLAGGEMS_CPP=OFF`, since the XPU SDK ships no `liboperators.so`).
+
+The default config,
+[`torch_fl/configs/backends_kunlunxin.conf`](../../torch_fl/configs/backends_kunlunxin.conf),
+routes every covered op to the `cuda` boxing key. Kunlunxin is deliberately
+absent from `FLAGGEMS_PYTHON_PLATFORMS` in
+[`scripts/codegen/gen_vendor_confs.py`](../../scripts/codegen/gen_vendor_confs.py),
+so no operator is rerouted to a FlagGems backend: the measured FlagGems allowlist
+is a follow-up PR. There is no `.github/configs/kunlunxin.yml`, so no CI job
+validates this platform; the measured scope is the build-from-source smoke
+harness in [`docs/vendors/kunlunxin/installation.md`](../vendors/kunlunxin/installation.md).
+
+The XPU SDK ships a CUPTI-compatible profiler shim, so kunlunxin is armed by the
+same CUPTI tracer as `cuda` / `metax` / `ppu`. That shim's context manager
+(`checkRuntimeProfilerEnv`) **throws** — rather than returning a `CUptiResult` —
+when the vendor profiler is not enabled, which killed the interpreter at module
+load: the arm runs from a static initializer, and an exception escaping one calls
+`std::terminate`. `csrc/profiler/cupti_device_tracer.cc` now wraps the arm and
+records whether it succeeded, so a misconfigured vendor profiler degrades to
+"tracer not armed" (`available()` is false, `start()` is a no-op) instead of
+aborting `import torch_fl`. On `cuda` / `metax` / `ppu` the wrapper is inert,
+because real CUPTI reports refusals as return codes and never throws.
+
+**Runtime measurement boundary.** On the P800 box used for the port the vendor
+XPU runtime is built against torch 2.9: the vendor overlay's `torch_xmlir`
+extension fails to load against a stock torch 2.10 with an undefined ATen `_ops`
+symbol (`at::_ops::triu_::redispatch`). The port therefore measures the build,
+`import torch_fl`, backend-config selection, and the boxing device layer (device
+count, device index, allocation, host↔device copy) on real hardware; eager
+operators that reach ATen's CUDA dispatch (for example `torch.mm` → the vendor
+BLAS) require a vendor torch 2.10 runtime and are **not validated** here. The
+boxing device layer routes through the port's own `csrc/runtime/` CUDA sources and
+the XPU driver shim, which is why it runs where the ATen path does not.
+
 ### Enflame GCU
 
 [`.github/configs/gcu.yml`](../../.github/configs/gcu.yml) builds an isolated CPU-PyTorch wheel
@@ -284,13 +385,30 @@ evidence above is from on-board measurement, not continuous validation.
 ### TsingMicro
 
 TsingMicro has a build selector (`FLAGOS_ACCELERATOR=tsingmicro`) and links against the Kuiper SDK
-(see [`CMakeLists.txt`](../../CMakeLists.txt), lines 196-216), but
-[`setup.py`](../../setup.py) (lines 367-375) disables every kernel set for it, mirroring the
-same "no per-op kernel to call" treatment documented for BPU (see
-[`docs/vendors/bpu/integration.md`](../vendors/bpu/integration.md), lines 37-43). There is no
-recoverable current install or test guide, and no CI manifest, for this platform. It is marked
-**Runtime only**, and setup and operator validation should be treated as not currently
-documented.
+(see [`CMakeLists.txt`](../../CMakeLists.txt), lines 196-216). Unlike BPU, it does have an
+eager operator path: the wheel registers the full generated PrivateUse1 op list (the
+`#else` branch of [`csrc/aten/register.cc`](../../csrc/aten/register.cc)) and
+[`torch_fl/configs/backends_tsingmicro.conf`](../../torch_fl/configs/backends_tsingmicro.conf)
+routes those ops to FlagGems. There is no vendor-native kernel set to fall back to —
+TsingMicro's compute path is FlagGems through a vendor FlagTree/Triton build, and a build
+that cannot reach FlagGems has nothing behind it.
+
+The routing works, but the registration set does not. Because the full generated list is
+claimed on PrivateUse1 while FlagGems supplies no kernel for `empty_like`, that op resolves
+through the dispatcher to the CUDA boxing kernel, which needs a CUDA runtime a TsingMicro
+CPU-torch build does not have, so it raises `NotImplementedError: Could not run
+'aten::empty_strided' with arguments from the 'CUDA' backend`. Every FlagGems kernel that
+allocates its output through `torch.empty_like` (FlagGems' `pointwise_dynamic`, used by
+`add`/`mul`/`silu`/`softmax` and the rest of the pointwise family) is therefore
+unreachable, and `cat`/`rms_norm` fail through CUDA calls for the same reason. The
+matmul family and the reductions that allocate differently (`mm`, `bmm`, `sum`, `mean`,
+`randn`) do run and match the CPU reference. The registration subsetting that would fix
+the rest — a TsingMicro-scoped `tsingmicro_flaggems_register.inc`, as MUSA uses — is not
+part of this change; see the TsingMicro row in
+[`docs/reference/operator-support.md`](operator-support.md) for the measured split.
+
+This was measured on a TX8 host, not in CI. There is no CI manifest, and no current
+installation or test guide, for this platform.
 
 ## Reading the Matrix
 

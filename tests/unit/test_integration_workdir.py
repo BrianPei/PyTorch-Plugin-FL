@@ -47,15 +47,28 @@ and this module holds each command to whichever one it chose.
 These checks are static on purpose: they must run anywhere, without a device or
 a network.
 
+The second half of the module is the same kind of guard for a different
+failure, recorded as issue #391: a manifest enumerates what it runs rather than
+sweeping the tree, so an integration test file added at the top level of
+``tests/integration/`` reached no CI job at all. Three multi-device contract
+files sat that way for their whole existence, and the defect class they cover --
+an op that reads or writes across devices -- faults the device or silently
+returns its result on the wrong device rather than raising, so nothing went red.
+The check below requires every integration test file to be reachable from at
+least one manifest, against an explicit list of the ones that are known not to
+be, so the next orphan fails instead of hiding.
+
 Nothing here imports a YAML parser, for the reason ``load-platform-tests.yml``
 gives for running its own parsing off the vendor image: the accelerator
 containers are not required to carry a YAML dependency, and this file runs
 inside one of them.
 """
 
+import itertools
 import re
 import shlex
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -63,14 +76,19 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / ".github/workflows"
 _CONFIG_DIR = _REPO_ROOT / ".github/configs"
+_INTEGRATION_DIR = _REPO_ROOT / "tests/integration"
 
 _PREPARE_STEP = "Prepare wheel-only test workspace"
 # `platform: dcu`, the input the workflow passes to load-platform-tests.yml.
 _PLATFORM_RE = re.compile(r"^\s*platform:\s*([A-Za-z0-9_]+)\s*$", re.MULTILINE)
 # A column-0 YAML key, used to delimit a top-level block.
 _TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z_][\w-]*:")
-# A folded or literal scalar: `command: >-`, `command: |`.
-_SCALAR_KEY_RE = re.compile(r"\s*command:\s*[>|][-+]?\s*")
+# A `command:` key and its value. The value is either a block indicator, as in
+# `command: >-` or `command: |`, or a plain scalar on the same line. Both forms
+# are in use, and a reader that knew only one would silently skip whole steps.
+_COMMAND_KEY_RE = re.compile(r"\s*command:\s*(\S.*?)\s*$")
+# A block scalar indicator: `>`, `>-`, `|`, `|+`.
+_BLOCK_INDICATOR_RE = re.compile(r"[>|][-+]?")
 # A repository script named by a manifest command.
 _SCRIPT_RE = re.compile(r"\.github/scripts/[\w./-]+")
 # A command that leaves the prepared workspace for the checkout.
@@ -181,6 +199,11 @@ def _manifest_commands(platform: str) -> list[str]:
     Only that block is read. The neighbouring top-level ``setup_script`` key
     names a script too, but that one is not executed from this workspace, so
     requiring it to be copied would be wrong.
+
+    Both scalar forms are read. A step written as a plain ``command: python -m
+    pytest ...`` is as much of an instruction as the folded one beside it, and
+    reading only the folded form drops it -- which for the reachability check
+    below means a file named solely by such a step looks like an orphan.
     """
     config = _CONFIG_DIR / f"{platform}.yml"
     if not config.is_file():
@@ -192,7 +215,14 @@ def _manifest_commands(platform: str) -> list[str]:
         if _TOP_LEVEL_KEY_RE.match(line):
             in_tests = line.startswith("integration_tests:")
             continue
-        if not in_tests or not _SCALAR_KEY_RE.fullmatch(line):
+        if not in_tests:
+            continue
+        key = _COMMAND_KEY_RE.fullmatch(line)
+        if key is None:
+            continue
+        value = key.group(1)
+        if not _BLOCK_INDICATOR_RE.fullmatch(value):
+            commands.append(value)
             continue
         body = _block_after(lines, index, _indent(line))
         commands.append(" ".join(row.strip() for row in body if row.strip()))
@@ -301,3 +331,393 @@ def test_the_prepare_step_still_copies_the_tests_it_was_written_for():
     """The original purpose of the step, kept so a rewrite cannot drop it."""
     for workflow, _platform, script in _prepare_steps():
         assert "tests" in _copied_paths(script), workflow
+
+
+# ---------------------------------------------------------------------------
+# Manifest reachability (issue #391)
+#
+# A manifest enumerates the files it runs; only `tests/integration/ops/` is
+# swept as a directory. A test file added at the top level of
+# `tests/integration/` therefore runs nowhere until someone names it, and three
+# multi-device contract files spent their whole existence that way. The check
+# below requires every file under `tests/integration/` to be selected by at
+# least one manifest command, against an explicit list of the ones that are
+# known not to be.
+#
+# Reachability is modelled, not measured -- there is no pytest here. A command
+# selects a file when its paths cover it and the file carries a mark its `-m`
+# expression accepts. Both halves deliberately over-approximate: a false
+# "reachable" is a gap left for later, while a false "unreachable" is a red
+# build that says so. The failure mode this must never have is silence.
+# ---------------------------------------------------------------------------
+
+# `pytest.mark.<name>` in source form: the only mark spelling that can be read
+# without importing the file.
+_MARK_RE = re.compile(r"pytest\.mark\.([A-Za-z_]\w*)")
+# Marks that configure a case rather than select it. `-m parametrize` would
+# match nothing on purpose, so seeing one says nothing about whether a sweep's
+# `-m` expression picks the file up.
+_NON_SELECTING_MARKS = frozenset(
+    {
+        "parametrize",
+        "skip",
+        "skipif",
+        "xfail",
+        "usefixtures",
+        "filterwarnings",
+        "timeout",
+        "tryfirst",
+        "trylast",
+    }
+)
+# A marker-expression token: a mark name, a parenthesis, or an operator.
+_MARKER_TOKEN_RE = re.compile(r"[A-Za-z_]\w*|[()]")
+# pytest options whose value is a separate token. Without this the token after
+# `--deselect tests/integration/ops/test_x.py::TestX` reads as a file the
+# command runs, which would credit a file the command explicitly drops.
+_OPTIONS_WITH_VALUES = frozenset(
+    {
+        "-m",
+        "-k",
+        "-c",
+        "-p",
+        "-n",
+        "--deselect",
+        "--ignore",
+        "--ignore-glob",
+        "--rootdir",
+        "--junitxml",
+    }
+)
+
+
+class _Selection(NamedTuple):
+    """One manifest command, as what it hands to pytest."""
+
+    paths: tuple[str, ...]
+    marker: str | None
+    ignored: tuple[str, ...]
+
+
+def _pytest_arguments(command: str) -> list[str]:
+    """The arguments after ``pytest`` in a manifest command, or none.
+
+    The literal ``python -m pytest`` shape is required, so an environment probe
+    that merely mentions pytest in a heredoc is not read as an invocation.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        # An unbalanced quote somewhere in a heredoc body, so not a pytest
+        # invocation -- and not something to fail a reachability check over.
+        return []
+    for index, token in enumerate(tokens):
+        if token.rsplit("/", 1)[-1] != "pytest":
+            continue
+        if (
+            index >= 2
+            and tokens[index - 1] == "-m"
+            and tokens[index - 2].endswith("python")
+        ):
+            return tokens[index + 1 :]
+    return []
+
+
+def _integration_target(token: str) -> str | None:
+    """A pytest argument as a repository-relative path under ``tests/integration``.
+
+    A node id targets the file before its first ``::``, so that is what is
+    resolved. Anything landing outside ``tests/integration`` -- ``tests/unit/``,
+    ``$MODEL_PATH`` -- is not this check's business and returns None.
+    """
+    candidate = token.split("::", 1)[0]
+    if not candidate or candidate.startswith("-"):
+        return None
+    parts = Path(candidate).parts
+    root = _INTEGRATION_DIR.relative_to(_REPO_ROOT).parts
+    if parts[: len(root)] != root:
+        return None
+    return "/".join(parts)
+
+
+def _selection_of(command: str) -> _Selection | None:
+    """A manifest command split into the paths and filter it runs, or None."""
+    arguments = _pytest_arguments(command)
+    if not arguments:
+        return None
+    paths: list[str] = []
+    ignored: list[str] = []
+    marker: str | None = None
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in _OPTIONS_WITH_VALUES:
+            # Every one of these takes the next token, but only `-m` says
+            # anything about which files the command runs.
+            if token == "-m" and index + 1 < len(arguments):
+                marker = arguments[index + 1]
+            index += 2
+            continue
+        if token.startswith("--ignore="):
+            ignored.append(token.split("=", 1)[1])
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        target = _integration_target(token)
+        if target is not None:
+            paths.append(target)
+        index += 1
+    return _Selection(tuple(paths), marker, tuple(ignored))
+
+
+def _manifest_selections(platform: str) -> list[_Selection]:
+    """What every pytest invocation in one platform's manifest runs."""
+    selections = []
+    for command in _manifest_commands(platform):
+        selection = _selection_of(command)
+        if selection is not None:
+            selections.append(selection)
+    return selections
+
+
+def _manifest_platforms() -> list[str]:
+    """Every platform manifest, by the name its file carries."""
+    return sorted(path.stem for path in _CONFIG_DIR.glob("*.yml"))
+
+
+def _marks_of(test_file: Path) -> set[str]:
+    """The selecting marks a test file carries, read textually off the source.
+
+    Over the whole file rather than per case: the question is whether *any*
+    case in the file is collected, and answering it exactly would mean
+    importing the file, which needs the device this check must not require.
+    """
+    return {
+        name
+        for name in _MARK_RE.findall(test_file.read_text(encoding="utf-8"))
+        if name not in _NON_SELECTING_MARKS
+    }
+
+
+def _evaluate(expression: str, marks: set[str]) -> bool:
+    """What pytest's ``-m`` would answer for a case carrying exactly ``marks``.
+
+    Only the grammar the manifests use: mark names, ``and``, ``or``, ``not``,
+    and parentheses. A name is true when the case carries it.
+    """
+    tokens = _MARKER_TOKEN_RE.findall(expression)
+    position = 0
+
+    def atom() -> bool:
+        nonlocal position
+        assert position < len(tokens), f"unbalanced marker expression: {expression!r}"
+        token = tokens[position]
+        position += 1
+        if token == "(":
+            value = disjunction()
+            assert position < len(tokens) and tokens[position] == ")", (
+                f"unbalanced marker expression: {expression!r}"
+            )
+            position += 1
+            return value
+        if token == "not":
+            return not atom()
+        assert token not in ("and", "or"), (
+            f"malformed marker expression: {expression!r}"
+        )
+        return token in marks
+
+    def conjunction() -> bool:
+        nonlocal position
+        value = atom()
+        while position < len(tokens) and tokens[position] == "and":
+            position += 1
+            # Evaluated before the `and`, not after: Python would short-circuit
+            # past the call and leave the cursor on the operand it never read.
+            following = atom()
+            value = value and following
+        return value
+
+    def disjunction() -> bool:
+        nonlocal position
+        value = conjunction()
+        while position < len(tokens) and tokens[position] == "or":
+            position += 1
+            following = conjunction()
+            value = value or following
+        return value
+
+    result = disjunction()
+    assert position == len(tokens), (
+        f"trailing tokens in marker expression: {expression!r}"
+    )
+    return result
+
+
+def _selects(expression: str, marks: set[str]) -> bool:
+    """Whether any case in a file carrying ``marks`` survives ``expression``.
+
+    Asked of every subset of the file's marks rather than of their union, and
+    that is not a detail: the union is wrong in the direction that matters.
+    ``ops/test_acos_dispatch.py`` carries ``anyplatform`` on one class and
+    ``flaggems_python`` on another, so the union makes ``(anyplatform or
+    main_ops) and not flaggems_python`` false and the file reads as an orphan
+    -- while pytest collects 8 of its 11 cases under exactly that filter.
+    Every subset is a superset of the marks one case can carry, so this errs
+    towards "reachable": that can leave a gap, which is the status quo, where
+    the reversed error is a red build over a file that does run.
+    """
+    names = sorted(marks)
+    for size in range(len(names) + 1):
+        for subset in itertools.combinations(names, size):
+            if _evaluate(expression, set(subset)):
+                return True
+    return False
+
+
+def _names_target(relative: str, target: str) -> bool:
+    """Whether a pytest target covers a file, by name or as a directory above it."""
+    return relative == target or relative.startswith(target.rstrip("/") + "/")
+
+
+def _test_file_paths() -> set[str]:
+    """Every integration test file, relative to the repository root."""
+    return {
+        path.relative_to(_REPO_ROOT).as_posix()
+        for path in _INTEGRATION_DIR.rglob("test_*.py")
+    }
+
+
+def _reachable_test_files() -> set[str]:
+    """Every integration test file at least one manifest command would run."""
+    files = {
+        relative: _marks_of(_REPO_ROOT / relative)
+        for relative in sorted(_test_file_paths())
+    }
+    reachable = set()
+    for platform in _manifest_platforms():
+        for selection in _manifest_selections(platform):
+            for relative, marks in files.items():
+                if any(_names_target(relative, skip) for skip in selection.ignored):
+                    continue
+                if not any(_names_target(relative, path) for path in selection.paths):
+                    continue
+                if selection.marker is not None and not _selects(
+                    selection.marker, marks
+                ):
+                    continue
+                reachable.add(relative)
+    return reachable
+
+
+# Files no manifest selects, each with the reason it is left that way. This is
+# the ratchet: the check below is green while it matches reality exactly, and
+# goes red the moment either half drifts -- a new orphan it has not been told
+# about, or an entry here that has since been wired in.
+#
+# What is left after issue #409 worked the list #391 left behind is the
+# environment group, and nothing else: files a job cannot run as the images and
+# mounts stand. None of them is waiting on a code change, so the entry *is* the
+# decision and is written as one, rather than as a task someone forgot.
+_KNOWN_UNREACHABLE: dict[str, str] = {
+    "tests/integration/test_apex_compat.py": (
+        "needs NVIDIA apex and its amp_C extension, and no CI platform is "
+        "NVIDIA: flagos boxes its device onto CUDA while carrying a CPU "
+        "PyTorch, as cuda.yml's own version assertion states. Accepted "
+        "exclusion unless a job that installs apex is added"
+    ),
+    "tests/integration/test_fallback_trace.py": (
+        "needs --model and a mounted Qwen3 checkpoint, which only the CUDA "
+        "runner mounts; wiring it in needs a step on that manifest and a "
+        "decision about what the other six do with it"
+    ),
+    "tests/integration/test_fallback_trace_train.py": (
+        "needs --model and a mounted Qwen3 checkpoint; same as test_fallback_trace.py"
+    ),
+    "tests/integration/test_profiler_qwen3_infer.py": (
+        "needs --model and a mounted Qwen3 checkpoint; same as test_fallback_trace.py"
+    ),
+    "tests/integration/ops/test_flaggems_cpp_dispatch.py": (
+        "carries only flaggems_cpp, and every set_env_*.sh builds FlagGems "
+        "without its C++ path (FLAGOS_BUILD_FLAGGEMS_CPP=0). Accepted "
+        "exclusion until one job opts into that build"
+    ),
+    "tests/integration/ops/test_musa_flaggems.py": (
+        "documented in musa.yml as held back until the image ships the vendor "
+        "triton stack; added now it would record a pass that measured nothing"
+    ),
+}
+
+
+def test_the_reachability_reader_sees_what_the_manifests_actually_ask_for():
+    """A reader that quietly found nothing would make the check below vacuous.
+
+    Every manifest runs at least one sweep by marker, so a reading that missed
+    them -- or one that stopped seeing ``-m`` -- has to fail here rather than
+    report a clean tree.
+
+    Both scalar forms have to be read too. ``command: python -m pytest ...`` on
+    one line is as much of an instruction as the folded ``>-`` form beside it,
+    and this reader used to know only the folded one -- which mattered as soon
+    as the check below started asking the same reader which files run, because a
+    file named solely by a plain-scalar step then reads as an orphan. The
+    Ascend manifest names ``test_factory_ops.py`` that way and in no other.
+    """
+    commands = _manifest_commands("ascend")
+    assert commands, "the reader found no command at all in the Ascend manifest"
+    plain = "python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short"
+    assert plain in commands, (
+        "the plain-scalar `command:` form went unread; the reader sees "
+        f"{[command for command in commands if 'test_factory_ops' in command]!r}"
+    )
+    selections = _manifest_selections("ascend")
+    assert selections, "the reader found no pytest invocation in the Ascend manifest"
+    assert any(selection.paths and selection.marker for selection in selections), (
+        "the reader saw no marker-filtered sweep, so nothing below is being tested"
+    )
+    assert _reachable_test_files(), "the reader found no reachable file at all"
+
+
+def test_no_integration_test_file_is_orphaned_from_every_manifest():
+    """Every test file under tests/integration/ has to be run by some job.
+
+    A manifest lists what it runs, so a file reaches CI only by being named --
+    and the cases that go missing this way are the quiet ones. The three
+    multi-device files behind issue #391 assert that an op reads and writes on
+    the device it was handed; a violation faults the device or returns the
+    result on the wrong one, so the files existed for months without a red
+    build to say they never ran.
+    """
+    undeclared = sorted(
+        path
+        for path in _test_file_paths() - _reachable_test_files()
+        if path not in _KNOWN_UNREACHABLE
+    )
+    assert not undeclared, (
+        f"{undeclared} are selected by no manifest command, so no CI job runs "
+        "them; wire each one into the platforms that have the hardware, or add "
+        "it to _KNOWN_UNREACHABLE with the reason it cannot be"
+    )
+
+
+def test_the_known_unreachable_list_has_not_gone_stale():
+    """The exclusions have to be re-earned, or they outlive their reasons.
+
+    Both directions rot the same way: an entry whose file is now reachable
+    documents a gap that no longer exists, and an entry naming a file that is
+    gone is a stale path pretending to be a decision.
+    """
+    reachable = _reachable_test_files()
+    wired_in = sorted(path for path in _KNOWN_UNREACHABLE if path in reachable)
+    assert not wired_in, (
+        f"{wired_in} are reachable now, so their entries in _KNOWN_UNREACHABLE "
+        "describe a gap that has closed; drop them"
+    )
+    vanished = sorted(
+        path for path in _KNOWN_UNREACHABLE if not (_REPO_ROOT / path).is_file()
+    )
+    assert not vanished, (
+        f"{vanished} are listed in _KNOWN_UNREACHABLE but do not exist any more"
+    )

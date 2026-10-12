@@ -45,7 +45,7 @@ jobs:
       - mt-8g-cicd-pytorch
     timeout-minutes: ${{ inputs['timeout-minutes'] }}
     container:
-      image: registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
+      image: registry.mthreads.com/mcconline/musa-pytorch-release-public@sha256:13f7375aab77a4ace7084558eb939a977467330f558a3c2a185c6c6d31ec8935
       options: >-
         --privileged
         --ipc=host
@@ -68,30 +68,33 @@ jobs:
         run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
       # Cache pip downloads across runs. The cache only skips the download,
-      # not the install, so the environment prepared by set_env_musa.sh is
+      # not the install, so the environment prepared by set_env.sh is
       # still rebuilt fresh each run. PIP_CACHE_DIR is persisted to
       # $GITHUB_ENV by the setup script and points at RUNNER_TEMP, which the
       # container owns; /github/home is not writable by the runtime user on
       # this image, so without that redirect pip disables its cache there.
       #
-      # set_env_musa.sh is hashed because the real version pins live there;
-      # without it a pin bump leaves the key unchanged, the exact-hit skips the
+      # The platform hook and shared version pins are hashed because
+      # dependency changes must invalidate the cache; otherwise a pin bump leaves the key unchanged, the exact-hit skips the
       # save, and the newly downloaded wheels are discarded every run.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: musa-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_musa.sh') }}
+          key: musa-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_musa.sh') }}
           restore-keys: |
             musa-pip-${{ runner.os }}-
 
       - name: Prepare MUSA build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_musa.sh
+        run: bash .github/scripts/set_env.sh --platform musa
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform musa --check-build-env
 
       - name: Install wheel
         run: python -m pip install --force-reinstall --no-deps dist/*.whl

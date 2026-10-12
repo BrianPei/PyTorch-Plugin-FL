@@ -222,6 +222,14 @@ def test_musa_registers_all_flaggems_ops_except_known_failures():
         internally and mudnn's CAST has no UInt16/32/64 case, so the cast raises
         before the sort runs. mudnn's own sort is correct here; argsort and
         msort decompose onto sort.
+      - where.self_out: added 2026-09-19 from the MUSA CI run (flag_gems
+        5.4.0rc2.post1+g437ba3938), not from a MTT S5000 sweep like the entries
+        above -- the wrapper computes the broadcast shape only when `out is
+        None` and hands a caller-supplied destination straight to
+        `pointwise_dynamic.prepare_args`, which validates instead of resizing,
+        so ATen's out= contract (grow a wrong-sized `out`) raises. This is a
+        contract gap rather than a failure of the kernel's arithmetic, and
+        mudnn's ternary SELECT serves the overload.
 
     index_add/index_add_ and randn/randn_like were removed from this set on
     2026-09-15: re-measured on MTT S5000 against both the current FlagGems and
@@ -273,6 +281,8 @@ def test_musa_registers_all_flaggems_ops_except_known_failures():
         "_conj",
         "add.Tensor",
         "add_.Tensor",
+        "addmm",
+        "baddbmm",
         "div.Tensor",
         "div.Tensor_mode",
         "div_.Tensor",
@@ -284,6 +294,7 @@ def test_musa_registers_all_flaggems_ops_except_known_failures():
         "sort.stable",
         "sub.Tensor",
         "sub_.Tensor",
+        "where.self_out",
     }
 
     # Known failures should NOT be routed to flaggems or be registered
@@ -483,6 +494,38 @@ def test_only_registration_subset_platforms_get_a_generated_vendor_conf():
         "backends_tsingmicro.conf must stay hand-written"
     )
     assert " = none" not in text, "tsingmicro registers every op; none would raise"
+
+
+def test_sdpa_composite_is_measured_on_exactly_the_two_platforms_that_took_it():
+    """``scaled_dot_product_attention`` is a hand-held measurement, per platform.
+
+    The op is a composite whose fused-backend selection runs inside it, so it is
+    outside the FlagGems coverage ceiling no coverage scan can see, and
+    ``boxing_measured_python_ops`` is the only thing that can route it at all.
+    That makes it exactly the kind of route that leaks: widening the function to
+    hand back one set for every platform would route MetaX's measurement on DCU
+    and DCU's on MetaX, and routing it on a third platform would claim a kernel
+    nobody measured there.
+    """
+    assert g.METAX_COMPOSITE_FLAGGEMS == {"scaled_dot_product_attention"}
+    assert g.DCU_COMPOSITE_FLAGGEMS == {"scaled_dot_product_attention"}
+    assert g.boxing_measured_python_ops("backends_metax.conf") == (
+        g.METAX_FLAGGEMS_MEASURED | g.METAX_COMPOSITE_FLAGGEMS
+    )
+    assert g.boxing_measured_python_ops("backends_dcu.conf") == (
+        g.DCU_COMPOSITE_FLAGGEMS
+    )
+    # Named the other way round on purpose: a platform that never measured the
+    # op gets nothing, and backends_metax.conf's set must not arrive here.
+    assert g.boxing_measured_python_ops("backends_musa.conf") == set()
+
+    built = g.build_all(CONF_DIR)
+    for platform, (_, routes, _) in built.items():
+        route = routes["scaled_dot_product_attention"].split("#", 1)[0].strip()
+        if platform in ("dcu", "metax"):
+            assert route == "flaggems", f"{platform} routes the op to {route}"
+        else:
+            assert route != "flaggems", f"{platform} took a route it never measured"
 
 
 def test_metax_conf_keeps_mm_boxed():

@@ -38,8 +38,8 @@ way ``test_musa_flaggems.py`` does for the MThreats hybrid path:
    identically on every flagos platform -- see the ``flaggems_runtime_broken``
    entries in ``scripts/codegen_ops.py`` for the per-op diagnosis. The rest fail
    for a reason specific to their gems kernel -- a wrapper that raises, or a
-   result that differs from ATen's -- and are listed per op in the
-   ``metax_triton_fallback`` literal.
+   result that differs from ATen's -- and are listed per op in
+   ``BOXING_GAP_NOTES["metax"]`` in ``scripts/codegen/gen_vendor_confs.py``.
 
 The dispatch log is the oracle for (1) instead of monkeypatching a FlagGems
 callable: ``PythonOpCache::GetFunc`` memoizes the resolved ``py::object`` per
@@ -75,7 +75,8 @@ moved with ``.to("flagos")``, so both arms see identical values, and the cuda ar
 reached with ``FLAGOS_OP_<op>=cuda`` -- and each one **passes on cuda while
 failing on flaggems**, which is what makes the withdrawal a correction rather
 than a preference. The failures fall in three groups, spelled out per op in the
-``metax_triton_fallback`` literal in ``scripts/codegen_ops.py``: four where the
+``BOXING_GAP_NOTES["metax"]`` note in ``scripts/codegen/gen_vendor_confs.py``:
+four where the
 gems kernel asserts its input is a real CUDA tensor and aborts, four where the
 gems wrapper raises on its own argument handling (``nansum.out``,
 ``lu_unpack.out``, ``linalg_matrix_exp.out`` and ``_cdist_forward``), and eight
@@ -259,8 +260,9 @@ _FORCED_OFF_FLAGGEMS = (
     # FlagGems cohort added (see the module docstring). Every one of them PASSES
     # on the cuda boxing route and fails on flaggems, so the hold is a
     # correction; the per-op diagnosis is grouped by cause in the
-    # `metax_triton_fallback` literal in scripts/codegen_ops.py. The groups below
-    # state the *measured* gems verdict, which is what the survey recorded.
+    # `BOXING_GAP_NOTES["metax"]` note in scripts/codegen/gen_vendor_confs.py.
+    # The groups below state the *measured* gems verdict, which is what the
+    # survey recorded.
     #
     # Group 1 -- the gems kernel asserts its input is a real CUDA tensor, so it
     # aborts before computing anything:
@@ -713,11 +715,17 @@ _SDPA_ORACLE = (
     "flag_gems.scaled_dot_product_attention = _sdpa_counting\n"
     "\n"
     # The host reference moves the arguments back rather than rebuilding them, so
-    # both arms of every case see the same values, and an additive mask moves
-    # with them (a bool mask would have to keep its dtype to keep its meaning).
+    # both arms of every case see the same values. A float mask is additive and
+    # moves as a float; a bool mask is a keep/drop mask and only keeps its meaning
+    # if it keeps its dtype, so it moves as a bool (the CPU reference reads one).
     "def host_ref(q, k, v, kw):\n"
-    "    moved = {n: (t.cpu().float() if torch.is_tensor(t) else t)\n"
-    "             for n, t in kw.items()}\n"
+    "    def move(t):\n"
+    "        if not torch.is_tensor(t):\n"
+    "            return t\n"
+    "        if t.dtype == torch.bool:\n"
+    "            return t.cpu()\n"
+    "        return t.cpu().float()\n"
+    "    moved = {n: move(t) for n, t in kw.items()}\n"
     "    return torch.nn.functional.scaled_dot_product_attention(\n"
     "        q.float().cpu(), k.float().cpu(), v.float().cpu(), **moved)\n"
     "\n"
@@ -733,36 +741,84 @@ _SDPA_ORACLE = (
 )
 
 # The cases, and what each one is. `joint()` is the shape Qwen-Image-2512's joint
-# attention has -- bf16, 4-D, head_dim 128, seq 1024, no mask -- and it is the one
-# shape in the set the envelope admits. Every other case differs from it in
-# exactly one respect, so a failing assertion names the clause that let a call
-# through. The mask is additive and all-zero, i.e. numerically a no-op: what the
-# case checks is that a mask *at all* keeps the call off the route, not that the
-# mask is honoured.
+# attention has -- bf16, 4-D, head_dim 128, seq 1024, no mask -- and it is one of
+# the five shapes in the set the envelope admits. Every other case differs from
+# `joint()` in one respect, so a failing assertion names the clause that let a
+# call through; the admitted cases are held at different batches, sequence
+# lengths or head dims from each other so the SHAPES line tells them apart.
+#
+# `joint_masked()` is the reason the mask clause exists: Qwen-Image-2.1's prefill
+# processor passes the joint key-valid row -- 4-D bool, one entry per key -- on
+# every call it makes (transformer_qwenimage21.py:478-560). It is built at a
+# different batch from `joint()` so the two are told apart in the SHAPES line,
+# and it drops keys rather than masking nothing, because an all-True row would
+# exercise the clause without exercising the polarity the conversion has to get
+# right.
+#
+# The other three admitted cases are the widening for issue #394: a head dim
+# other than 128, a sequence shorter than the joint attention's, and fp16. Each
+# is in the probe because `FlagGemsEligible` admits it, and each bound the
+# widening touched is pinned from both sides -- `head_dim8` and `head_dim256`
+# are the first values outside the head-dim bounds, `float32` is the dtype the
+# kernel raises on, and `masked_seq512` is the sequence below the one floor the
+# widening kept.
+#
+# The `mask*` cases below it are the other side of the same clause: each supplies
+# a mask a *caller* may legitimately pass and that the route must refuse. The
+# additive case is 2-D and all-zero, i.e. numerically a no-op, so what it checks
+# is that an additive mask at all keeps the call off the route -- a float mask is
+# broadcast by the kernel, not converted by this route. `mask_4d_bool` has the
+# right dtype and rank but one entry per (query, key) pair rather than per key,
+# which is 1 GiB materialised at the shape the route serves; `mask_row_f32` has
+# the right shape but is the wrong dtype, and a float row carries no keep/drop
+# meaning for the conversion to preserve.
 _SDPA_CASES = (
     "def joint():\n"
     "    return tuple(\n"
     "        torch.randn(1, 2, 1024, 128, device=DEVICE).to(torch.bfloat16)\n"
     "        for _ in range(3))\n"
     'run_case("eligible", joint, {})\n'
+    "def joint_masked():\n"
+    "    return tuple(\n"
+    "        torch.randn(2, 2, 1024, 128, device=DEVICE).to(torch.bfloat16)\n"
+    "        for _ in range(3))\n"
+    "def key_row(n):\n"
+    "    row = torch.ones(1, 1, 1, n, device=DEVICE, dtype=torch.bool)\n"
+    "    row[..., -128:] = False\n"
+    "    return row\n"
+    'run_case("masked", joint_masked, {"attn_mask": key_row(1024)})\n'
     'run_case("head_dim64", lambda: tuple(\n'
     "    torch.randn(1, 2, 1024, 64, device=DEVICE).to(torch.bfloat16)\n"
     "    for _ in range(3)), {})\n"
     'run_case("seq512", lambda: tuple(\n'
     "    torch.randn(1, 2, 512, 128, device=DEVICE).to(torch.bfloat16)\n"
     "    for _ in range(3)), {})\n"
+    'run_case("float16", lambda: tuple(\n'
+    "    torch.randn(3, 2, 1024, 128, device=DEVICE).to(torch.float16)\n"
+    "    for _ in range(3)), {})\n"
     'run_case("float32", lambda: tuple(\n'
     "    torch.randn(1, 2, 1024, 128, device=DEVICE) for _ in range(3)), {})\n"
-    'run_case("float16", lambda: tuple(\n'
-    "    torch.randn(1, 2, 1024, 128, device=DEVICE).to(torch.float16)\n"
-    "    for _ in range(3)), {})\n"
     'run_case("rank2", lambda: tuple(\n'
     "    torch.randn(1024, 128, device=DEVICE).to(torch.bfloat16)\n"
     "    for _ in range(3)), {})\n"
+    'run_case("head_dim8", lambda: tuple(\n'
+    "    torch.randn(1, 2, 1024, 8, device=DEVICE).to(torch.bfloat16)\n"
+    "    for _ in range(3)), {})\n"
+    'run_case("head_dim256", lambda: tuple(\n'
+    "    torch.randn(1, 2, 1024, 256, device=DEVICE).to(torch.bfloat16)\n"
+    "    for _ in range(3)), {})\n"
     'run_case("causal", joint, {"is_causal": True})\n'
-    'run_case("mask", joint,\n'
+    'run_case("masked_seq512", lambda: tuple(\n'
+    "    torch.randn(2, 2, 512, 128, device=DEVICE).to(torch.bfloat16)\n"
+    "    for _ in range(3)), {'attn_mask': key_row(512)})\n"
+    'run_case("mask_additive", joint,\n'
     '         {"attn_mask": torch.zeros(1024, 1024, device=DEVICE,\n'
     "                                   dtype=torch.bfloat16)})\n"
+    'run_case("mask_4d_bool", joint,\n'
+    '         {"attn_mask": torch.ones(1, 2, 1024, 1024, device=DEVICE,\n'
+    "                                   dtype=torch.bool)})\n"
+    'run_case("mask_row_f32", joint,\n'
+    '         {"attn_mask": torch.zeros(1, 1, 1, 1024, device=DEVICE)})\n'
     "print(f'SHAPES {_sdpa_calls}')\n"
 )
 
@@ -771,18 +827,25 @@ _SDPA_CASES = (
 # kernel fails at that case rather than moving a global total.
 _SDPA_CASES_EXPECTED = {
     "eligible": (1, "bf16, 4-D, head_dim 128, seq 1024, no mask"),
-    "head_dim64": (0, "head_dim 64, which `_attn_fwd` tiles differently"),
-    "seq512": (0, "seq 512, under the 1024 the route requires"),
-    "float32": (0, "float32, and the route is bf16-only"),
-    "float16": (0, "float16, and the route is bf16-only"),
+    "masked": (1, "the same class, with the (1,1,1,KV) bool key row 2.1 passes"),
+    "head_dim64": (1, "head_dim 64, inside the route's head_dim bounds"),
+    "seq512": (1, "seq 512, which the route no longer floors"),
+    "float16": (1, "fp16, the second dtype the route was measured on"),
+    "float32": (0, "float32, whose tile the kernel reports OutOfResources on"),
     "rank2": (0, "2-D input, and the route requires the 4-D call form"),
+    "head_dim8": (0, "head_dim 8, under the 16 a tile's BLOCK_N bottoms out at"),
+    "head_dim256": (0, "head_dim 256, over the 128 whose tile still fits"),
     "causal": (0, "is_causal, which the FlagGems entry point does not take"),
-    "mask": (0, "an attn_mask, which the FlagGems entry point does not take"),
+    "masked_seq512": (0, "that key row at seq 512, under the masked route floor"),
+    "mask_additive": (0, "an additive mask, which the route does not convert"),
+    "mask_4d_bool": (0, "a bool mask with one entry per (query, key) pair"),
+    "mask_row_f32": (0, "a per-key row in float32, whose polarity is undefined"),
 }
 
-# Max |device - host| for the bf16 route against a float32 host reference. The
+# Max |device - host| for a 16-bit route against a float32 host reference. The
 # bf16 rounding of the inputs already moves the logits by ~2e-2; softmax turns
-# that into far less on an output of magnitude ~3e-2.
+# that into far less on an output of magnitude ~3e-2. The fp16 case sits an order
+# below this, at its own rounding floor rather than the bf16 one.
 _SDPA_DIFF_BOUND = 2e-2
 
 _SDPA_RESULT = re.compile(
@@ -882,21 +945,31 @@ class TestMetaXFlaggemsSdpaRoute:
         )
         assert device == DEVICE, f"{tag}: the result is on {device}, not {DEVICE}"
 
-    def test_only_the_joint_attention_shape_reaches_the_kernel(self, sdpa_shipped):
-        """The shapes the FlagGems kernel saw, in order, across all eight cases.
+    def test_only_the_admitted_shapes_reach_the_kernel(self, sdpa_shipped):
+        """The shapes the FlagGems kernel saw, in order, across all fourteen cases.
 
         The count above says how many calls took the route; this says they were
         the calls that were meant to, on the arguments the envelope is written
-        around.
+        around. Five shapes are admitted -- the unmasked joint attention, the
+        same class carrying 2.1's key-valid row, and the three the widening for
+        issue #394 added -- and no two of them share a shape, so a call that
+        reached the kernel on the wrong case is visible here rather than absorbed
+        into the count.
         """
         _, shapes = sdpa_shipped
-        # One call, on its own q, k and v: the probe records each call as a
-        # three-tuple of argument shapes, so the eligible case contributes a
+        # One call each, on their own q, k and v: the probe records each call as
+        # a three-tuple of argument shapes, so each admitted case contributes a
         # single three-tuple to the list.
-        expected = [((1, 2, 1024, 128),) * 3]
+        expected = [
+            ((1, 2, 1024, 128),) * 3,
+            ((2, 2, 1024, 128),) * 3,
+            ((1, 2, 1024, 64),) * 3,
+            ((1, 2, 512, 128),) * 3,
+            ((3, 2, 1024, 128),) * 3,
+        ]
         assert shapes == expected, (
-            f"the FlagGems SDPA kernel was called with {shapes}; only the "
-            "eligible case may reach it, and only with its own q, k, v"
+            f"the FlagGems SDPA kernel was called with {shapes}; only the five "
+            "admitted cases may reach it, and only with their own q, k, v"
         )
 
     def test_off_switch_returns_every_call_to_the_boxing_route(self, sdpa_switched_off):

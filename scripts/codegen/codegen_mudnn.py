@@ -229,6 +229,7 @@ OPS = {
     "addcmul": ("ternary_value", "ADDCMUL_ALPHA"),
     "addcdiv": ("ternary_value", "ADDCDIV_ALPHA"),
     "where.self": ("where", "SELECT"),
+    "where.self_out": ("where_out", "SELECT"),
     # ---- P1: addmm family (three-branch, see T_ADDMM) ----
     "addmm": ("addmm", "MatMul"),
     "baddbmm": ("addmm", "BatchMatMul"),
@@ -897,16 +898,20 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 """
 )
 
-# mm/bmm. mudnn's MatMul and BatchMatMul both want a workspace maintainer (the
+# mm/bmm. The unsupported-dtype arm of this template and of mm.out/addmm below
+# refuses on purpose -- see MATMUL_CATEGORIES. mudnn's MatMul and BatchMatMul
+# both want a workspace maintainer (the
 # query returned 0 bytes for the shapes probed, but the argument is mandatory).
 # Operands are made contiguous here: unlike the elementwise ops, a GEMM's inner
 # layout requirements are not something the stride descriptor alone guarantees,
 # so this keeps mm(a.t(), b) correct rather than fast.
 T_MATMUL = """\
 at::Tensor {kernel}(const at::Tensor& self, const at::Tensor& mat2) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    return at::{at_op}(self.cpu(), mat2.cpu()).to(self.device());
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -930,10 +935,11 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 
 T_MATMUL_OUT = """\
 at::Tensor& {kernel}(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    out.copy_(at::{at_op}(self.cpu(), mat2.cpu()));
-    return out;
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = self.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -1106,6 +1112,16 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 # `half_to_float` asks for a float output from a half input, which mudnn's
 # Softmax does not express (out dtype must match in), so that combination runs
 # on the host. ACCURATE is the max-subtracting algorithm, matching aten.
+#
+# Unlike Reduce, Softmax reads its input through the *index* arithmetic that
+# mudnn derives from the stride descriptor, and its validation rejects anything
+# that is not dense C-contiguous -- `SoftmaxRun only support contiguous tensor`,
+# INVALID_PARAMETER -- rather than falling back to a strided read. So a strided
+# input (a slice, a transpose, an expanded broadcast) has to be materialized
+# here. `is_contiguous()` is the right test even though MudnnTensorWrapper
+# already normalizes size-1 strides: the predicate only ignores size-1 dims,
+# whose stride the wrapper rewrites to the C-contiguous value, so anything it
+# reports as non-contiguous is genuinely strided and would be rejected.
 T_SOFTMAX_FWD = """\
 at::Tensor {kernel}(const at::Tensor& self, int64_t dim, bool half_to_float) {{
   if (!musa_ops::{dtype_pred}(self.scalar_type()) || half_to_float) {{
@@ -1113,8 +1129,9 @@ at::Tensor {kernel}(const at::Tensor& self, int64_t dim, bool half_to_float) {{
   }}
   int64_t d = dim < 0 ? dim + self.dim() : dim;
   auto out = at::empty(self.sizes(), self.options());
-{empty_guard}
-  musa_ops::MudnnTensorWrapper t_self(self);
+{empty_guard}  auto self_c = self.contiguous();
+
+  musa_ops::MudnnTensorWrapper t_self(self_c);
   musa_ops::MudnnTensorWrapper t_out(out);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::{mode});
@@ -1132,6 +1149,14 @@ REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 # y*(g - sum(g*y)) exactly. `input_dtype` only tells us what the forward input
 # was; when it differs from the gradient's dtype aten wants a converting
 # backward, which mudnn does not express, so that combination goes to the host.
+#
+# RunBwd enforces the same dense-contiguity validation as Run, on both of its
+# operands. `grad_output` is the one that genuinely arrives strided: autograd
+# hands the backward a broadcasted `ones` whenever the softmax output is summed
+# (`y.sum().backward()` gives a grad_output of stride 0 everywhere), which is
+# how the qwen3 tests reach this. `output` is the forward's own dense
+# allocation in every path we dispatch, but the same guard is applied so a
+# direct `_softmax_backward_data` call with a strided output cannot trip it.
 T_SOFTMAX_BWD = """\
 at::Tensor {kernel}(
     const at::Tensor& grad_output,
@@ -1147,8 +1172,10 @@ at::Tensor {kernel}(
   int64_t d = dim < 0 ? dim + output.dim() : dim;
   auto grad_input = at::empty(output.sizes(), output.options());
 
-  musa_ops::MudnnTensorWrapper t_go(grad_output);
-  musa_ops::MudnnTensorWrapper t_out(output);
+  auto grad_output_c = grad_output.contiguous();
+  auto output_c = output.contiguous();
+  musa_ops::MudnnTensorWrapper t_go(grad_output_c);
+  musa_ops::MudnnTensorWrapper t_out(output_c);
   musa_ops::MudnnTensorWrapper t_gi(grad_input);
   musa_ops::mudnn::Softmax op;
   op.SetMode(musa_ops::mudnn::Softmax::Mode::{mode});
@@ -1805,6 +1832,74 @@ at::Tensor {kernel}(
 REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
 """
 
+# where.self_out is the out= variant. MUSA does not route it to FlagGems: that
+# wrapper computes the broadcast shape only when `out is None` and otherwise
+# hands the caller's destination straight to `pointwise_dynamic.prepare_args`,
+# which raises rather than resizing -- `torch.where(cond, a, b, out=empty(0))`
+# therefore fails in the wrapper where ATen's own out= overload grows the
+# destination. The body follows T_WHERE plus the two steps that contract needs,
+# the same ones GCU's T_WHERE_SELF_OUT takes: infer the broadcast shape and
+# resize `out` if it differs, then check the destination's dtype before running
+# the ternary SELECT through mudnn. The route and this template are two halves
+# of one claim -- see the NATIVE_TRITON_GAPS["musa"] entry in
+# gen_vendor_confs.py.
+T_WHERE_OUT = """\
+at::Tensor& {kernel}(
+    const at::Tensor& condition,
+    const at::Tensor& self,
+    const at::Tensor& other,
+    at::Tensor& out) {{
+  // The `out=` contract pins the destination's dtype as well as its shape, and
+  // ATen's rule is equality rather than castability: with an f32 result a
+  // destination of any other dtype raises, `Expected out type to be Float but
+  // got Double`, and the same for Half, Int, Long, Bool and Byte -- measured on
+  // CPU, for every dtype other than the result's. It is checked here rather
+  // than left to the branch below for the same reason: that branch writes the
+  // result with `out.copy_(host)`, which for a f16 destination narrows an f32
+  // result silently instead of raising. Keeping the check ahead of the
+  // unsupported-dtype fallback means the fallback cannot become a silent cast
+  // either.
+  auto result_dtype = at::result_type(self, other);
+  TORCH_CHECK(
+      out.scalar_type() == result_dtype,
+      "Expected out type to be ", result_dtype, " but got ",
+      out.scalar_type());
+  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
+      !musa_ops::{dtype_pred}(other.scalar_type()) ||
+      condition.scalar_type() != at::kBool) {{
+    auto host = at::{at_op}(condition.cpu(), self.cpu(), other.cpu());
+    if (!out.sizes().equals(host.sizes())) {{
+      out.resize_(host.sizes());
+    }}
+    out.copy_(host);
+    return out;
+  }}
+  auto self_c = self.to(condition.device(), result_dtype);
+  auto other_c = other.to(condition.device(), result_dtype);
+  auto out_shape = at::infer_size(condition.sizes(), self_c.sizes());
+  out_shape = at::infer_size(out_shape, other_c.sizes());
+  if (!out.sizes().equals(out_shape)) {{
+    out.resize_(out_shape);
+  }}
+{empty_guard}  auto cond_b = condition.expand(out_shape);
+  auto self_b = self_c.expand(out_shape);
+  auto other_b = other_c.expand(out_shape);
+  musa_ops::MudnnTensorWrapper t_cond(cond_b);
+  musa_ops::MudnnTensorWrapper t_self(self_b);
+  musa_ops::MudnnTensorWrapper t_other(other_b);
+  musa_ops::MudnnTensorWrapper t_out(out);
+  musa_ops::mudnn::Ternary op;
+  op.SetMode(musa_ops::mudnn::Ternary::Mode::{mode});
+  EXEC_MUDNN_CMD(
+      "{at_op}", self,
+      op.Run(_mudnn_h, t_out.get(), t_cond.get(), t_self.get(),
+             t_other.get()));
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMusa, {kernel})
+"""
+
 # addmm/baddbmm: out = beta*self + alpha*(mat1 @ mat2).
 #
 # mudnn computes d = alpha*a@b + beta*c + gamma*bias, and which slot `self`
@@ -1826,11 +1921,14 @@ at::Tensor {kernel}(
     const at::Tensor& mat2,
     const at::Scalar& beta,
     const at::Scalar& alpha) {{
-  if (!musa_ops::{dtype_pred}(self.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat1.scalar_type()) ||
-      !musa_ops::{dtype_pred}(mat2.scalar_type())) {{
-    return at::{at_op}(self.cpu(), mat1.cpu(), mat2.cpu(), beta, alpha)
-        .to(self.device());
+  if (!musa_ops::{dtype_pred}(self.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", self.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat1.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat1.scalar_type());
+  }}
+  if (!musa_ops::{dtype_pred}(mat2.scalar_type())) {{
+    musa_ops::MusaRaiseUnsupportedMatmulDtype("{route_key}", mat2.scalar_type());
   }}
   std::vector<int64_t> out_shape = mat1.sizes().vec();
   out_shape.back() = mat2.size(-1);
@@ -2648,6 +2746,7 @@ CATEGORIES = {
     "leaky_relu_bw": T_LEAKY_RELU_BW,
     "ternary_value": T_TERNARY_VALUE,
     "where": T_WHERE,
+    "where_out": T_WHERE_OUT,
     "addmm": T_ADDMM,
     "softmax_bwd": T_SOFTMAX_BWD,
     "reduce_dims_plain": T_REDUCE_DIMS_PLAIN,
@@ -2725,6 +2824,24 @@ ARITHMETIC_CATEGORIES = {
     "reduce_indices",
 }
 
+# The categories whose kernel drives a mudnn MatMul/BatchMatMul. Their dtype
+# reach is narrower than arithmetic's: every matmul entry point rejects DOUBLE
+# ("NOT_SUPPORTED in MatMul::Run, unsupported data type DOUBLE,DOUBLE,DOUBLE,,
+# DOUBLE", measured on mudnn v3300), even though the type maps in
+# ToMudnnDataType. These kernels use MudnnSupportsMatmulDtype, and where that
+# predicate says no they raise (MusaRaiseUnsupportedMatmulDtype) instead of
+# falling back to the host the way the other categories do. A dtype the vendor
+# cannot serve on this route is a dtype the config cannot deliver: `addmm = musa`
+# has to mean the op ran on the device, not that the tensor came back from the
+# CPU. Every other category keeps its .cpu() fallback, because the dtypes their
+# predicates reject (complex, quantized, fp8) have no device path at all, and
+# refusing them would take away ops that work today.
+MATMUL_CATEGORIES = {
+    "matmul",
+    "matmul_out",
+    "addmm",
+}
+
 # The mudnn class each category configures, for symbol validation.
 CATEGORY_CLASS = {
     "metadata_view": None,  # pure ATen metadata; no mudnn symbol to validate
@@ -2760,6 +2877,7 @@ CATEGORY_CLASS = {
     "leaky_relu_bw": "Binary",
     "ternary_value": "Ternary",
     "where": "Ternary",
+    "where_out": "Ternary",
     "addmm": None,  # mode names the class itself (MatMul / BatchMatMul)
     "softmax_bwd": "Softmax",
     "reduce_dims_plain": "Reduce",
@@ -2981,10 +3099,17 @@ def main():
             fn=fn,
             disp=disp,
             at_op=AT_OP_OVERRIDES.get(op, base),
+            # The name the conf spells and the FLAGOS_OP_ loop reads, which for
+            # an out= variant is the overload (`mm.out`) and not the base op the
+            # mudnn tag carries. A template that refuses a dtype names its op
+            # with this, so the message uses the spelling the conf uses.
+            route_key=op,
             empty_guard=empty_guard(EMPTY_GUARD_RETURN.get(cat, "out")),
             promote_integral="true" if base == "sum" else "false",
             dtype_pred=(
-                "MudnnSupportsArithmeticDtype"
+                "MudnnSupportsMatmulDtype"
+                if cat in MATMUL_CATEGORIES
+                else "MudnnSupportsArithmeticDtype"
                 if cat in ARITHMETIC_CATEGORIES
                 else "MudnnSupportsDtype"
             ),

@@ -151,11 +151,11 @@ class TestSumDimDispatch:
         GCU300 front end rejects for an int64 operand (see
         NATIVE_TRITON_GAPS["gcu"]), and MetaX keeps this overload on the cuda
         boxing kernel while its activity handling in the profiler workload is
-        being stabilized (see metax_triton_fallback in
-        scripts/codegen/codegen_ops.py). Platforms whose conf keeps the FlagGems
-        route still log flagos_python, so asserting the conf's own value keeps
-        this test meaningful on every platform rather than pinning it to the one
-        it was written on.
+        being stabilized (see BOXING_GAP_NOTES["metax"] in
+        scripts/codegen/gen_vendor_confs.py). Platforms whose conf keeps the
+        FlagGems route still log flagos_python, so asserting the conf's own value
+        keeps this test meaningful on every platform rather than pinning it to
+        the one it was written on.
         """
         result = _run_subprocess({"FLAGOS_LOG": "dispatch"})
         assert result.returncode == 0, f"Failed:\n{result.stderr}"
@@ -180,3 +180,31 @@ class TestSumDimAscendDispatch:
         """Verify sum.dim_IntList on ascend backend matches CPU reference."""
         result = _run_subprocess({"FLAGOS_OP_sum__dim_IntList": "ascend"})
         assert result.returncode == 0
+
+    @pytest.mark.ascend
+    def test_ascend_bool_operand_reduces_to_int64_counts(self):
+        """A bool operand reduced over dims returns the CPU's int64 counts.
+
+        Two defects used to sit behind this operator on Ascend, both from
+        ``cdtype = inp.dtype.element_ty`` in the FlagGems kernel the conf now
+        routes around (NATIVE_TRITON_GAPS["ascend"]): a bool operand accumulated
+        in i1, where ``+`` is a bitwise OR and ``tl.sum`` is an "any", so a row
+        holding any True at all came back ``1`` -- the right dtype, with a wrong
+        count in it -- and the same i1 accumulate was rejected outright by
+        BiShengIR on the multi-dimension path, so ``dim=(0, 1)`` was a hard
+        error. Values and dtype are both asserted, because the dtype is what
+        made the wrong count silent.
+
+        The operand is shaped so "any" and "count" disagree on both axes: one row
+        is full and one is partly masked, so ``dim=1`` must return the counts
+        ``[40, 52]`` rather than ``[1, 1]``, and the total must be ``92`` rather
+        than the ``1`` an "any" reduction produces.
+        """
+        mask = torch.ones(2, 52, dtype=torch.bool, device=DEVICE)
+        mask[0, 40:] = False
+
+        for dim in (1, (0, 1)):
+            out = torch.sum(mask, dim=dim)
+            ref = torch.sum(mask.cpu(), dim=dim)
+            assert out.dtype == ref.dtype == torch.int64
+            assert out.cpu().tolist() == ref.tolist()

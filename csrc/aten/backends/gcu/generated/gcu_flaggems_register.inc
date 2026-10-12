@@ -25,6 +25,7 @@
 //   - _linalg_eigvals
 //   - _log_softmax_backward_data
 //   - _pdist_backward
+//   - _softmax
 //   - _softmax_backward_data
 //   - _unique2
 //   - _weight_norm_interface
@@ -135,6 +136,7 @@
 //   - le.Tensor
 //   - lgamma
 //   - lgamma_
+//   - linalg_vector_norm
 //   - linspace
 //   - log
 //   - log10
@@ -171,6 +173,7 @@
 //   - ne.Scalar
 //   - ne.Tensor
 //   - neg
+//   - new_ones
 //   - nextafter
 //   - nextafter_
 //   - nll_loss_backward
@@ -240,11 +243,12 @@
 //   - var_mean.correction
 //   - vdot
 //   - where.self
+//   - where.self_out
 //   - zero_
 //   - zeros
 //   - zeros_like
 //
-// Total: 249 ops registered here, 88 further FlagGems ops already claimed by gcu_register.inc.
+// Total: 246 ops registered here, 103 further FlagGems ops already claimed by gcu_register.inc.
 
   m.impl("_conv_depthwise2d", WrapperPrivConvDepthwise2d);
   m.impl("_efficient_attention_backward", WrapperPrivEfficientAttentionBackward);
@@ -369,7 +373,6 @@
   m.impl("lift", WrapperLift);
   m.impl("lift.out", WrapperLiftOut);
   m.impl("linalg_ldl_factor_ex", WrapperLinalgLdlFactorEx);
-  m.impl("linalg_vector_norm", WrapperLinalgVectorNorm);
   m.impl("log10.out", WrapperLog10Out);
   m.impl("log10_", WrapperLog10Inplace);
   m.impl("log1p.out", WrapperLog1pOut);
@@ -406,7 +409,6 @@
   m.impl("native_group_norm", WrapperNativeGroupNorm);
   m.impl("native_group_norm_backward", WrapperNativeGroupNormBackward);
   m.impl("neg_", WrapperNegInplace);
-  m.impl("new_ones", WrapperNewOnes);
   m.impl("nll_loss2d_backward", WrapperNllLoss2dBackward);
   m.impl("nll_loss2d_forward", WrapperNllLoss2dForward);
   m.impl("pixel_unshuffle.out", WrapperPixelUnshuffleOut);
@@ -488,7 +490,6 @@
   m.impl("transpose.int", WrapperTransposeInt);
   m.impl("trunc_", WrapperTruncInplace);
   m.impl("upsample_linear1d_backward", WrapperUpsampleLinear1dBackward);
-  m.impl("where.self_out", WrapperWhereSelfOut);
   m.impl("xlogy.OutScalar_Other", WrapperXlogyOutscalarOther);
   m.impl("xlogy.OutScalar_Self", WrapperXlogyOutscalarSelf);
   m.impl("xlogy.OutTensor", WrapperXlogyOuttensor);

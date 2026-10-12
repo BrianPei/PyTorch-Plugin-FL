@@ -80,6 +80,7 @@ Capability availability and validation status vary by platform. A feature existi
 | Ascend | Native ACLNN backend, FlagGems via FlagTree (Triton 3.5) | Eager, autograd, RNG suite | **Beta** | [Ascend](docs/vendors/ascend/installation.md) |
 | PPU | CUDA boxing against PPU's CUDA-13-compatible SDK | Eager, autograd | **Experimental** | [PPU](docs/vendors/ppu/installation.md) |
 | Hygon DCU | CUDA boxing over hipified DTK torch | Eager, autograd, FP16/BF16 AMP, profiler | **Beta** | [DCU](docs/vendors/dcu/installation.md) |
+| Kunlunxin (Kunlun P800) | CUDA boxing against the Kunlun XPU SDK | Eager, autograd | **Experimental** | [Kunlunxin](docs/vendors/kunlunxin/installation.md) |
 | Enflame GCU | Native topsaten backend, CPU fallback for unrouted/int64 ops | Eager | **Experimental** | [GCU](docs/vendors/gcu/installation.md) |
 | Moore Threads MUSA | FlagGems-first Triton kernels, native mudnn fallback, CPU fallback for unrouted ops | Eager, FP16/BF16 AMP | **Experimental** | [MUSA](docs/vendors/musa/installation.md) |
 | D-Robotics BPU | No eager kernels; `torch.compile` graph path via hbdk4 | Graph compilation only | **Runtime only** | [BPU](docs/vendors/bpu/installation.md) |
@@ -148,6 +149,7 @@ For device queries, synchronization, and multi-device usage patterns, see the [Q
 
 ### Architecture
 
+- [Startup Lifecycle](docs/architecture/startup-lifecycle.md) — Mandatory bootstrap and explicit framework integration activation
 - [Distributed Collectives](docs/architecture/distributed-flagcx.md) — ProcessGroupFlagOS, FlagCX, and vendor fallbacks
 - [Profiler Integration](docs/architecture/profiler.md) — torch.profiler parity and CUPTI integration
 - [torch.compile Integration](docs/architecture/torch-compile-integration.md) — Inductor GPU device registration
@@ -159,9 +161,16 @@ For device queries, synchronization, and multi-device usage patterns, see the [Q
 - [Ascend (Huawei)](docs/vendors/ascend/installation.md)
 - [PPU](docs/vendors/ppu/installation.md)
 - [Hygon DCU](docs/vendors/dcu/installation.md)
+- [Kunlunxin (Kunlun P800)](docs/vendors/kunlunxin/installation.md)
 - [Enflame GCU](docs/vendors/gcu/installation.md)
 - [Moore Threads MUSA](docs/vendors/musa/installation.md)
 - [D-Robotics BPU](docs/vendors/bpu/installation.md)
+
+### Development
+
+- [Releasing](docs/development/releasing.md) — What a release tag builds and where each wheel is published
+- [Testing](docs/development/testing.md) — Test organization, marks, and how to run each suite
+- [Integration Harness](docs/development/integration-harness-design.md) — How the per-platform integration manifests are structured
 
 ## Contributing
 

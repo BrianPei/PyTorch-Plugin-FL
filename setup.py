@@ -15,9 +15,11 @@
 import glob
 import importlib.machinery
 import importlib.util
+import json
 import multiprocessing
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -33,25 +35,61 @@ from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
 IS_DARWIN = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 
-# Accelerator platform: "cuda" (default), "ppu", "metax", "ascend",
-# "tsingmicro", "dcu", "gcu", "musa", or "bpu"
+# Accelerator platform: "cuda" (default), "ppu", "metax", "kunlunxin",
+# "ascend", "tsingmicro", "dcu", "gcu", "musa", or "bpu"
 FLAGOS_ACCELERATOR = os.environ.get("FLAGOS_ACCELERATOR", "cuda").lower()
+
+# Where the sources live. Distinct from BASE_DIR, which is repointed at a
+# scratch tree when the generated files are redirected somewhere else -- the
+# files this build reads back (torch_fl/_env.py, cmake/flagos_platforms.json) do
+# not move with them.
+SOURCE_DIR = os.path.dirname(os.path.realpath(__file__))
+
+BASE_DIR = SOURCE_DIR
+
+_PLATFORM_TABLE = None
+
+
+def _platform_table() -> dict:
+    """cmake/flagos_platforms.json: the platform/build matrix shared with CMake.
+
+    CMakeLists.txt reads the same file, so the kernel switches, the
+    bundled-libtorch dir, the platform list and the pins have one definition.
+    """
+    global _PLATFORM_TABLE
+    if _PLATFORM_TABLE is None:
+        path = os.path.join(SOURCE_DIR, "cmake", "flagos_platforms.json")
+        with open(path, encoding="utf-8") as handle:
+            _PLATFORM_TABLE = json.load(handle)
+    return _PLATFORM_TABLE
+
+
+def _platform_entry(accelerator: str) -> dict:
+    """One accelerator's row from the shared table (raises on an unknown id)."""
+    table = _platform_table()
+    try:
+        return table["accelerators"][accelerator]
+    except KeyError:
+        known = ", ".join(sorted(table["accelerators"]))
+        raise ValueError(
+            f"Unknown FLAGOS_ACCELERATOR '{accelerator}'. Expected one of: {known}"
+        ) from None
+
+
+# The kernel sets a build can compile in, and their build-record names, from the
+# shared table. Each name is simultaneously an environment variable, a CMake
+# option() and one entry of the generated build_config.KERNELS, so no
+# env-name -> -D-name -> record-name translation exists to fall out of sync.
+KERNEL_SWITCHES = tuple(_platform_table()["kernel_switches"])
+KERNEL_SET_NAME = dict(_platform_table()["kernel_set_names"])
 
 # Directory inside the wheel holding a bundled forked libtorch, for the backends
 # that ship one (see scripts/vendor/bundle_*_libtorch.sh). "lib" means "no separate
 # bundle dir": the CUDA backend drops its extra .so straight into torch_fl/lib/.
-# Must match FLAGOS_BUNDLE_LIBDIR in CMakeLists.txt -- _C.so's RUNPATH has to
-# reach the bundle or its auditwheel-mangled deps (libglog-*.so.0) go missing.
-_BUNDLE_LIBDIR = {"metax": "lib_maca", "dcu": "lib_dcu", "ppu": "lib_ppu"}.get(
-    FLAGOS_ACCELERATOR, "lib"
-)
-
-# Where the sources live. Distinct from BASE_DIR, which is repointed at a
-# scratch tree when the generated files are redirected somewhere else -- the
-# files this build reads back (torch_fl/_env.py) do not move with them.
-SOURCE_DIR = os.path.dirname(os.path.realpath(__file__))
-
-BASE_DIR = SOURCE_DIR
+# From the table -- the same value CMake's FLAGOS_BUNDLE_LIBDIR gets. _C.so's
+# RUNPATH has to reach the bundle or its auditwheel-mangled deps
+# (libglog-*.so.0) go missing.
+_BUNDLE_LIBDIR = _platform_entry(FLAGOS_ACCELERATOR)["bundle_libdir"]
 
 # Only run cmake build for actual build commands, not metadata collection
 BUILD_COMMANDS = {
@@ -306,52 +344,75 @@ def _dtk_root() -> str:
     return default
 
 
-# The kernel sets a build can compile in. Each name is simultaneously an
-# environment variable, a CMake option() and one entry of the generated
-# build_config.KERNELS, so no env-name -> -D-name -> record-name translation
-# exists to fall out of sync. csrc/CMakeLists.txt declares the same five.
-KERNEL_SWITCHES = (
-    "FLAGOS_BUILD_VENDOR",
-    "FLAGOS_BUILD_FLAGGEMS",
-    "FLAGOS_BUILD_BOXING",
-    "FLAGOS_BUILD_FLAGGEMS_CPP",
-    "FLAGOS_BUILD_TILEOPS",
-)
+def _kunlunxin_roots() -> tuple[str, str]:
+    """Return the validated Kunlunxin XPU SDK root and libcudart directory.
 
-# What the build record calls the same five sets. The accelerator alone cannot
-# answer "was the FlagGems C++ wrapper compiled into this wheel?" -- two MetaX
-# wheels built with different kernel-set flags share a FLAGOS_ACCELERATOR and
-# are not the same wheel.
-KERNEL_SET_NAME = {
-    "FLAGOS_BUILD_VENDOR": "vendor",
-    "FLAGOS_BUILD_FLAGGEMS": "flaggems",
-    "FLAGOS_BUILD_BOXING": "boxing",
-    "FLAGOS_BUILD_FLAGGEMS_CPP": "flaggems_cpp",
-    "FLAGOS_BUILD_TILEOPS": "tileops",
-}
+    The XPU SDK ships a CUDA-shaped runtime: cuda_runtime.h under
+    ``XPU_ROOT/include`` and the libcudart shim under ``XCUDART_ROOT`` (the
+    SDK's own ``so/`` directory on a P800 install). Both are host-only build
+    inputs -- the runtime libraries are never copied into the wheel -- so this
+    only locates them. Returns ``(XPU_ROOT, <directory holding libcudart.so*>)``.
+    """
+    xpu_root = os.path.realpath(os.environ.get("XPU_ROOT", "/usr/local/xpu"))
+    xcudart_root = os.path.realpath(
+        os.environ.get("XCUDART_ROOT", os.path.join(xpu_root, "so"))
+    )
+    if not os.path.isfile(os.path.join(xpu_root, "include", "cuda_runtime.h")):
+        raise RuntimeError(
+            "FLAGOS_ACCELERATOR=kunlunxin selected, but cuda_runtime.h was not "
+            f"found under {xpu_root}/include. Set XPU_ROOT to the Kunlunxin XPU "
+            "SDK root."
+        )
+    # The shim's soname tracks the SDK's CUDA-compat version (libcudart.so.11.0
+    # on XPU SDK 5.0.21) rather than a fixed one, and it sits either directly in
+    # XCUDART_ROOT or one level down in lib/, so match the whole family in both
+    # spots instead of pinning a filename.
+    for cudart_dir in (xcudart_root, os.path.join(xcudart_root, "lib")):
+        if glob.glob(os.path.join(cudart_dir, "libcudart.so*")):
+            return xpu_root, cudart_dir
+    raise RuntimeError(
+        "FLAGOS_ACCELERATOR=kunlunxin selected, but no libcudart.so* was found "
+        f"under {xcudart_root} or {xcudart_root}/lib. Set XCUDART_ROOT to the "
+        "directory holding the XPU CUDA-compat runtime."
+    )
 
-# The values an explicit environment variable may not contradict, because the
-# platform cannot produce the other answer at all. Each entry mirrors a
-# set(... CACHE BOOL ... FORCE) in CMakeLists.txt: the FORCE would win over the
-# -D silently, so a build record derived from the requested value would describe
-# a wheel that was never built. Asking for one is an error rather than a silent
-# override, on both sides (here and in CMakeLists.txt).
+
+def _setup_kunlunxin_build_env(env: dict) -> tuple[str, str]:
+    """CPATH/LIBRARY_PATH/LD_LIBRARY_PATH for the Kunlunxin XPU SDK.
+
+    Kunlunxin is a CUDA-boxing build: host g++ compiles the generated boxing
+    kernels against the SDK's CUDA-shaped headers and links the libcudart shim,
+    so both the include and lib directories have to be reachable. Returns
+    ``(XPU_ROOT, <directory holding libcudart.so*>)``.
+    """
+    xpu_root, xcudart_dir = _kunlunxin_roots()
+    env.setdefault("XPU_ROOT", xpu_root)
+    env.setdefault("XCUDART_ROOT", xcudart_dir)
+    _prepend_env_path(env, "CPATH", os.path.join(xpu_root, "include"))
+    _prepend_env_path(env, "LIBRARY_PATH", xcudart_dir)
+    _prepend_env_path(env, "LD_LIBRARY_PATH", xcudart_dir)
+    return xpu_root, xcudart_dir
+
+
+# The values an explicit environment variable may not contradict, from the
+# shared table's per-platform "pins". Each pin is a set(... CACHE BOOL ... FORCE)
+# in CMakeLists.txt: the FORCE would win over the -D silently, so a build record
+# derived from the requested value would describe a wheel that was never built.
+# Asking for the other value is an error rather than a silent override, on both
+# sides (here and in CMakeLists.txt).
 #
-# Only genuinely impossible combinations are listed. metax, gcu, ppu and
-# tsingmicro are absent because FLAGOS_BUILD_FLAGGEMS_CPP=OFF there is a default
-# that an explicit FLAGOS_BUILD_FLAGGEMS_CPP=1 (with a vendor-built
-# liboperators.so) may replace -- MetaX's MACA build is the documented case.
-# DCU, MUSA and BPU pin it off for the opposite reason: no FlagGems C++ build
-# exists for DTK, for the MUSA toolkit or for the BPU at all, so there is nothing
-# an explicit 1 could link against. Ascend/musa FLAGOS_BUILD_VENDOR is pinned
-# because their whole kernel story is the vendor library: Ascend has no CUDA
-# boxing runtime to fall back to, and MUSA's toolbox ships no CUDA runtime.
-_PINNED_KERNEL_SWITCHES: dict[str, dict[str, bool]] = {
-    "ascend": {"FLAGOS_BUILD_VENDOR": True},
-    "musa": {"FLAGOS_BUILD_VENDOR": True, "FLAGOS_BUILD_FLAGGEMS_CPP": False},
-    "dcu": {"FLAGOS_BUILD_FLAGGEMS_CPP": False},
-    "bpu": {"FLAGOS_BUILD_FLAGGEMS_CPP": False},
-}
+# Only genuinely impossible combinations are pinned. metax, gcu, ppu and
+# tsingmicro are not, because FLAGOS_BUILD_FLAGGEMS_CPP=OFF there is a default an
+# explicit =1 (with a vendor-built liboperators.so) may replace -- MetaX's MACA
+# build is the documented case. DCU, MUSA and BPU pin it off for the opposite
+# reason: no FlagGems C++ build exists for DTK, the MUSA toolkit or the BPU at
+# all, so there is nothing an explicit 1 could link against. Ascend/musa
+# FLAGOS_BUILD_VENDOR is pinned because their whole kernel story is the vendor
+# library.
+def _pinned_kernel_switches(accelerator: str) -> dict[str, bool]:
+    pins = _platform_entry(accelerator).get("pins", {})
+    return {name: spec["value"] for name, spec in pins.items()}
+
 
 _ENV_MODULE = None
 
@@ -380,139 +441,12 @@ def _vendor_kernel_switches(accelerator: str) -> dict[str, bool]:
     """What one accelerator builds by default, before any explicit environment value.
 
     The middle of the three layers in _kernel_switches, and the only one that
-    differs per vendor. The comments here are the whole build-side policy: there
-    is no mode variable, because what a wheel can run follows from what it
-    compiled in.
+    differs per vendor. The values -- and the per-platform rationale (why MetaX
+    has no native kernels, why Ascend/GCU/MUSA turn boxing off, why BPU drops
+    FlagGems, ...) -- live in cmake/flagos_platforms.json, next to the CMake side
+    that consumes the same table.
     """
-    vendor: dict[str, bool] = {}
-
-    if accelerator != "cuda":
-        # TileOPs is TileLang on SM90 (Hopper) NVIDIA parts only. Its stubs are
-        # harmless on other vendors -- the shims fall back to aten -- but there
-        # is nothing for them to reach, so keep them out of vendor wheels. An
-        # explicit FLAGOS_BUILD_TILEOPS=1 still wins.
-        vendor["FLAGOS_BUILD_TILEOPS"] = False
-
-    if accelerator not in ("cuda", "tsingmicro"):
-        # The FlagGems C++ wrappers link a liboperators.so built for the vendor;
-        # upstream's CUDA/ROCm build is the only one that exists by default, so
-        # every other platform keeps them off and links cleanly without it. An
-        # explicit FLAGOS_BUILD_FLAGGEMS_CPP=1 with FLAGGEMS_DIR=<vendor build>
-        # still wins -- MetaX's MACA build is the documented case. TsingMicro is
-        # exempt because it has no vendor branch at all and has always taken the
-        # CUDA default here.
-        vendor["FLAGOS_BUILD_FLAGGEMS_CPP"] = False
-
-    if accelerator == "metax":
-        # MetaX is a CUDA-boxing build: no native mxcc kernels compile in, the
-        # generated boxing kernels provide acceleration, and the FlagGems C++
-        # wrappers stay off (no MACA-built liboperators). The hand-written
-        # kernels under backends/metax/ are not built -- the dead native path is
-        # retired.
-        #
-        # FLAGOS_BUILD_FLAGGEMS stays at the CUDA default: the boxing wheel also
-        # compiles the FlagGems Python-path kernels (flagos_python backend) so
-        # the conf can route to them. python_op_caller links torch_python_library
-        # (already in the metax link set) and adds nothing to the bundled wheel
-        # size. FLAGOS_BUILD_FLAGGEMS=0 gives a slim pure-boxing build.
-        #
-        # FLAGOS_BUILD_FLAGGEMS_CPP needs a FlagGems built for MACA, which is a separate
-        # build:
-        #     cd FlagGems/cpp && cmake -B build-maca -DFLAGGEMS_BUILD_C_EXTENSIONS=ON \
-        #         -DFLAGGEMS_BACKEND=MACA -DMACA_PATH=/opt/maca
-        # Opt in with FLAGOS_BUILD_FLAGGEMS_CPP=1 FLAGGEMS_DIR=<that build dir>. The C++
-        # kernels reach the device via the same DeviceBoxingGuard as the boxing
-        # path, so they need the boxing kernels.
-        vendor["FLAGOS_BUILD_VENDOR"] = False
-    elif accelerator == "ascend":
-        # Ascend uses ACLNN as the native fallback, with the FlagGems Python path
-        # enabled by default. FlagGems runs on FlagTree (the vendor's Triton 3.5
-        # build), not on triton-ascend: torch_fl imports before triton and carries
-        # a torch_npu-free backend policy for it, so nothing here links torch_npu.
-        # The generated Ascend conf is FlagGems-first for measured routes, while
-        # unsupported or unregistered operators remain on ACLNN/CPU fallback.
-        #
-        # FLAGOS_BUILD_BOXING=OFF: Ascend is not a CUDA-compatible vendor, and its conf
-        # routes nothing to the boxing kernel (0 `= cuda` entries), so compiling
-        # the generated CUDA wrappers was pure dead weight -- the same reason
-        # gcu/musa exclude them.
-        vendor.update(
-            {
-                "FLAGOS_BUILD_BOXING": False,
-                "FLAGOS_BUILD_FLAGGEMS": True,
-                "FLAGOS_BUILD_VENDOR": True,
-            }
-        )
-    # tsingmicro needs no branch: no vendor backend directory exists, so
-    # FLAGOS_BUILD_VENDOR is a no-op, and boxing plus FlagGems Python stay on by
-    # default.
-    elif accelerator == "dcu":
-        # Boxing build. The DCU torch wheel is a hipified build whose HIP kernels
-        # are registered under the CUDA dispatch key, so the generated
-        # PrivateUse1 -> CUDA boxing kernels reach them with no hand-written
-        # kernels of our own.
-        #
-        # FLAGOS_BUILD_FLAGGEMS stays on, same as metax/cuda: DTK ships a working
-        # triton (hcu backend) that flag_gems runs on, so the choice becomes a
-        # runtime one (backends_dcu.conf). python_op_caller links
-        # torch_python_library, already in the link set, so this adds nothing to
-        # the wheel size. FLAGOS_BUILD_FLAGGEMS=0 gives a slim pure-boxing build.
-        pass
-    elif accelerator == "ppu":
-        # PPU (T-Head) builds against PPU_SDK/CUDA_SDK and reuses the CUDA
-        # boxing kernels, but its libtorch is a local PPU build bundled into
-        # lib_ppu/. FLAGOS_BUILD_TILEOPS is already off by the non-cuda rule above
-        # (TileOps is SM90).
-        pass
-    elif accelerator == "bpu":
-        # D-Robotics RDK BPU. The BPU's unit of execution is a whole compiled
-        # graph (a .hbm produced by hbdk4), not an individual operator, so there
-        # are no FlagGems kernels to build: eager ops reach cpu_fallback, and
-        # acceleration comes from the torch.compile backend in
-        # torch_fl/accelerator/bpu/. Only the runtime layer (UCP allocator,
-        # device/stream stubs) is native.
-        #
-        # FLAGOS_BUILD_VENDOR stays at the ON default, as it always has for this
-        # platform, but compiles nothing: csrc/aten/backends/bpu/ does not
-        # exist, so the vendor block at the top of csrc/CMakeLists.txt finds no
-        # directory to add. The resulting "vendor" entry in the build record is
-        # therefore a switch that is on, not a kernel set that is present.
-        vendor["FLAGOS_BUILD_FLAGGEMS"] = False
-    elif accelerator == "gcu":
-        # Enflame GCU has no CUDA runtime: the tops runtime provides the device
-        # layer and libtopsaten the operators, so CUDA/vendor kernel sets stay
-        # off and FLAGOS_BUILD_VENDOR (topsaten) provides the native compute ops. Ops
-        # without a topsaten kernel fall back to CPU.
-        #
-        # Keep the FlagGems Python kernels in the same C++ dispatcher as the
-        # topsaten kernels. This mirrors the CUDA unified-RNG design: one
-        # PrivateUse1 wrapper owns an exact ATen overload, while the backend
-        # config chooses kGcu or kFlagOsPython at runtime. GCU initialization
-        # prepares triton_gcu but does not call flag_gems.enable(), so the
-        # Python layer cannot register a second PrivateUse1 implementation.
-        vendor.update(
-            {
-                "FLAGOS_BUILD_BOXING": False,
-                "FLAGOS_BUILD_FLAGGEMS": True,
-                "FLAGOS_BUILD_VENDOR": True,
-            }
-        )
-    elif accelerator == "musa":
-        # Moore Threads MUSA has no CUDA runtime: the musa* API provides the
-        # device layer, and mudnn provides the native operators (FLAGOS_BUILD_VENDOR).
-        # Compile the FlagGems Python callers into the same wheel so the conf
-        # can route the hybrid path at runtime. Kernel execution still requires a
-        # compatible MUSA Triton backend; without one, native routing remains the
-        # default and unaffected.
-        vendor.update(
-            {
-                "FLAGOS_BUILD_BOXING": False,
-                "FLAGOS_BUILD_FLAGGEMS": True,
-                "FLAGOS_BUILD_VENDOR": True,
-            }
-        )
-
-    return vendor
+    return dict(_platform_entry(accelerator)["kernel_defaults"])
 
 
 def _kernel_switches(accelerator: str) -> dict[str, bool]:
@@ -535,7 +469,7 @@ def _kernel_switches(accelerator: str) -> dict[str, bool]:
     # here for the same reason it does at run time, instead of the build
     # reading it as "on" and compiling a set the user never asked for.
     env = _env_module()
-    pinned = _PINNED_KERNEL_SWITCHES.get(accelerator, {})
+    pinned = _pinned_kernel_switches(accelerator)
     for name in KERNEL_SWITCHES:
         requested = env.flag(name, resolved[name])
         if name in pinned and requested != pinned[name]:
@@ -583,7 +517,7 @@ def build_deps():
     # reads, so the -D list and the KERNELS record cannot disagree.
     #
     # The per-vendor rationale (why MetaX has no native kernels, why Ascend
-    # turns boxing off, ...) lives in _vendor_kernel_switches().
+    # turns boxing off, ...) lives in cmake/flagos_platforms.json.
     kernels = _kernel_switches(FLAGOS_ACCELERATOR)
     for switch in KERNEL_SWITCHES:
         cmake_args.append(f"-D{switch}={'ON' if kernels[switch] else 'OFF'}")
@@ -615,6 +549,10 @@ def build_deps():
             cmake_args.append(f"-DFLAGGEMS_DIR={flaggems_dir}")
     elif FLAGOS_ACCELERATOR == "dcu":
         cmake_args.append(f"-DROCM_PATH={_dtk_root()}")
+    elif FLAGOS_ACCELERATOR == "kunlunxin":
+        xpu_root, xcudart_dir = _setup_kunlunxin_build_env(build_env)
+        cmake_args.append(f"-DXPU_ROOT={xpu_root}")
+        cmake_args.append(f"-DXCUDART_ROOT={xcudart_dir}")
 
     subprocess.check_call([cmake, BASE_DIR] + cmake_args, cwd=build_dir, env=build_env)
 
@@ -677,6 +615,44 @@ def _write_build_config() -> None:
         f.write(content)
 
 
+def _write_compatibility_manifest(wheel_version: str) -> None:
+    """Write artifact facts after the native build, before wheel staging."""
+    import torch
+
+    # setuptools' PEP 517 backend executes setup.py with the source root absent
+    # from sys.path, even for --no-isolation builds. Load this source file by
+    # absolute path instead of relying on an import that only works in a shell.
+    preflight_path = os.path.join(SOURCE_DIR, "scripts", "tools", "torch-fl-preflight")
+    loader = importlib.machinery.SourceFileLoader("torch_fl_preflight", preflight_path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load wheel preflight from {preflight_path}")
+    preflight = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
+
+    kernels = _kernel_switches(FLAGOS_ACCELERATOR)
+    compiled = [KERNEL_SET_NAME[name] for name in KERNEL_SWITCHES if kernels[name]]
+    manifest = preflight.make_manifest(
+        platform=FLAGOS_ACCELERATOR,
+        wheel_version=wheel_version,
+        kernels=compiled,
+        bundle_libdir=_BUNDLE_LIBDIR,
+        vendor_torch_libraries=_platform_entry(FLAGOS_ACCELERATOR)[
+            "vendor_torch_libraries"
+        ],
+        requirements=_install_requires(),
+        torch_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        sdk_version=os.environ.get("FLAGOS_SDK_VERSION"),
+        vendor_torch_version=os.environ.get("FLAGOS_VENDOR_TORCH_VERSION"),
+    )
+    if manifest["build"]["distributions"]["torch"] is None:
+        raise RuntimeError("Build-time PyTorch distribution is missing")
+    path = os.path.join(BASE_DIR, "torch_fl", "compatibility.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
 def _bundle_cuda_assets() -> None:
     """Copy the external CUDA .so assets into torch_fl/lib so the wheel is
     self-contained.
@@ -722,6 +698,64 @@ def _bundle_cuda_assets() -> None:
         print(f"[setup] bundled CUDA assets into torch_fl/lib: {', '.join(copied)}")
 
 
+_NCCL_EXT_BUILD_PATH = os.path.join(
+    SOURCE_DIR, "torch_fl", "comm", "_nccl_ext", "build.py"
+)
+
+
+def _load_nccl_ext_builder():
+    """Import torch_fl/comm/_nccl_ext/build.py without importing torch_fl.
+
+    Loaded from its path rather than as ``torch_fl.comm._nccl_ext.build``: that
+    form imports torch_fl, which imports torch, which -- with device-backend
+    autoloading on -- imports the half-built native package this build is in the
+    middle of producing. build.py is stdlib-only at import time for exactly this
+    reason; tests/unit/test_nccl_ext_build.py loads it the same way.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "torch_fl_nccl_ext_build", _NCCL_EXT_BUILD_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Cannot load the _flagos_nccl builder at {_NCCL_EXT_BUILD_PATH}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _nccl_ext_extension():
+    """The ``_flagos_nccl`` Extension for this accelerator, or None.
+
+    None means the accelerator does not wire the native comm bridge into its
+    wheel (the builder's docstring names the DCU-only scope, and why); the
+    standalone builder still covers that platform. A configuration error on an
+    accelerator that *is* wired is raised instead of skipped: a released DCU
+    wheel without this extension is the defect, so an unresolvable DTK link set
+    has to stop the build rather than quietly ship a wheel whose
+    ProcessGroupFlagOS has no native RCCL fallback.
+
+    Called from _get_setup_kwargs() under RUN_BUILD_DEPS, so a real build pass
+    always reaches it. That is deliberate -- the DTK link set is resolvable
+    exactly when a DCU build is possible at all, and setup.py must not be able
+    to describe a DCU wheel it cannot build.
+    """
+    if not os.path.isfile(_NCCL_EXT_BUILD_PATH):
+        return None
+    builder = _load_nccl_ext_builder()
+    try:
+        extension = builder.wheel_extension()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"FLAGOS_ACCELERATOR={FLAGOS_ACCELERATOR} selected, but the "
+            f"_flagos_nccl native comm bridge cannot be configured: {exc}"
+        ) from exc
+    if extension is not None:
+        print(f"[setup] native comm bridge target: {extension.name}")
+    return extension
+
+
 def _verify_built_native_libs() -> None:
     lib = os.path.join(BASE_DIR, "torch_fl", "lib", "libtorch_fl.so")
     if not os.path.isfile(lib):
@@ -758,17 +792,53 @@ def _verify_built_native_libs() -> None:
 class BuildExtWithCmake(_build_ext):
     """Run cmake before setuptools builds torch_fl._C."""
 
+    def _prepare_nccl_extension(self):
+        """Finish the torch_fl.comm._nccl_ext._flagos_nccl target in place.
+
+        The target itself is appended in _get_setup_kwargs() so setuptools'
+        bookkeeping (finalize_options' ext_map, _needs_stub, get_outputs) sees
+        it. What can only be added here is torch's own include and library
+        paths, which belong to the interpreter build_deps() has just run with.
+        """
+        builder = _load_nccl_ext_builder()
+        for extension in self.extensions:
+            if extension.name != builder.WHEEL_EXTENSION_NAME:
+                continue
+            from torch.utils.cpp_extension import include_paths, library_paths
+
+            # Torch's paths go last so DTK's cuda.h/nccl.h win over any
+            # torch-shipped copy, the ordering build.py's CppExtension gives.
+            extension.include_dirs += include_paths()
+            extension.library_dirs += library_paths()
+            # The c10/torch/torch_cpu the factory's pybind module links against,
+            # mirroring CppExtension in torch_fl/comm/_nccl_ext/build.py.
+            extension.libraries += ["c10", "torch", "torch_cpu"]
+            print(
+                "[setup] _flagos_nccl link set: "
+                + ", ".join(extension.libraries)
+                + " | "
+                + ", ".join(extension.extra_link_args)
+            )
+            return
+
     def run(self):
         build_deps()
+        _write_compatibility_manifest(self.distribution.get_version())
+        self._prepare_nccl_extension()
         # ``build`` runs build_py before build_ext, but CMake installs package
         # data into torch_fl/ during build_ext. Setuptools caches build_py's file
         # list, so copy late-generated files explicitly into wheel staging.
         relative_paths = [
             "_build_config.py",
+            "compatibility.json",
             "lib/flagos_platform",
             "include/flagos.h",
         ]
         patterns = ["lib/*.so*", "lib/*.dylib*", "lib/*.dll", "lib/*.lib"]
+        if FLAGOS_ACCELERATOR == "metax":
+            patterns.extend(("lib_maca/*.so*", "lib_maca/vendor_version.py"))
+        if FLAGOS_ACCELERATOR == "ppu":
+            patterns.extend(("lib_ppu/*.so*", "lib_ppu/vendor_version.py"))
         if FLAGOS_ACCELERATOR == "dcu":
             # cmake installs the core-ABI shim straight into lib_dcu during
             # build_ext. build_py has already cached its file list by then, so
@@ -862,6 +932,21 @@ def _get_setup_kwargs():
             extra_link_args=extra_link_args,
         )
     ]
+    # torch_fl.comm._nccl_ext._flagos_nccl: the factory that exposes the
+    # vendor's ProcessGroupNCCL to a CPU-only torch wheel. Added to ext_modules
+    # here rather than at build_ext time so setuptools' own bookkeeping --
+    # finalize_options' ext_map/_needs_stub, get_outputs, and the inplace copy
+    # back into torch_fl/comm/_nccl_ext/ -- sees the target. torch's include and
+    # library paths are added later, in BuildExtWithCmake (they need the
+    # interpreter build_deps() runs with).
+    #
+    # Gated on RUN_BUILD_DEPS: resolving the DCU link set reads DTK paths that
+    # only a build environment has, so a metadata-only pass (egg_info, sdist,
+    # --version) must not need them.
+    if RUN_BUILD_DEPS:
+        nccl_ext = _nccl_ext_extension()
+        if nccl_ext is not None:
+            ext_modules.append(nccl_ext)
 
     package_data = {
         "torch_fl": [
@@ -872,10 +957,11 @@ def _get_setup_kwargs():
             # Self-contained wheels: the vendor's forked libtorch C++ .so bundled
             # here so the process loads that C++ runtime without a separate
             # vendor torch wheel (see scripts/vendor/bundle_*_libtorch.sh, and
-            # torch_fl/accelerator/_vendor_libtorch.py for the relink at import).
+            # torch_fl/accelerator/_vendor_libtorch.py for private selection).
             # The trailing * matters for lib_dcu: DTK's auditwheel-mangled
             # torch.libs deps end in a version suffix (libglog-6ed04f2c.so.0.0.0).
             "lib_maca/*.so*",
+            "lib_maca/vendor_version.py",
             "lib_dcu/*.so*",
             # DTK torch's own version.py, carried so _restore_dcu_hip_version()
             # can hand triton's hcu backend the hip/rocm strings the stock +cpu
@@ -883,7 +969,14 @@ def _get_setup_kwargs():
             # only match *.so*.
             "lib_dcu/vendor_version.py",
             "lib_ppu/*.so*",
+            "lib_ppu/vendor_version.py",
             "include/*.h",
+            # The native comm bridge's source, so the standalone builder
+            # (comm/_nccl_ext/build.py) can still rebuild the extension from an
+            # installed wheel. build.py itself ships with the package; the .cpp
+            # next to it does not, and a release that omitted it left users
+            # unable to rebuild _flagos_nccl in place.
+            "comm/_nccl_ext/*.cpp",
             # The DTK-private symbol manifest that libflagos_dtk_core_compat.so
             # must export, shipped so an installed wheel can be re-audited with
             # scripts/vendor/check_dcu_core_abi.py against a different DTK release.
@@ -893,20 +986,39 @@ def _get_setup_kwargs():
             # backends_metax.conf, ...). Now consolidated under configs/.
             "configs/backends*.conf",
             "codegen_skip_ops.txt",
+            "compatibility.json",
         ]
     }
 
-    version = "0.1.0"
-    # A local version segment tags which vendor a self-contained wheel bundles a
-    # forked libtorch for. That bundle is SDK-version-bound whether we say so or
-    # not -- DTK's libtorch_hip.so has librocblas.so.4 written into its
-    # DT_NEEDED -- so making the binding visible in the filename is strictly
-    # better than leaving two incompatible wheels both called 0.1.0. Override
-    # with FLAGOS_WHEEL_LOCAL to pin the exact SDK, e.g.
-    # FLAGOS_WHEEL_LOCAL=metax3.8.1 / FLAGOS_WHEEL_LOCAL=dtk2604.
-    _default_local = {"metax": "metax", "dcu": "dtk", "ppu": "ppu"}.get(
-        FLAGOS_ACCELERATOR
-    )
+    # The project version names the PyTorch minor line the wheel binds to, so
+    # torch_fl 2.10.0 is the release built against torch 2.10.x. The generated
+    # ATen bindings are tied to that same line (TORCH_PIN below), which makes a
+    # wheel unusable on any other one; carrying the line in the version keeps
+    # that visible from the filename alone. Bumping it is a deliberate act that
+    # belongs with a codegen regeneration, not a routine edit.
+    version = "2.10.0"
+    # A pre-release suffix, for cutting a release candidate before the release.
+    # PEP 440 spells it without a separator -- 2.10.0rc1 sorts below 2.10.0, so
+    # installing `torch_fl==2.10.0` does not pick the candidate up -- and the
+    # release workflow sets this from the tag it was triggered by. Unset (the
+    # normal case) leaves the version alone.
+    prerelease = os.environ.get("FLAGOS_WHEEL_PRERELEASE", "").strip()
+    if prerelease:
+        if not re.fullmatch(r"(a|b|rc)[0-9]+", prerelease):
+            raise ValueError(
+                f"FLAGOS_WHEEL_PRERELEASE={prerelease!r} is not a PEP 440 "
+                "pre-release suffix; expected something like 'rc1', 'a2' or 'b1'"
+            )
+        version = f"{version}{prerelease}"
+    # A local version segment names the SDK this wheel was built against. The
+    # bundle is SDK-bound whether we say so or not -- DTK's libtorch_hip.so has
+    # librocblas.so.4 written into its DT_NEEDED -- and a vendor publishes more
+    # than one SDK variant of the same platform (the nvidia lane carries CUDA
+    # 12.8 and 13.3 builds of everything, the metax lane two MACAs), so two
+    # incompatible wheels would otherwise both be called 2.10.0. The value comes
+    # from the platform table, where the other build facts live; override it with
+    # FLAGOS_WHEEL_LOCAL for a dev build that must pin something else.
+    _default_local = _platform_entry(FLAGOS_ACCELERATOR)["wheel_local"] or None
     local = os.environ.get("FLAGOS_WHEEL_LOCAL", _default_local)
     if local:
         version = f"{version}+{local}"
@@ -919,6 +1031,7 @@ def _get_setup_kwargs():
         packages=find_packages(
             include=["torch_fl*", "accelerator*", "csrc.runtime.accelerator*"]
         ),
+        scripts=["scripts/tools/torch-fl-preflight"],
         package_dir={"": "."},
         package_data=package_data,
         ext_modules=ext_modules,
@@ -928,9 +1041,15 @@ def _get_setup_kwargs():
             "clean": BuildClean,  # type: ignore[misc]
         },
         include_package_data=False,
-        python_requires=">=3.8",
+        python_requires=_requires_python(),
         install_requires=_install_requires(),
-        extras_require={"cuda": _cuda_runtime_requires()},
+        # No extras_require here: pyproject.toml's
+        # [project.optional-dependencies] owns that table and setuptools reports
+        # `extras_require` overwritten in `pyproject.toml` when both are given,
+        # so a `cuda` extra declared here was never in any artifact. The CUDA
+        # runtime dependencies are hard requirements on that platform anyway
+        # (_install_requires), and `pip install torch_fl[cuda]` is unaffected --
+        # it never resolved to anything.
     )
 
 
@@ -957,26 +1076,112 @@ _CUDA_RUNTIME_DEPS = [
 ]
 
 
-def _cuda_runtime_requires():
-    return list(_CUDA_RUNTIME_DEPS)
+# torch_fl is a thin build on three packages that live outside this repository:
+# FlagTree (the Triton build carrying the vendor backend), FlagGems (the operator
+# source) and FlagCX (the distributed backend). Omitting them is not a crash --
+# every import in the Python layer is guarded -- but the result is a flagos device
+# that routes no operator and a distributed path staged through the host, so the
+# wheel declares the exact versions it was built and measured against.
+#
+# The versions come from .github/version-pins.env, the file the CI setup scripts
+# source, rather than a second copy here. Two things that file settles and a
+# guessed range does not:
+#
+#   * flagtree and flagcx are not on PyPI at all, and flag_gems on a generic
+#     index resolves to an older cohort (5.0.x) than the one the per-op routing
+#     tables in torch_fl/configs/backends_*.conf were generated against, so a
+#     floor like `flag_gems>=5.0.2` is satisfied by a build this wheel was never
+#     measured on;
+#   * FlagTree is per-platform -- the same package name carries the vendor's own
+#     Triton backend (0.7.0rc2+hcu3.6 for DCU, 0.7.0rc3+metax3.6 for MetaX) -- so
+#     a plain `triton` requirement is the wrong shape. Declaring triton next to a
+#     vendor FlagTree is what produces Ascend's "0 active drivers" failure.
+#
+# Resolution needs an index that carries both locations: FlagTree is published to
+# flagos-pypi-hosted while flag_gems and flagcx sit in the per-vendor lane
+# (flagos-pypi-<vendor>), which is exactly how the CI scripts are configured
+# (FLAGTREE_INDEX_URL and FLAGGEMS_INDEX_URL in .github/scripts/hooks/set_env_*.sh).
+# A single --index-url therefore has to name a group repository containing both,
+# plus a proxy for PyPI and one for download.pytorch.org/whl/cpu.
+VERSION_PINS = os.path.join(SOURCE_DIR, ".github", "version-pins.env")
 
 
-def _vendor_supplies_triton() -> bool:
-    """True when the target platform ships its own Triton, so PyPI's
-    NVIDIA-targeted wheel must not be pulled in as a dependency.
+def _requires_python() -> str:
+    """The one interpreter line this wheel can be installed with.
 
-    - FLAGOS_ACCELERATOR=dcu: DTK ships its own Triton (and builds pure-boxing).
-    - FLAGOS_ACCELERATOR=ascend: `triton` is provided by FlagTree, installed out of
-      band (it has no PyPI release satisfying `triton>=3.5.1`). Declaring the
-      dep makes pip install stock triton over FlagTree, after which any
-      Triton entry point dies with "0 active drivers".
-    - PPU (FLAGOS_ACCELERATOR=ppu): the vendor Triton lives on a private index and is
-      versioned 3.x+<sdk> (e.g. 3.5.0+v0.2.0.ppu2.1.0), which does not satisfy
-      a `triton>=3.5.1` pin; its sdist is also a download shim that pip cannot
-      always build. Install it manually, then `pip install --no-deps` this
-      package. See "Build from Source (PPU Platform)" in the README.
+    A FlagTree build is published for exactly one cp tag, torch_fl links that
+    build, and the wheel filename already carries the tag -- so the interpreter
+    is fixed per platform: 3.12 on cuda/gcu/metax/ppu, 3.10 on dcu/musa, 3.11 on
+    ascend. Declaring `>=3.8` let a resolver accept 3.8, 3.9 or 3.13, none of
+    which has a FlagTree, and the failure surfaced much later inside the
+    extension instead of at install time.
+
+    Spelled `>=3.12,<3.13` rather than `==3.12`, which does not mean what it
+    looks like: `==3.12` matches the version 3.12 exactly, and no interpreter
+    reports that -- CPython reports 3.12.3, so every install was rejected by its
+    own interpreter the first time this was written. The range says "this minor
+    line", which is the actual constraint.
     """
-    return FLAGOS_ACCELERATOR in ("dcu", "ascend", "ppu")
+    pins = _version_pins()
+    version = pins.get(f"FLAGTREE_PYTHON_VERSION_{FLAGOS_ACCELERATOR}")
+    if not version:
+        # tsingmicro and bpu build no FlagTree; they also publish no wheel, so
+        # this only affects a local build of one of them.
+        return ">=3.8"
+    major, minor = version.split(".")[:2]
+    return f">={major}.{minor},<{major}.{int(minor) + 1}"
+
+
+def _version_pins() -> dict:
+    """The KEY=VALUE assignments of .github/version-pins.env.
+
+    Read as data rather than sourced. The file says of itself that it is "a plain
+    assignment file meant to be sourced" -- no `export`, no quoting and no value
+    that expands a variable -- so a parser here is the same read the CI scripts
+    do, and the two cannot drift into disagreeing about a pin.
+    """
+    if not os.path.isfile(VERSION_PINS):
+        raise RuntimeError(
+            f"{VERSION_PINS} is missing, so the FlagTree/FlagGems/FlagCX versions "
+            "this wheel must declare are unknown. They cannot be guessed: the "
+            "package names are vendor- and cohort-specific. Build from a checkout "
+            "of the repository."
+        )
+    pins = {}
+    with open(VERSION_PINS, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            pins[key.strip()] = value.strip().strip("\"'")
+    return pins
+
+
+def _flagos_sibling_requires() -> list:
+    """FlagTree, FlagGems and FlagCX at the versions this wheel was built against."""
+    pins = _version_pins()
+    reqs = []
+    flagtree = pins.get(f"FLAGTREE_VERSION_{FLAGOS_ACCELERATOR}")
+    if flagtree:
+        # FlagTree *is* Triton -- it installs a `triton` distribution -- so
+        # pinning it is what keeps a stock NVIDIA triton wheel out of the
+        # environment on every platform that has a FlagTree build.
+        reqs.append(f"flagtree=={flagtree}")
+    else:
+        # No FlagTree build is published for this platform, so Triton has to
+        # come from somewhere else. tsingmicro and bpu are the two.
+        reqs.append("triton>=3.5.1")
+    flag_gems = pins.get("FLAGGEMS_VERSION_DEFAULT")
+    if not flag_gems:
+        raise RuntimeError(f"{VERSION_PINS} defines no FLAGGEMS_VERSION_DEFAULT")
+    reqs.append(f"flag_gems=={flag_gems}")
+    flagcx = pins.get(f"FLAGCX_VERSION_{FLAGOS_ACCELERATOR}")
+    if flagcx:
+        # Only the platforms whose vendor runtime FlagCX has a build for. The
+        # others fall back to the NCCL-shaped path, so there is nothing to pin.
+        reqs.append(f"flagcx=={flagcx}")
+    return reqs
 
 
 # The checked-in csrc/aten/generated/* bindings are generated against a
@@ -990,15 +1195,8 @@ TORCH_PIN = "torch>=2.10,<2.11"
 
 
 def _install_requires():
-    reqs = [TORCH_PIN]
-    # FlagGems (and its Triton) is the default operator source, so it is a hard
-    # runtime dep everywhere it can actually run. Platforms that ship their own
-    # Triton are the exception: pulling PyPI's NVIDIA-targeted triton wheel would
-    # install ~200 MB of the wrong artifact (or fail to resolve outright). All
-    # flag_gems imports in the Python layer are ImportError-guarded, so omitting
-    # it is safe.
-    if not _vendor_supplies_triton():
-        reqs += ["flag_gems>=5.0.2", "triton>=3.5.1"]
+    reqs = [TORCH_PIN, "packaging>=23"]
+    reqs += _flagos_sibling_requires()
     # For a CUDA wheel we bundle libtorch_cuda.so and preload it at import; it
     # needs the NVIDIA runtime libs present, so make them hard deps. Ascend/MetaX
     # builds do not (they supply their own runtime), so keep it CUDA-only.

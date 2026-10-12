@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -56,19 +57,21 @@ std::string DefaultConfigPath() {
         if (test.is_open()) return candidate;
       }
 
-      // Try package-relative: <dir>/../configs/backends.conf
-      std::string candidate = dir + "/../configs/backends.conf";
+      // No platform-specific conf (cuda/metax/dcu/ppu): the CUDA conf is the
+      // base list those builds inherit. Python normally sets the path via
+      // SetBackendConfigPath(); this is only the last-resort default.
+      std::string candidate = dir + "/../configs/backends_cuda.conf";
       std::ifstream test(candidate);
       if (test.is_open()) return candidate;
-      // Try: <dir>/configs/backends.conf
-      candidate = dir + "/configs/backends.conf";
+      // Try: <dir>/configs/backends_cuda.conf
+      candidate = dir + "/configs/backends_cuda.conf";
       test.open(candidate);
       if (test.is_open()) return candidate;
     }
   }
 #endif
   // Fallback to build-time path
-  return FLAGOS_SOURCE_ROOT "/torch_fl/configs/backends.conf";
+  return FLAGOS_SOURCE_ROOT "/torch_fl/configs/backends_cuda.conf";
 }
 
 std::string TrimStr(std::string s) {
@@ -479,12 +482,115 @@ bool FlagGemsRejectsDtype(at::ScalarType dtype) {
   // dtype FlagGems' Ascend route could not serve across the pointwise family;
   // fp32/fp16/bf16/int64/bool all compile and run.
   return dtype == at::kDouble;
+#elif defined(USE_GCU)
+  // See the declaration in common.h for the measurement. int64 is the dtype
+  // that matters: it fails inside the compiler for every flag_gems pointwise
+  // kernel that takes one, and for remainder.Tensor it does not fail at all --
+  // it returns int32. float64 fails the same way but is deliberately left
+  // alone, because one FlagGems float64 route in the same seven-op
+  // intersection (remainder.Tensor) is correct today.
+  return dtype == at::kLong;
 #else
   // No vendor route is known to be dtype-limited in this way. MUSA's
   // FlagGems gaps are per-op (a Python-float operand against a bf16 tensor)
   // and are already recorded in NATIVE_TRITON_GAPS, so they are not reached
   // from here.
   (void)dtype;
+  return false;
+#endif
+}
+
+bool FlagGemsRejectsOpDtype(const char* op_name, at::ScalarType dtype) {
+  if (FlagGemsRejectsDtype(dtype)) return true;
+#if defined(USE_ASCEND)
+  // The intersection this table exists for: a FlagGems kernel that does not
+  // guard the element type it code-generates, for a dtype the reference
+  // implementation of that op rejects outright. See the declaration in
+  // common.h for why neither a conf entry nor the dtype-wide predicate can
+  // state it.
+  //
+  // `neg` over bool. flag_gems/ops/neg.py is a bare pointwise `-x`, so a bool
+  // operand is code-generated like any other element type and lowers to
+  // `hivm.hir.vadd` over `i1`, which BiShengIR refuses to verify:
+  //
+  //   MLIRCompilationError: 'hivm.hir.vadd' op failed to verify that operand
+  //   at idx 0 and 1 should have element type 16-bit signless integer or
+  //   32-bit signless integer or 16-bit float or 32-bit float or 64-bit
+  //   signless integer
+  //
+  // (Ascend910, CANN 9.0.0, FlagTree 0.6.2a1+ascend3.5.) Reached through the
+  // vendor slot instead, the aclnn kernel falls back to at::neg on a CPU copy
+  // for a dtype IsUnaryDtypeSupported does not cover -- which is where the
+  // reference behaviour
+  //
+  //   RuntimeError: Negation, the `-` operator, on a bool tensor is not
+  //   supported. If you are trying to invert a mask, use the `~` or
+  //   `logical_not()` operator instead.
+  //
+  // is raised. tests/integration/test_dtype_coverage.py pins that contract.
+  //
+  // `neg_` is deliberately absent: its vendor template (T_INPLACE_UNARY) has
+  // no dtype guard at all, so routing bool there reaches aclnnInplaceNeg and
+  // fails with "aclnnInplaceNegGetWorkspaceSize failed, ret=161002" rather
+  // than with the reference message. That is a separate defect in the
+  // in-place codegen and is left visible rather than papered over here.
+  //
+  // `mm` and `mm.out` over the integral dtypes are the second entry, and the
+  // only one where the op stays on the FlagGems route while part of its dtype
+  // set leaves it. The FlagGems matmul kernel builds its tl.dot from the
+  // operand element type, and the Ascend dot intrinsic takes floating point
+  // only, so int64/int32/int16/uint8 operands die inside the compiler:
+  //
+  //   triton.compiler.errors.CompilationError: at 56:15:
+  //     acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
+  //   AssertionError('Unsupported lhs dtype int64')
+  //
+  // (Ascend910C, CANN 9.0.0, shipped backends_ascend.conf.) int8 is the
+  // exception and is left alone: tl.dot accepts it and the FlagGems route is
+  // correct for it. The aclnn kernel behind the vendor slot serves all four --
+  // integer matmul is exact there, so this is not a precision trade. Measured
+  // on the same conf: int64/int32/int16/uint8 `mm` on the vendor route agree
+  // with the CPU reference exactly.
+  //
+  // A route cannot state this split, which is why the table has to. `mm` was
+  // moved off the vendor route because the aclnn cube path downcasts fp32 to
+  // HF32 across the whole float family -- 4.7e-3 against a CPU reference, where
+  // tests/integration/runtime asserts 1e-3 and the FlagGems kernel answers
+  // 8.6e-6 against that same reference (see NATIVE_TRITON_GAPS in
+  // scripts/codegen/gen_vendor_confs.py). Leaving mm on the vendor route keeps
+  // the float failure; leaving every dtype of it on FlagGems turns working
+  // integral matmul into a compile error.
+  struct OpDtypeGap {
+    at::ScalarType dtype;
+    const char* op_name;
+  };
+  static constexpr OpDtypeGap kGaps[] = {
+      {at::kBool, "neg"},
+      // Integral matmul: the four dtypes the Ascend dot intrinsic refuses.
+      // "mm.out" is its own conf key, so it needs its own entries.
+      {at::kLong, "mm"},
+      {at::kInt, "mm"},
+      {at::kShort, "mm"},
+      {at::kByte, "mm"},
+      {at::kLong, "mm.out"},
+      {at::kInt, "mm.out"},
+      {at::kShort, "mm.out"},
+      {at::kByte, "mm.out"},
+  };
+
+  for (const OpDtypeGap& gap : kGaps) {
+    // dtype first, so the common path costs one enum compare per entry before
+    // any strcmp -- this runs on every FlagGems dispatch.
+    if (dtype == gap.dtype && std::strcmp(op_name, gap.op_name) == 0) {
+      return true;
+    }
+  }
+  return false;
+#else
+  // No vendor route is known to have a gap that is specific to one op and
+  // dtype in this way. See the dtype-wide case above for what MUSA records
+  // instead.
+  (void)op_name;
   return false;
 #endif
 }

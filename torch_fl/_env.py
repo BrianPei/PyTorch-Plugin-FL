@@ -196,6 +196,9 @@ FOREIGN: dict[str, str] = {
     "TRITON_ENABLE_TASKQUEUE": "the FlagTree Ascend Triton launch queue",
     "COMPILE_ARCH": "Enflame's tops compiler architecture",
     "HB_DNN_USER_DEFINED_L2M_SIZES": "the BPU hbdk runtime's L2M sizing",
+    "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER": (
+        "Inductor's choice between its static Triton launcher and Triton's own"
+    ),
 }
 
 
@@ -346,9 +349,22 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
     ),
     "FLAGOS_WHEEL_LOCAL": (
         SCOPE_BUILD,
-        "SDK-derived",
-        "Local version label for the wheel (e.g. metax3.8.1), for dev builds "
-        "that must pin the exact SDK",
+        "The platform's wheel_local from cmake/flagos_platforms.json",
+        "Local version label for the wheel -- the SDK it was built against, in "
+        "the spelling the vendor's own wheels use (2.10.0+cuda13.3, "
+        "2.10.0+dtk2604). It is the build variant, not the publishing target: "
+        "the artifact goes to one lane, flagos-pypi-<vendor>, so the lane is "
+        "already implied and does not appear in the name. Overriding it is for "
+        "a dev build that must pin something else",
+    ),
+    "FLAGOS_WHEEL_PRERELEASE": (
+        SCOPE_BUILD,
+        "Unset",
+        "PEP 440 pre-release suffix for the wheel version (rc1, a1, b1), for "
+        "cutting a release candidate. The release workflow sets it from the tag, "
+        "so v2.10.0rc1 produces torch_fl-2.10.0rc1+cuda13.3; PEP 440 sorts that "
+        "below 2.10.0, so installing torch_fl==2.10.0 does not pick the "
+        "candidate up",
     ),
     "FLAGOS_SKIP_CUDA_ASSETS": (
         SCOPE_BUILD,
@@ -404,6 +420,13 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
         SCOPE_RUNTIME,
         "0 (off)",
         "Leave the FlagGems Python layer unregistered (C++ stub-only mode)",
+    ),
+    "FLAGOS_STARTUP_PROFILE": (
+        SCOPE_RUNTIME,
+        "full",
+        "Choose full import-time framework integration or minimal startup with "
+        "explicit activation. FlagTree, FlagGems, and FlagCX remain required "
+        "dependencies in both profiles",
     ),
     # --- Runtime diagnostics ---------------------------------------------
     "FLAGOS_LOG": (
@@ -461,15 +484,49 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
     ),
     "FLAGOS_DCU_SDPA_FLASH": (
         SCOPE_RUNTIME,
-        "0 (off)",
-        "Keep the fused SDPA backends enabled on DCU. The default disables "
-        "flash/mem-efficient SDPA so scaled_dot_product_attention's own choice "
-        "agrees with the only kernel this stack can execute",
+        "1 (on)",
+        "Point DTK's SDPA selector at its CUTLASS flash adapter when a stack "
+        "has one. Set 0 to force the math decomposition, which is what a stack "
+        "without DTK's flash-attn library falls back to anyway",
     ),
     "FLAGOS_DISABLE_APEX_COMPAT": (
         SCOPE_RUNTIME,
         "0 (off)",
         "Disable the optional Apex multi-tensor compatibility layer",
+    ),
+    "FLAGOS_DISABLE_FLEX_ATTENTION_COMPAT": (
+        SCOPE_RUNTIME,
+        "0 (off)",
+        "Leave flex_attention's hard-coded {cuda, cpu, xpu, hpu} device gate "
+        "alone, so a flagos tensor is refused at the entry point as it is "
+        "upstream. Set 1 to measure a platform against that gate unchanged",
+    ),
+    "FLAGOS_DISABLE_QWENIMAGE_ROPE": (
+        SCOPE_RUNTIME,
+        "0 (off)",
+        "Leave diffusers' Qwen-Image rotary-embedding table alone. On the "
+        "flagos device (GCU, Ascend, ...) torch_fl registers that device there, "
+        "which is what keeps the rotation off the complex exponential diffusers "
+        "would otherwise fall back to -- a path the backend may not be able to "
+        "run at all; set 1 to measure that difference. A capability switch, not "
+        "a route switch",
+    ),
+    # --- Distributed -----------------------------------------------------
+    "FLAGOS_DIST_REDIRECT_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Answer a plain init_process_group(backend='gloo') / new_group request "
+        "with the flagos backend when the process accelerator is the flagos "
+        "device. Set 0 to keep the requested backend, which then rejects flagos "
+        "tensors. See torch_fl/comm/process_group.py",
+    ),
+    "FLAGOS_DIST_STAGED_GLOO": (
+        SCOPE_RUNTIME,
+        "1 (on)",
+        "Allow the host-staged gloo inner backend: the last fallback tier when no "
+        "vendor communicator (FlagCX/NCCL/HCCL/MCCL) is available. It needs no "
+        "vendor library but copies every flagos operand device->host->device. Set "
+        "0 to fail loudly instead of staging",
     ),
     "FLAGOS_DIST_FORCE_NCCL": (
         SCOPE_TEST,

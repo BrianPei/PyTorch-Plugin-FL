@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Symlink the PPU libtorch .so into the active (official) torch wheel's lib dir.
+"""Select PPU libtorch through a private torch facade.
 
 PPU builds against ``PPU_SDK/CUDA_SDK`` with its own ``FLAGOS_ACCELERATOR=ppu`` value;
 the CUDA boxing kernels apply unchanged.  What differs from a real NVIDIA box is the
@@ -25,8 +25,8 @@ That local build also links the system MKL from ``/usr/local/lib``
 (``libmkl_core``/``libmkl_gnu_thread``/``libmkl_intel_lp64``), which the bundling
 script copies into ``lib_ppu/`` alongside the core libs.
 
-See ``torch_fl.accelerator._vendor_libtorch`` for the symlink mechanism and why a
-ctypes preload cannot replace core libs.  No env gate: the relink is skipped when
+See ``torch_fl.accelerator._vendor_libtorch`` for the private facade mechanism and
+why a ctypes preload cannot replace core libs. No env gate: selection is skipped when
 ``torch_fl/lib_ppu/`` was not bundled or torch already IS the PPU build.  The PPU
 SDK runtime stays on the target under ``/usr/local/PPU_SDK``.
 """
@@ -99,10 +99,10 @@ def _discover_ppu_torch_lib():
 
 
 def ensure_ppu_libtorch_links():
-    """Symlink the active torch wheel's core .so to the PPU build's copies.
+    """Select the PPU core without changing the installed torch wheel.
 
-    Idempotent; reversible via ``torch/lib/_orig_backup/``.  Returns True if
-    links are in place (or already were), False if there was nothing to do.
+    Idempotent. Returns True if the vendor core is selected, False if there was
+    nothing to do.
     """
     return ensure_vendor_libtorch_links(
         _BUNDLE_DIR,
@@ -116,6 +116,57 @@ def ensure_ppu_libtorch_links():
     )
 
 
+def _cuda_version_string(compiled_version):
+    """Convert PyTorch's integer CUDA ABI code (for example 13000) to 13.0."""
+    try:
+        value = int(compiled_version)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"PPU libtorch reported an invalid compiled CUDA version: "
+            f"{compiled_version!r}"
+        ) from exc
+    if value < 1000 or value % 10:
+        raise RuntimeError(
+            f"PPU libtorch reported an invalid compiled CUDA version: {value}"
+        )
+    major = value // 1000
+    minor = (value % 1000) // 10
+    return f"{major}.{minor}"
+
+
+def restore_ppu_cuda_version():
+    """Reconcile stock ``torch+cpu`` metadata with the loaded PPU runtime.
+
+    ``torch.version.cuda`` comes from the Python wheel's generated version.py.
+    Relinking that wheel to PPU's CUDA-enabled libtorch changes the actual C++
+    runtime but cannot update the Python constant, leaving third-party packages
+    such as bitsandbytes to mis-detect the live PPU as a CPU-only runtime.
+
+    Query the version from the loaded C++ runtime instead of hard-coding an SDK
+    release or carrying a second version file. A real vendor Torch already has
+    the correct value and is left unchanged.
+    """
+    import torch
+
+    current = getattr(torch.version, "cuda", None)
+    if current:
+        return current
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "PPU libtorch is active but torch.cuda.is_available() is false; "
+            "the vendor runtime was not loaded before importing torch"
+        )
+    getter = getattr(torch._C, "_cuda_getCompiledVersion", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "PPU libtorch does not expose torch._C._cuda_getCompiledVersion; "
+            "cannot reconcile the CPU wheel's CUDA metadata"
+        )
+    version = _cuda_version_string(getter())
+    torch.version.cuda = version
+    return version
+
+
 def restore_original_libtorch():
-    """Undo ensure_ppu_libtorch_links(): remove links, restore backups."""
+    """Compatibility no-op; the installed torch wheel is never modified."""
     _restore(_CORE_SO, _CUDA_SO, bundle_dirname=_BUNDLE_DIR)

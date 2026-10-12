@@ -391,7 +391,13 @@ class CannDeviceTracer final : public DeviceTracer {
   void popCorrelation() override {
     std::lock_guard<std::mutex> lock(mutex_);
     if (active_) {
-      api_.pop_external(MSPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, nullptr);
+      // MSPTI documents `lastId` as optional ("can be NULL") but rejects a null
+      // pointer with MSPTI_ERROR_INVALID_PARAMETER without unwinding the stack,
+      // so a null here leaves every later launch stamped with the most recently
+      // pushed id -- the op that starts after it rather than the op that issued
+      // it. Pass a real address, as the CUPTI and MUPTI tracers do.
+      uint64_t last = 0;
+      api_.pop_external(MSPTI_EXTERNAL_CORRELATION_KIND_CUSTOM0, &last);
     }
   }
 

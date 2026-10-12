@@ -18,8 +18,8 @@ on:
   workflow_call:
     inputs:
       # Longer than the other platforms: this job builds the accelerator payload
-      # (CUDA PyTorch, the FlagGems C++ operators) that a prebuilt image used to
-      # supply, so it spends minutes the image-based jobs spend on a pull.
+      # (CUDA PyTorch) when the selected image does not carry the matching
+      # PyTorch version, so it spends minutes the image-based jobs spend on a pull.
       timeout-minutes:
         description: "Timeout for the entire job in minutes"
         required: false
@@ -48,9 +48,8 @@ jobs:
       - torch-fl-nv
     timeout-minutes: ${{ inputs['timeout-minutes'] }}
     container:
-      # The FlagOS CUDA image rather than a stock NVIDIA one: it already carries
-      # the CUDA PyTorch and the FlagGems C++ operators that `set_env_cuda.sh`
-      # would otherwise have to produce in the job, and its Ubuntu 24.04 userland
+      # This FlagOS CUDA image carries PyTorch and the FlagGems C++ operators;
+      # its Ubuntu 24.04 userland
       # is the glibc baseline the FlagTree wheels this job installs are built
       # for. The CUDA line it ships is 13.0, which is what the script's cu130
       # PyTorch pin and its `torch.version.cuda == "13.0"` assertion expect.
@@ -80,11 +79,11 @@ jobs:
       # Restore pip downloads from a previous run so the smaller venv-side
       # wheels (transformers, flagtree, pytest) are fetched once and reused.
       # The giant CUDA and CPU torch wheels are excluded via --no-cache-dir in
-      # set_env_cuda.sh (they download fast from pytorch.org and would bloat
+      # the CUDA platform hook (they download fast from pytorch.org and would bloat
       # the archive past the self-hosted runner's upload capacity). The cache
       # only skips the download, not the install, so the isolated venv is still
       # rebuilt fresh each run. PIP_CACHE_DIR is persisted to $GITHUB_ENV by
-      # set_env_cuda.sh so every step shares the cache directory.
+      # set_env.sh so every step shares the cache directory.
       #
       # Save is split out to an explicit actions/cache/save step at the end of
       # the job (see "Save pip downloads") so it can carry a timeout-minutes:
@@ -92,15 +91,15 @@ jobs:
       # and on the CUDA runner an upload stall would otherwise hold the
       # torch-fl-nv runner indefinitely and block queued jobs.
       #
-      # set_env_cuda.sh is hashed because the real version pins (torch,
-      # flagtree, FlagGems revision) live there; without it a pin bump leaves
+      # The platform hook and shared version table are hashed because the
+      # actual dependency pins live there; without them a pin bump leaves
       # the key unchanged, the exact-hit skips the save, and the new wheels are
       # discarded every run.
       - name: Restore pip downloads
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_cuda.sh') }}
+          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_cuda.sh') }}
           restore-keys: |
             cuda-pip-${{ runner.os }}-py312-
         timeout-minutes: 5
@@ -108,10 +107,13 @@ jobs:
       - name: Prepare CUDA build environment
         env:
           CI_STAGE: integration
-        run: bash .github/scripts/set_env_cuda.sh
+        run: bash .github/scripts/set_env.sh --platform cuda
 
       - name: Build wheel
         run: python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform cuda --check-build-env
 
       - name: Install wheel
         run: python -m pip install --force-reinstall --no-deps dist/*.whl
@@ -141,5 +143,5 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_cuda.sh') }}
+          key: cuda-pip-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_cuda.sh') }}
         timeout-minutes: 10

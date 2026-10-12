@@ -109,6 +109,8 @@ Ops without a `topsaten` kernel are **not registered** on `PrivateUse1` at all, 
 
 GCU device pointers are device-scoped (no unified addressing): a pointer only resolves against the **current** device. The allocator and every kernel select the device first, and the default stream is per-device.
 
+A copy between two cards is a separate case that selecting the device does not fix. `topsMemcpy` with a device-to-device kind returns an error and leaves the destination byte-for-byte unchanged when the two pointers live on different cards, under every candidate current device, so a copy routed through it moves nothing while reporting a failure that callers commonly ignore — the visible symptom is a tensor that keeps its previous contents, not an exception. `topsMemcpyPeer` is the entry point that transfers the bytes, and it requires the current device to be one of the two cards. Both copy paths in the runtime (`csrc/runtime/accelerator/gcu/memory.cc` and `csrc/runtime/allocator/backends/gcu_memory.h`) resolve both pointers and take the peer route when their devices differ. The asynchronous peer entry point is stricter still: it also needs the caller's stream to belong to the source's device, and stalls the caller rather than returning an error when it does not.
+
 ### Contiguous input requirement
 
 Unlike `mudnn` (MUSA), `topsaten` does not honor strides on non-contiguous inputs. Generated kernels call `.contiguous()` where necessary to materialize a contiguous copy before passing to `topsaten`.
@@ -130,6 +132,38 @@ The GCU compatibility layer prepares the vendor Triton runtime but does not call
 `flag_gems.enable()` to register a competing PrivateUse1 implementation. This
 keeps one wrapper per overload and allows native and FlagGems RNG paths to share
 the same per-device seed/offset stream.
+
+### One stream, two producers
+
+`topsaten` and FlagGems submit to the **same** tops stream, so a run mixes two
+producers on one queue. `EXEC_TOPSATEN_CMD` submits to `GetCurrentTopsStream()`
+and Triton's enflame driver reads the handle back from
+`torch.gcu.current_stream(idx).gcu_stream`; measured on an S60 the two were equal
+process after process.
+
+Sharing a stream is not by itself enough to order them. A `topsaten` op that is
+merely *submitted* behind an already-queued Triton kernel does not read that
+kernel's output on this hardware, so a FlagGems producer followed by a `topsaten`
+consumer races unless the stream is drained in between:
+
+- `EXEC_TOPSATEN_CMD` (`csrc/aten/backends/gcu/topsaten_common.h`) synchronises
+  the stream **before** issuing its op as well as after it.
+- `BlockingCopyGuard::DrainCurrentQueue` (`csrc/aten/copy_ops.cc`) drains the
+  same stream on GCU, so a blocking device-to-host copy waits for a FlagGems
+  kernel rather than reading the buffer ahead of it.
+
+Only the consumer side needs this. The trailing synchronise in
+`EXEC_TOPSATEN_CMD` has already emptied the stream when the next FlagGems kernel
+is launched, so a FlagGems op that follows a `topsaten` op is ordered without
+help. The cost is close to free in the steady state for the same reason: only
+work issued since the last `topsaten` op can be in flight, which is exactly the
+FlagGems work the barrier exists to wait for.
+
+The failure mode this prevents is not a stale read that looks like a small
+numerical difference. Measured at `transformer_blocks.0.attn.norm_q`, the
+Qwen-Image transformer's attention RMSNorm, an unordered consumer of a FlagGems
+`mean` produced NaN in 131072 places (1024 rows of 128 lanes) and finite values
+up to 5.66e7, and the pipeline decoded a black image.
 
 Installation, routing, and operator-specific failure modes are documented in
 [flaggems-setup.md](flaggems-setup.md); the measured per-operator results are in

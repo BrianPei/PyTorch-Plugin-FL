@@ -90,14 +90,26 @@ at::Tensor IndexBoolMaskAscend(const at::Tensor& self,
 
 at::Tensor IndexTensorKernelAscend(const at::Tensor& self,
                                    const c10::List<::std::optional<at::Tensor>>& indices) {
+  // Issue #326: aclnn reads the ambient device, so make the one
+  // this kernel actually operates on current.
+  ::at::native::flagos::ascend::OpDeviceGuard device_guard_(
+      ::at::native::flagos::ascend::DeviceOf(self));
   namespace ascend = at::native::flagos::ascend;
 
-  // Collect defined index tensors and their positions
+  // Collect defined index tensors and their positions.
+  //
+  // A dimension that is not indexed reaches this kernel in one of two ways:
+  // `None` in a hand-built index list arrives as an empty optional, while the
+  // C++ dispatcher path (`x[:, idx]` -> `impl::recordTensorIndex` in
+  // TensorIndexing.h) pads the skipped leading dimensions with an
+  // engaged-but-undefined tensor. Both mean "no index here", so testing
+  // `has_value()` alone records the placeholder as a real index and shifts
+  // every following position by one.
   std::vector<at::Tensor> defined_indices;
   std::vector<int64_t> defined_positions;
   for (size_t i = 0; i < indices.size(); ++i) {
     const auto& idx = indices.get(i);
-    if (idx.has_value()) {
+    if (idx.has_value() && idx->defined()) {
       defined_indices.push_back(idx.value());
       defined_positions.push_back(static_cast<int64_t>(i));
     }

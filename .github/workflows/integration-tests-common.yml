@@ -23,6 +23,9 @@ on:
       setup_script:
         required: true
         type: string
+      setup_platform:
+        required: true
+        type: string
       image:
         required: true
         type: string
@@ -71,7 +74,7 @@ jobs:
       # passes --no-cache-dir); wipe before restore so the uploaded archive stays
       # bounded to this run's downloads. The GCU container's /github/home mount
       # is not writable by the runtime user, so the pip cache lives under
-      # RUNNER_TEMP (see PIP_CACHE_DIR in set_env_gcu.sh); wipe that path here.
+      # RUNNER_TEMP (see PIP_CACHE_DIR in set_env.sh); wipe that path here.
       - name: Reset pip cache dir
         shell: bash
         run: rm -rf "${RUNNER_TEMP}/pip-cache"
@@ -88,13 +91,13 @@ jobs:
       # exact hit on the build cache would skip the save and discard the
       # integration-only downloads (pytest, test deps). restore-keys fall back
       # to the build prefix so the build cache is reused, then to the legacy
-      # unsuffixed key for migration. The setup script is hashed because the
-      # real version pins live there, not in pyproject/setup.py.
+      # unsuffixed key for migration. The hooks and shared pin table are
+      # hashed because dependency versions live there, not only in pyproject/setup.py.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/pip-cache
-          key: ${{ inputs.display_name }}-integration-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/scripts/set_env_*.sh') }}
+          key: ${{ inputs.display_name }}-integration-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_*.sh') }}
           restore-keys: |
             ${{ inputs.display_name }}-integration-pip-${{ runner.os }}-
             ${{ inputs.display_name }}-build-pip-${{ runner.os }}-
@@ -103,7 +106,7 @@ jobs:
       - name: Prepare platform environment
         env:
           CI_STAGE: integration
-        run: bash "${{ inputs.setup_script }}"
+        run: bash "${{ inputs.setup_script }}" --platform "${{ inputs.setup_platform }}"
 
       - name: Download wheel artifact
         if: inputs.wheel_source == 'artifact'
@@ -117,6 +120,9 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform "$FLAGOS_ACCELERATOR" --check-build-env
 
       - name: Install wheel and test dependencies
         run: |

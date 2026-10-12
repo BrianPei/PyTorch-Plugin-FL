@@ -87,13 +87,32 @@ time to the wrong operator.
 ### 1.2 NVIDIA implementation — `cupti_device_tracer.cc`
 
 Every CUPTI/MCPTI type, callback-ID table, and activity-record layout mirror appears only in
-this file:
+this file and its `cupti_shim.h` (which nothing else includes):
 
 - `CuptiTracerInit` (file-level static) — arms CUPTI at module load; see §3.1
 - `bufferRequested` / `bufferCompleted` — CUPTI activity buffer callbacks
-- `CuptiDeviceTracer::processBuffer()` — decodes CUPTI activity records into `DeviceEvent`s
+- `CuptiDeviceTracer::processBuffer()` — decodes CUPTI activity records into `DeviceEvent`s.
+  Iteration ends on the iterator's own end-of-buffer signal; the per-buffer record bound is
+  `validSize / sizeof(uint32_t)`, the most records a buffer can physically hold, so a vendor
+  whose records are small and numerous (PPU emits a correlation record and a driver record per
+  runtime call) cannot be truncated by a flat record count
 - `cuptiActivityPushExternalCorrelationId` / `Pop...` — correlation push/pop
 - Kernel name demangling (`abi::__cxa_demangle`)
+- The runtime callback-id → API name lookup, which is **not** written by hand.
+  `csrc/profiler/cupti_shim.h` includes
+  `csrc/profiler/generated/cupti_runtime_cbid_names.inc`, a table of 523 entries
+  generated from CUPTI's own `cupti_runtime_cbid.h` by
+  `scripts/codegen/gen_cupti_runtime_cbid.py`. It used to be a switch holding ~20
+  ids with `default: return "cudaRuntime"`, so on CUDA 180 of 203 runtime events in
+  a plain matmul workload — and on PPU 72 of 117 — were exported under a single
+  indistinguishable label while the raw `cbid` sat unused in the metadata. The ids
+  are assigned by the vendor header and are append-only, so the table is derived
+  rather than maintained: `--check` re-renders the `.inc` from the committed `.txt`
+  and is run by the Codegen checks job, while `--refresh` re-parses the header and is
+  a reviewed action. An id the table does not name keeps the generic label rather
+  than a guessed one — the numeric `cbid` still identifies it — and MetaX is
+  unaffected: MCPTI ids are a different namespace and resolve through
+  `mcptiActivityGetApiName` (§6.2)
 - The 13 kernel metadata fields, matching torch-cuda exactly:
   `grid`, `block`, `registers per thread`, `shared memory`, `warps per SM`,
   `blocks per SM`, `est. achieved occupancy %`, `queued`, `context`, `stream`,
@@ -127,7 +146,10 @@ type. It does exactly two things — translate `DeviceEvent` into
 2. Add the tracer to the per-accelerator source selection in `csrc/CMakeLists.txt`. The
    build uses `GLOB_RECURSE`, so exactly one tracer factory must be compiled for every
    accelerator: CUPTI/MCPTI for CUDA, MetaX, and PPU; ROCtracer for DCU; and the
-   unavailable tracer for platforms without a supported activity API.
+   unavailable tracer for platforms without a supported activity API. That mapping is pinned
+   accelerator by accelerator in `tests/unit/test_device_tracer_selection.py`, so a new
+   accelerator has to be given a tracer deliberately instead of falling into the `else()`
+   arm — which is how PPU silently built the unavailable tracer until issue #411.
 3. Done. The kineto adaptor needs no vendor-specific changes.
 
 ---
@@ -451,7 +473,32 @@ The shared cross-backend profiler contract (`tests/integration/test_profiler_con
 - `test_profiler_memcpy_events` is gated on `mspti_preload_active()`, which checks `/proc/self/maps` for the actually loaded `libmspti.so` rather than trusting the `LD_PRELOAD` string. When the environment script has made the library available before process start, the workload's host-to-device copy produces a real positive-duration `gpu_memcpy` record; a missing or invalid library causes the test to skip explicitly instead of claiming a capability it does not have. The link map is sampled once at `profiler_support` import, which is the only moment that answers the question: the module is loaded as a pytest plugin before anything starts a profiler session, so a hit there can only come from a process-start preload. Sampling later would also see the lazy `dlopen` in `CannDeviceTracer::start()`, which does *not* enable interposition — measured on 910, a late check reports "preloaded" and then the memcpy assertion fails on a workload that produced no records.
 - `test_profiler_memset_events` stays disabled for Ascend regardless of preload. The direct `ctypes` probe above proves the CANN interception path itself works: `aclrtMemset`/`aclrtMemsetAsync` produce real `gpu_memset` records when called explicitly under preload. But nothing reachable from the shared workload calls that allocator path. `torch.zeros()` -- the only zeroing op the workload exercises -- routes to the `aclnnInplaceZero` kernel (`csrc/aten/backends/ascend/generated/ascend_kernels.cc`), not to the allocator's `aclrtMemset`/`aclrtMemsetAsync` calls in `csrc/runtime/accelerator/ascend/memory.cc`. Switching it only to make a profiler record appear would regress measured 910 latency from 12.7us to 133us at 1 MiB and from 17.4us to 9080us at 64 MiB (`aclrtMemsetAsync` is slower still). The high-performance kernel routing is therefore intentional, and the absent `gpu_memset` record is a correct-by-design capability difference.
 
+The device-side capability rows are a separate question from the memcpy/memset pair, and Ascend's were the last held back. `profiler_support.capabilities_for_platform` set `device = platform != "ascend"` and propagated that to `kernel`, `runtime`, `flow`, `linkage`, and `metadata`, so ten of the contract's twelve cases skipped on Ascend and the two that ran could not fail. That row described the tracer as it stood before MSPTI activity capture, not the tracer as it is. Measured on 910 with CANN 9.0 and the preload above, `11 passed, 1 skipped` — the skip is memset, and the eleven include the linkage case below. Re-run without the preload the same way and the result is `10 passed, 2 skipped` — the preload gates memcpy alone; kernel and runtime/API records arrive through `CannDeviceTracer`'s lazy `dlopen`, which does not need it.
+
+Device-time linkage was the last of those rows to report a real result, and the defect was in this repository rather than in CANN. `CannDeviceTracer::popCorrelation` called `msptiActivityPopExternalCorrelationId(kind, nullptr)`; MSPTI's own header documents that out-parameter as optional (`lastId [in] ... can be NULL`), but CANN 9.0 returns `MSPTI_ERROR_INVALID_PARAMETER` for a null pointer *without unwinding the stack*, and the tracer discarded the result. The external-correlation stack therefore grew monotonically for the process's life, so every activity record was stamped with the id most recently pushed — the op that starts *after* the launch rather than the one that issued it. Measured on 910 with the shared workload, the five `MatMulV2_*` kernels dispatched by `aten::matmul` carried the `External id`s of the `aten::empty` calls that followed them, the five `relu_forward_kernel_rank_1_0` kernels dispatched by `aten::relu` carried those of the `aten::empty_strided` calls, and the `Sort` and `Cast` kernels collapsed onto one id. The duration was not lost — `aten::matmul.device_time_total` read 98.0us against a `self_device_time_total` of 0.0us, so it arrived through Kineto's child aggregation — but the launching operator read zero, which is what `test_profiler_device_time_linkage` selects on. Passing a real address, as the CUPTI and MUPTI tracers already did, restores the pairing: measured again on 910, `aten::matmul` reads `self_device_time_total` 126.7us against `aten::empty` 0.0us, and every kernel record carries the id of its dispatcher. That is issue #425.
+
+The stack-not-unwound model is what the evidence distinguishes, not merely one candidate: it predicts the observed id for all fifteen device records of the shared workload and for every launch in an independent probe, and the C-level reproduction (`push(100)`, `push(200)`, `pop(NULL)` → error, `pop(&last)` → `200`) confirms the null call is a no-op that leaves both entries on the stack.
+
+That case carried an unconditional `xfail` until #426, added by #272 when `mm`/`bmm` moved from `cuda` to `flaggems` and the CUDA matmul stopped surfacing device time (FlagGems issue #6223). Unconditional was the wrong shape. `xfail` is not a skip — it runs the body and absorbs the outcome — so an all-platform marker does not narrow the contract, it converts the assertion's failures into XFAILs on every platform, including the four the known defect is not about. DCU, PPU and MUSA had each been recording `1 xpassed` in their profiler-contract runs, which is the assertion passing under a marker that would equally have swallowed it failing. #426 conditioned the marker on the two platforms with a measured reason to need it, `cuda` and `ascend`; #425 removed `ascend` again by fixing it, so the marker now names `cuda` alone and Ascend asserts.
+
+The one row that is genuinely absent is `cbid`. MSPTI's runtime record has no callback-id field — it carries the API name the vendor already resolved — so `cann_device_tracer.cc` names each `privateuse1_runtime` event from `record->name` and the union of its argument keys is `{External id, correlation, thread}`. The tracers that resolve an id through a table (CUPTI, roctracer, MUPTI, TOPSPTI) stamp it onto the event args, which is what the contract's `assert "cbid" in ...` was reading; that assertion is now gated on a `cbid` capability row, with an unconditional `assert keys` floor so the gate cannot degrade into asserting nothing. Ascend reaches the underlying property — distinct runtime calls stay distinguishable — by the other road, and `test_profiler_runtime_names_are_not_all_fallback` measures it directly. Synthesizing a `cbid` for MSPTI would mean keying one on the activity correlation, and CANN 9.0's callback surface returns a repeated stack-address-shaped value there rather than a stable per-callsite id (issue #195).
+
 Every CI backend runs this contract with the same command. `.github/configs/ascend.yml` carries no shell prefix; its structured `environment` field scopes the prepared preload to this process, and `.github/scripts/run_integration_tests.py` applies it without changing the command string.
+
+`test_profiler_runtime_names_are_not_all_fallback` is the one assertion in that contract
+whose threshold is a *rate*, so its evidence is stated per platform.
+`profiler_support.MAX_GENERIC_RUNTIME_FRACTION` caps the share of runtime events allowed
+to carry a tracer's placeholder name (the labels are listed in
+`profiler_support.GENERIC_RUNTIME_NAMES`). The bound was added in #186, where the
+NVIDIA table was replaced by the generated one above: measured at 180 of 203 (89%)
+degraded on CUDA and 72 of 117 (62%) on PPU before the change, and 0 of 117 on PPU after
+it. It has **not** been revalidated on MUSA or DCU, whose runtimes resolve names through
+`muptiGetCallbackName` and `roctracer_op_string` respectively rather than through a table
+in this repository; a platform whose vendor resolver regressed would now fail here with
+the unresolved `cbid` histogram in the message. MetaX never reaches the assertion (the
+shared fixture skips trace export on that platform), Ascend reaches it now that it
+declares runtime activity and passes at 0 of 15 measured on 910, and GCU does not run
+this file at all.
 
 `import torch_fl` deliberately does not re-exec the process to install the preload. Doing so would disturb file descriptors, multiprocessing, `torchrun`, and debuggers, and exporting the interposer job-wide demonstrably destabilizes unrelated CANN operator processes. Per-process integration environment data is the safe boundary at which to express this startup requirement.
 

@@ -19,14 +19,17 @@
 #include <optional>
 #include "device_boxing.h"
 // Included unconditionally: the #else branches below cover TsingMicro, GCU and
-// MUSA-without-mudnn as well as Ascend, and this header supplies inline no-op
-// fallbacks for those platforms.
+// MUSA-without-mudnn as well as Ascend, and these headers supply inline no-op
+// fallbacks for every platform they do not implement.
 #include "backends/ascend/ascend_copy.h"
+#include "backends/gcu/gcu_copy.h"
 
 #if defined(FLAGOS_MUSA_KERNEL)
 #include "backends/musa/mudnn_common.h"
 #elif defined(USE_MUSA)
 #include "runtime/accelerator/musa/musa_stream.h"
+#elif defined(USE_GCU)
+#include "runtime/accelerator/gcu/tops_stream.h"
 #endif
 
 // On the CUDA-family backends (including MetaX boxing) the flagos device shares
@@ -126,6 +129,22 @@ class BlockingCopyGuard {
     // above is what makes GetDefaultMusaStream() resolve to *this tensor's*
     // device; it keys off the current device, like the mudnn handle.
     musaStreamSynchronize(at::native::flagos::musa::GetDefaultMusaStream());
+#elif defined(USE_GCU)
+    // Same shape as the MUSA arm, and added for the same reason: the tops
+    // stream is shared by both producers -- topsaten submits to
+    // GetCurrentTopsStream() (see EXEC_TOPSATEN_CMD) and FlagGems submits to the
+    // handle triton's enflame driver reads back from
+    // `torch.gcu.current_stream(idx).gcu_stream`, and on an S60 the two were
+    // measured equal, process after process. With no arm here the function
+    // compiles to nothing on GCU, so a blocking copy issued after a FlagGems
+    // kernel could read the buffer before the kernel producing it had run.
+    // Measured with the allocator poisoned and the first host read taken
+    // immediately after the op: 19 of 20 rounds of
+    // `sq.mean(-1, keepdim=True)` came back holding the poison, and 0 of 20 once
+    // this stream was drained first. The result was not merely misreported --
+    // `rsqrt(mean + eps)`, the next step of the RMSNorm it feeds, is a topsaten
+    // op and was wrong in 40 of 40 rounds without the barrier.
+    topsStreamSynchronize(at::native::flagos::gcu::GetCurrentTopsStream());
 #endif
   }
 
@@ -348,7 +367,7 @@ at::Tensor _copy_from(
       // this platform.
       musa_ops::MudnnCopy(self, const_cast<at::Tensor&>(dst));
 #elif !defined(USE_ASCEND) && !defined(USE_TSINGMICRO) && !defined(USE_GCU) && \
-    !defined(USE_MUSA) && !defined(USE_BPU)
+    !defined(USE_MUSA) && !defined(USE_BPU) && !defined(USE_KUNLUNXIN)
       // CUDA platform: use DeviceBoxingGuard to dispatch to native CUDA
       // strided copy kernel (handles strides, dtype casts on-device). The
       // native copy kernel has no UInt16/UInt32/UInt64 case, so those casts
@@ -360,9 +379,19 @@ at::Tensor _copy_from(
         at::native::copy_(const_cast<at::Tensor&>(dst), self, false);
       }
 #else
-      // Ascend: copy on-device via aclnnInplaceCopy, which honors both src and
-      // dst strides/offset and casts dtype. Avoids the CPU round-trip below.
-      if (!ascend::StridedCopy(dst, self)) {
+      // Ascend copies on-device via aclnnInplaceCopy, GCU via topsatenCopy;
+      // both honor the src and dst strides and storage offset. Avoids the CPU
+      // round-trip below, which on GCU also D2H's the entire destination
+      // storage. Kunlunxin joins the CPU round-trip below: its vendor torch
+      // exposes CUDA-shaped copy kernels, but they are not guaranteed to
+      // support these AMP tensor-list operations, so it takes the portable
+      // path like the other non-CUDA backends.
+#if defined(USE_GCU)
+      const bool copied_on_device = gcu::StridedCopy(dst, self);
+#else
+      const bool copied_on_device = ascend::StridedCopy(dst, self);
+#endif
+      if (!copied_on_device) {
         // Fallback: CPU round-trip (device->host, strided copy on CPU, host->device).
         at::Tensor self_contig = self.is_contiguous()
             ? self
@@ -424,6 +453,26 @@ at::Tensor _copy_from(
              ? at::native::flagos::contiguous(self, c10::MemoryFormat::Contiguous)
              : self.contiguous());
 
+  // Every `Memcpy` below moves raw storage bytes and takes its byte count from
+  // the *source*, so a cross-device copy between differing dtypes used to hand
+  // the driver a count that did not match the destination's element width. A
+  // CPU f64 source copied into a device f32 destination wrote twice the
+  // destination's length -- a silent device-heap overflow -- and the f32 -> f64
+  // direction wrote half of the destination and left the rest holding whatever
+  // the allocator last had there. The device<->device pair is unaffected: it
+  // takes the strided-copy path below, which casts.
+  //
+  // Measured on GCU before this conversion, `torch.empty(6, dtype=torch.float64,
+  // device="flagos:6").copy_(torch.arange(6) + 0.5)` returned
+  // `[0.125, 128.0, 4096.0, ...]` -- two fp32 values reinterpreted as one fp64,
+  // max|diff| 4.09e3 -- and `dev_f32.copy_(cpu_f64)` gave max|diff| 4.5e0.
+  // Converting the source on the host first keeps both sides the same width, so
+  // `nbytes` describes the copy exactly; the host `copy_` reached below does the
+  // cast that a raw memcpy cannot.
+  if (self.is_cpu() && self.scalar_type() != dst.scalar_type()) {
+    self_contig = self_contig.to(dst.scalar_type());
+  }
+
   size_t nbytes = self_contig.numel() * self_contig.element_size();
 
   // Every branch below issues a blocking `Memcpy`. The source may have been
@@ -445,7 +494,7 @@ at::Tensor _copy_from(
       auto tmp = at::empty(self_contig.sizes(), dst.options());
       Memcpy(tmp.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyHostToDevice);
 #if defined(USE_ASCEND) || defined(USE_TSINGMICRO) || defined(USE_GCU) || \
-    defined(USE_MUSA) || defined(USE_BPU)
+    defined(USE_MUSA) || defined(USE_BPU) || defined(USE_KUNLUNXIN)
       at::native::flagos::_copy_from(tmp, dst, false);
 #else
       DeviceBoxingGuard guard(tmp, dst);
@@ -453,7 +502,17 @@ at::Tensor _copy_from(
 #endif
     }
   } else if (self.is_privateuseone() && dst.is_cpu()) {
-    if (dst.is_contiguous()) {
+    if (self.scalar_type() != dst.scalar_type()) {
+      // The device->host direction of the dtype case described above: land the
+      // source's bytes in a CPU tensor of the *source's* dtype, then let the
+      // host copy_ cast into `dst`. Allocating `tmp` with `dst.options()` (as
+      // the branches below do) would make the memcpy disagree with its own
+      // buffer as well.
+      auto tmp =
+          at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
+      Memcpy(tmp.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyDeviceToHost);
+      at::native::copy_(const_cast<at::Tensor&>(dst), tmp, false);
+    } else if (dst.is_contiguous()) {
       Memcpy(dst.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyDeviceToHost);
     } else {
       auto tmp = at::empty(self_contig.sizes(), dst.options());
@@ -475,7 +534,7 @@ at::Tensor _copy_from(
       auto tmp = at::empty(self_contig.sizes(), dst.options());
       Memcpy(tmp.data_ptr(), self_contig.data_ptr(), nbytes, MemcpyDeviceToDevice);
 #if defined(USE_ASCEND) || defined(USE_TSINGMICRO) || defined(USE_GCU) || \
-    defined(USE_MUSA) || defined(USE_BPU)
+    defined(USE_MUSA) || defined(USE_BPU) || defined(USE_KUNLUNXIN)
       at::native::flagos::_copy_from(tmp, dst, false);
 #else
       DeviceBoxingGuard guard(tmp, dst);
@@ -638,18 +697,27 @@ at::Tensor _to_copy(
           .dtype(dtype).device(c10::Device(c10::kPrivateUse1, device_index)));
       musa_ops::MudnnCopy(self_contig, result);
 #elif defined(USE_ASCEND) || defined(USE_TSINGMICRO) || defined(USE_GCU) || \
-    defined(USE_MUSA) || defined(USE_BPU)
+    defined(USE_MUSA) || defined(USE_BPU) || defined(USE_KUNLUNXIN)
       // No CUDA runtime on these backends, so the CUDA TensorIterator cast
-      // below is unavailable.
+      // below is unavailable. Kunlunxin does expose CUDA-shaped APIs, but its
+      // runtime rejects this cast kernel with cudaErrorInvalidDeviceFunction,
+      // so it uses the portable host-staged conversion below.
 #ifdef USE_ASCEND
       // Ascend casts on-device via aclnnCast, avoiding the D2H->CPU->H2D
       // round-trip that dominated HF RMSNorm (two fp16<->fp32 casts per layer).
       result = ascend::DtypeCast(self_contig, dtype);
 #endif
+#ifdef USE_GCU
+      // GCU casts on-device via topsatenToCopy, the same D2H->CPU->H2D
+      // round-trip being what makes this the single most expensive op in
+      // Qwen-Image's forward: 437.9 ms per cast at the (1, 24, 4114, 4114)
+      // attention shape, against 5.6 ms for the vendor call.
+      result = gcu::DtypeCast(self_contig, dtype);
+#endif
       if (!result.defined()) {
         // Fallback: CPU round-trip when no on-device cast is available
-        // (TsingMicro / GCU / MUSA / BPU, or an Ascend dtype pair aclnnCast
-        // rejects).
+        // (TsingMicro / MUSA / BPU, a GCU dtype pair topsatenToCopy declines,
+        // or an Ascend dtype pair aclnnCast rejects).
         size_t nbytes = self_contig.numel() * self_contig.element_size();
         at::Tensor cpu_tensor =
             at::empty(self_contig.sizes(), self_contig.options().device(at::kCPU));
