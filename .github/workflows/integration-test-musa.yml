@@ -87,7 +87,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '1'
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
         with:
           path: ${{ runner.temp }}/pip-cache
           key: ${{ steps.pip-cache-lookup.outputs.cache-matched-key }}

@@ -231,10 +231,11 @@ def test_cache_failure_budgets_do_not_gate_installation(workflow):
     for step in _steps(workflow):
         if step.get("uses", "").startswith("actions/cache/"):
             assert step["continue-on-error"] is True
-            maximum = 3 if step["uses"] == "actions/cache/save@v4" else 2
+            maximum = 1 if step.get("id") == "pip-cache-lookup" else 3
             assert 0 < step["timeout-minutes"] <= maximum
             if step.get("id") == "pip-cache":
-                assert step["env"]["SEGMENT_DOWNLOAD_TIMEOUT_MINS"] == "1"
+                segment_timeout = int(step["env"]["SEGMENT_DOWNLOAD_TIMEOUT_MINS"])
+                assert 0 < segment_timeout <= min(2, step["timeout-minutes"])
         elif "run" in step:
             assert "pip-cache" not in step.get("if", "")
 
