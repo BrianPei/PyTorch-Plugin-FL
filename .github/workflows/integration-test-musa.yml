@@ -60,25 +60,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Self-hosted runners accumulate stale wheels in ~/.cache/pip across
-      # runs (pip no longer passes --no-cache-dir); wipe before restore so
-      # the uploaded archive stays bounded to this run's downloads.
+      # Discard host leftovers before restoring the managed pip download cache.
       - name: Reset pip cache dir
         shell: bash
         run: rm -rf "${RUNNER_TEMP}/pip-cache"
 
-      # Cache pip downloads across runs. The cache only skips the download,
-      # not the install, so the environment prepared by set_env.sh is
-      # still rebuilt fresh each run. PIP_CACHE_DIR is persisted to
-      # $GITHUB_ENV by the setup script and points at RUNNER_TEMP, which the
-      # container owns; /github/home is not writable by the runtime user on
-      # this image, so without that redirect pip disables its cache there.
-      #
-      # The platform hook and shared version pins are hashed because
-      # dependency changes must invalidate the cache; otherwise a pin bump leaves the key unchanged, the exact-hit skips the
-      # save, and the newly downloaded wheels are discarded every run.
-      - name: Cache pip downloads
-        uses: actions/cache@v4
+      # Cache downloads only; provisioning and dependency installation still run.
+      # Hash the hooks, shared pins and constraints to invalidate changed deps.
+      # Both the segment deadline and the whole-step deadline bound restoration.
+      - name: Restore pip downloads
+        id: pip-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
         with:
           path: ${{ runner.temp }}/pip-cache
           key: musa-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_musa.sh') }}
@@ -110,3 +106,15 @@ jobs:
           INTEGRATION_TESTS: ${{ needs.load-tests.outputs.integration_tests }}
           INTEGRATION_ENVIRONMENT: ${{ needs.load-tests.outputs.integration_environment }}
         run: python .github/scripts/run_integration_tests.py
+
+      # Save outside post-job cleanup so the upload has its own deadline.
+      # Skip exact hits, failed restores and cancelled jobs; cache errors must
+      # not change the build/test result.
+      - name: Save pip downloads
+        if: ${{ !cancelled() && steps.pip-cache.outcome == 'success' && steps.pip-cache.outputs.cache-hit != 'true' && steps.pip-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        timeout-minutes: 10
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: ${{ steps.pip-cache.outputs.cache-primary-key }}

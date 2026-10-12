@@ -80,34 +80,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Self-hosted runners accumulate stale wheels in ~/.cache/pip across
-      # runs (pip no longer passes --no-cache-dir); wipe before restore so
-      # the uploaded archive stays bounded to this run's downloads.
-      - name: Reset pip cache dir
-        shell: bash
-        run: rm -rf "${RUNNER_TEMP}/pip-cache"
-
-      # Cache pip downloads across runs. The cache only skips the download,
-      # not the install, so the environment prepared by the setup script is
-      # still rebuilt fresh each run. PIP_CACHE_DIR is persisted to
-      # $GITHUB_ENV by the setup script so every pip invocation in this job
-      # (build, verify wheel) writes to the cache directory.
-      #
-      # The key carries a -build- stage suffix so this build job's cache stays
-      # separate from the integration job's (they share display_name via
-      # all-tests-common); the integration job's restore-keys fall back to this
-      # build prefix. The hooks and shared pin table are hashed because
-      # dependency versions live there, not only in pyproject/setup.py;
-      # without them a pin bump leaves the key unchanged, the exact-hit skips the
-      # save, and the newly downloaded wheels are discarded every run.
-      - name: Cache pip downloads
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/pip-cache
-          key: ${{ inputs.display_name }}-build-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_*.sh') }}
-          restore-keys: |
-            ${{ inputs.display_name }}-build-pip-${{ runner.os }}-
-            ${{ inputs.display_name }}-pip-${{ runner.os }}-
       # Fail in seconds rather than after seven platform builds. An organization
       # secret that is not visible to this repository, or one of the `secrets:`
       # hops that carries it to a vendor runner, is otherwise only noticed when
@@ -124,6 +96,27 @@ jobs:
           fi
           echo "NEXUS_TOKEN is set (${#NEXUS_TOKEN} characters)"
 
+      # Discard host leftovers before restoring the managed pip download cache.
+      - name: Reset pip cache dir
+        shell: bash
+        run: rm -rf "${RUNNER_TEMP}/pip-cache"
+
+      # Cache downloads only; provisioning and dependency installation still run.
+      # Hash the hooks, shared pins and constraints to invalidate changed deps.
+      # Both the segment deadline and the whole-step deadline bound restoration.
+      - name: Restore pip downloads
+        id: pip-cache
+        uses: actions/cache/restore@v4
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: ${{ inputs.display_name }}-build-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_*.sh') }}
+          restore-keys: |
+            ${{ inputs.display_name }}-build-pip-${{ runner.os }}-
+            ${{ inputs.display_name }}-pip-${{ runner.os }}-
       - name: Prepare platform environment
         env:
           CI_STAGE: build
@@ -245,3 +238,15 @@ jobs:
         with:
           name: ${{ inputs.artifact_name }}
           path: dist/*.whl
+
+      # Save outside post-job cleanup so the upload has its own deadline.
+      # Skip exact hits, failed restores and cancelled jobs; cache errors must
+      # not change the build/test result.
+      - name: Save pip downloads
+        if: ${{ !cancelled() && steps.pip-cache.outcome == 'success' && steps.pip-cache.outputs.cache-hit != 'true' && steps.pip-cache.outputs.cache-primary-key != '' }}
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        timeout-minutes: 10
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: ${{ steps.pip-cache.outputs.cache-primary-key }}
