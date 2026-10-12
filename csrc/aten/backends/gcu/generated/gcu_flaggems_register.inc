@@ -73,6 +73,7 @@
 //   - bmm
 //   - bmm.out
 //   - bucketize.Tensor
+//   - cat
 //   - ceil
 //   - clamp.Tensor
 //   - constant_pad_nd
@@ -248,7 +249,7 @@
 //   - zeros
 //   - zeros_like
 //
-// Total: 246 ops registered here, 103 further FlagGems ops already claimed by gcu_register.inc.
+// Total: 246 ops registered here, 104 further FlagGems ops already claimed by gcu_register.inc.
 
   m.impl("_conv_depthwise2d", WrapperPrivConvDepthwise2d);
   m.impl("_efficient_attention_backward", WrapperPrivEfficientAttentionBackward);

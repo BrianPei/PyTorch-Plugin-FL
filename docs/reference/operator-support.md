@@ -7376,6 +7376,160 @@ after, via `nm --undefined-only`); `tests/manual/flaggems_overload_survey.py` wa
 not re-run against the new cohort because the excluded ops cannot run here in
 either arm. That evidence gap is recorded here and in the PR.
 
+## `cat` route changes (2026-10-12)
+
+`cat` was the last route of the runtime-conformance set that TsingMicro could not
+execute, and the only one of the failures whose cause was neither numeric nor
+allocator. The repair is in the platform code generator, not in the prototype
+described by the bring-up above.
+
+Root cause. `aten::cat` has the schema `(Tensor[] tensors, int dim) -> Tensor`.
+`detect_category()` in `scripts/codegen/codegen_ops.py` classifies an op by its
+argument types, and a `Tensor[]` argument files the op under
+`foreach_tensorlist` -- the rank-identical elementwise `_foreach_*` family --
+which is not one of the FlagGems Python categories the generator emits kernels
+for. `cat = flaggems` was therefore a conf entry with no kernel behind it. On
+TsingMicro that does not degrade: the platform takes the `#else` branch of
+`csrc/aten/register.cc` and claims the full generated op list on PrivateUse1, so
+a claimed route with no kernel reaches the dispatcher and raises
+`RuntimeError: PyTorch is not linked with support for cuda devices` instead of
+falling back to CPU.
+
+Repair. `scripts/codegen/codegen_ops.py` gains an explicit
+`_FLAGGEMS_TENSORLIST_DIM` set naming the ops served by the already-declared
+`CallPythonOp_ListI` caller, a membership check in `discover_flaggems_ops()`, and
+a `tensorlist_dim` branch in `gen_flaggems_python_kernel()` that emits
+`CallPythonOp_ListI("<gems_func>", <list_name>, <dim_name>)` with both parameter
+names read from the op's `CppSignature`. Membership is an explicit list and not a
+schema-derived category: `detect_category()` is the thing being worked around,
+and a schema-shaped rule would also have to reason about every `_foreach_*` op
+for which FlagGems has no kernel at all. The regenerated
+`csrc/aten/generated/flaggems_python_kernels.cc` contains
+`CatKernelPython(const at::ITensorListRef & tensors, int64_t dim)` calling
+`CallPythonOp_ListI("flag_gems.cat", tensors, dim)` and
+`REGISTER_IMPL_TO_DISPATCHER(CatFn, cat_dispatcher, Backend::kFlagGems,
+CatKernelPython)`.
+
+**Conf route change.** Regenerating the kernels re-derives the coverage ceiling,
+and the one new entry (`cat`) moves a single op's route across the vendor confs,
+which this report has to record. Measured against the previous revision of each
+conf:
+
+| conf | op | before | after (as this change finally lands) |
+| --- | --- | --- | --- |
+| `backends_ascend.conf` | `cat` | `ascend` | `flaggems  # ascend` |
+| `backends_gcu.conf` | `cat` | `gcu` | `gcu` -- the reroute landed and was reverted on a measured failure, see below |
+| `backends_musa.conf` | `cat` | `musa` | `flaggems  # musa` |
+| `backends_ppu.conf` | `cat` | `cuda` | `flaggems` |
+
+`backends_cuda.conf`, `backends_dcu.conf`, `backends_kunlunxin.conf`,
+`backends_bpu.conf`, `backends_metax.conf` and `backends_tsingmicro.conf` have
+**no route change at all**: `backends_cuda.conf` and `backends_metax.conf` are
+byte-identical to their previous revisions, and the `backends_tsingmicro.conf`
+revision of this change is **comments only**, so that conf's cohort membership is
+unchanged.
+
+The ceiling gains exactly one entry and loses none. `cat` is a new member of the
+FlagGems Python op set, so the checked-in
+`csrc/aten/generated/flaggems_python_kernels.cc` names one more
+`flag_gems.<name>` entry point than the previous revision did -- the count the
+MetaX setup hook measures before every integration job rises from 666 to 667 --
+and every op that was in the set stays in it: `alias_copy.out` keeps its
+`flaggems` route in `backends_metax.conf` and `backends_ppu.conf`. `cat` is not a
+member of `FLAGGEMS_PENDING_NATIVE_OPS`, so nothing withheld it from the
+native-kernel vendors either: `ascend`, `gcu` and `musa` each took the new
+FlagGems route in their conf, and each of those three routes stands on the
+generator's owned evidence rather than on a measurement until that vendor's own
+suite runs. GCU's suite has now run, and `cat` is back on the `gcu` kernel there;
+see the next section.
+
+**TsingMicro -- measured.** `tests/manual/flaggems_overload_survey.py` (version
+6, SHA-256
+`7b01c22ce3a94315f1364df242323e9faac27f2585debfb05030670c7c756cc7`) was run
+scoped to the single affected route against this revision of
+`backends_tsingmicro.conf` (SHA-256
+`842bf4a67f2e3b89c5cdefb42cef43069d8580483a551afeeec02beef7d2a05d`):
+
+```
+python tests/manual/flaggems_overload_survey.py \
+  --conf torch_fl/configs/backends_tsingmicro.conf --ops cat
+[1/1] cat  strict=1 basic_only=0 failed=0 untested=0
+```
+
+All seven profiles -- `2d-f32`, `4d-f32`, `1d-f32`, `2d-f16`, `2d-i64`,
+`2d-bool`, `2d-f32-strided` -- record `PASS` with an empty `detail`, and the run
+summarises to `{"basic_executable": 1, "registered": 1, "strict_support": 1,
+"tested": 1, "verdicts": {"STRICT": 1}}` at rc 0. That is the strongest verdict
+the harness emits: the route is measured against the CPU reference at
+`atol=2e-2, rtol=2e-2` on every profile, including the integer and boolean
+dtypes and the non-contiguous case. The runtime-conformance suite that gates the
+platform is unchanged in its verdict and moves only in its composition:
+`RUNTIME-CONFORMANCE accel=tsingmicro kernels=boxing,flaggems,vendor
+ops_total=10 ops_routed=10 ops_none=0 passed=32 failed=0 skipped=0 errors=0`,
+`PYTEST_RC=0`.
+
+**GCU -- measured, and reverted.** The GCU integration job on the rerouted
+revision failed `tests/integration/ops/test_cat_dispatch.py::TestCatKvCacheAppend`
+-- the KV-cache append shape `torch.cat([k_prefill, k_new], dim=-2)` over
+concatenands of differing sizes -- together with its fp16 large-magnitude
+variant. The call reached the FlagGems Enflame kernel and the compiler rejected
+it:
+
+```
+flag_gems/runtime/backend/_enflame/gcu300/ops/cat.py:291: in _cat_run_kernel
+    cat_copy_row_kernel_4[grid](
+...
+E   triton.compiler.errors.CompilationError: at 34:4:
+E       if pid_t == 0:
+E           in_ptr = in_ptr_a
+E           dim_size_in = dim_size_in_a
+E           dim_offset = dim_offset_a
+E       elif pid_t == 1:
+E
+E   AssertionError('Mismatched type for dim_size_in between then block (int32) and else block (int64)')
+```
+
+That is an Enflame-side compile bug in the FlagGems `cat` kernel, not a routing
+mistake in the conf: `cat_copy_row_kernel_4` selects between the two
+concatenands' size scalars inside the kernel and merges them into one variable,
+and the Enflame GCU300 front end rejects the int32/int64 join across the two
+branches. It is shape- and dtype-dependent rather than universal, which is why
+the route compiles at all and still fails on these two cases.
+
+The counter-measure is the one this codebase uses for an unmeasured or broken
+Enflame FlagGems route: `"cat"` joins `NATIVE_TRITON_GAPS["gcu"]` in
+`scripts/codegen/gen_vendor_confs.py`, with the compile assertion above attached
+as its evidence. Membership in that set closes the FlagGems Python route for
+that one vendor, so `backends_gcu.conf` falls back to the kernel `T_CAT` in
+`codegen_gcu.py` claims -- the topsaten route the conf held before this change,
+and the one the same suite measured green -- while `ascend`, `musa`, `ppu` and
+`tsingmicro` keep the FlagGems route. Every other artifact moves with it: the
+regenerated `gcu_flaggems_register.inc` gains `cat` in its excluded-ops list (the
+list is exactly `sorted(NATIVE_TRITON_GAPS["gcu"])`, 230 entries) and no
+`m.impl()` line changes, because the native registration already claimed `cat`.
+`codegen_gcu_flaggems.py`'s banner is not one of the moving numbers: its
+"further FlagGems ops already claimed by `gcu_register.inc`" figure is
+`len((native & FLAGGEMS_PYTHON_OPS) - pending)`, which does not subtract
+`NATIVE_TRITON_GAPS`, so it stays **103** -- measured, not assumed: recomputing
+both figures against the current tree gives `246` registered here and `103` via
+the native registration, with and without `cat` in the gap set. The GCU row of
+`test_conf_route_counts_are_stable` returns to `{none: 1605, gcu: 179,
+flaggems: 253}`.
+
+**Not revalidated:** the remaining route changes in the table above. No other
+platform is measured here. The scoped survey was run against the TsingMicro
+configuration only, and the GCU measurement is the integration suite's, not a
+probe; no `ascend`, `musa` or `ppu` device was reachable to re-run `--ops cat`
+against the changed confs. So of the four FlagGems gains, GCU's has been
+reverted on evidence and the other three (`ascend`, `musa`, `ppu`) carry only
+the generator's owned evidence -- the regenerated kernels, the re-derived
+ceiling, and the unit coverage in
+[`tests/unit/test_flaggems_tensorlist_dim_route.py`](../../tests/unit/test_flaggems_tensorlist_dim_route.py)
+-- and need a scoped survey run on the corresponding hardware before they can be
+relied on. Read the table as: `cat` reaches FlagGems on TsingMicro by
+measurement, and on `ascend`, `musa` and `ppu` by generator derivation until
+measured.
+
 ## FlagGems Route Removals
 
 The 10 stale-qualname routes fixed on 2026-08-31 are omitted from this section
