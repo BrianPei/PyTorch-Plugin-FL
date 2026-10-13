@@ -40,7 +40,8 @@ container_options: >-
 
 timeout_minutes: 60
 wheel_artifact_name: wheel-kunlunxin
-# The integration job tests the exact artifact produced by the build job.
+# Used only by the generic pipeline. The dedicated Kunlunxin CI workflow
+# builds and tests the wheel in one job, without transferring an artifact.
 integration_wheel_source: artifact
 
 integration_tests:
