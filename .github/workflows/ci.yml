@@ -159,14 +159,8 @@ jobs:
     if: needs.discover-platforms.outputs.has_ppu == 'true'
     uses: ./.github/workflows/integration-test-ppu.yml
 
-  # Kunlunxin has no dedicated integration-test-<platform>.yml: like gcu it runs
-  # the generic all-tests-common.yml. Its config uses integration_wheel_source:
-  # artifact, so the common pipeline's build job runs (no run_build: false) and
-  # the integration job tests the exact wheel that job produced.
   kunlunxin-pipeline:
     name: Platform pipeline (kunlunxin)
     needs: discover-platforms
     if: needs.discover-platforms.outputs.has_kunlunxin == 'true'
-    uses: ./.github/workflows/all-tests-common.yml
-    with:
-      platform: kunlunxin
+    uses: ./.github/workflows/integration-test-kunlunxin.yml
