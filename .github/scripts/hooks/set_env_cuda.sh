@@ -13,9 +13,8 @@
 # limitations under the License.
 
 
-# CUDA's pip calls target several interpreters (PIP_RETRY_PYTHON at each call)
-# and reuse the build cache rather than redownloading the ~2 GB wheel set on
-# every retry.
+# CUDA's pip calls target several interpreters (PIP_RETRY_PYTHON at each call).
+# Cache ordinary and CPU-torch downloads; the multi-GB vendor install opts out.
 export PIP_RETRY_TIMEOUT=600
 export PIP_RETRY_NO_CACHE=0
 CPU_TORCH_VERSION="${TORCH_FL_CPU_TORCH_VERSION:-$CPU_TORCH_VERSION_DEFAULT}"
@@ -168,7 +167,7 @@ bootstrap_vendor_python() {
   "$base_python" -m venv "$vendor_venv"
   local vendor_python="$vendor_venv/bin/python"
   "$vendor_python" -m pip install --upgrade pip
-  PIP_RETRY_PYTHON="$vendor_python" pip_retry --index-url "$VENDOR_TORCH_INDEX_URL" \
+  PIP_RETRY_PYTHON="$vendor_python" pip_retry --no-cache-dir --index-url "$VENDOR_TORCH_INDEX_URL" \
     "torch==$CPU_TORCH_VERSION"
   VENDOR_PYTHON="$vendor_python"
 }
@@ -382,6 +381,7 @@ if [[ ! -x "$VENV_PYTHON" ]]; then
 fi
 
 "$VENV_PYTHON" -m pip install --upgrade pip "setuptools>=64,<77" "setuptools-scm>=8,<10" "wheel==0.46.2" cmake build
+# Cache the small CPU wheel; the multi-GB vendor install stays out of this cache.
 install_cpu_torch
 
 # FlagTree ships its own Triton provider; nothing else in the environment may

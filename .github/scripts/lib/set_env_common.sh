@@ -24,7 +24,7 @@
 # /opt/venv it provisions in place. `pip_retry` additionally honours
 # PIP_RETRY_PYTHON (a per-call override, used by the CUDA script's several
 # interpreters), PIP_RETRY_TIMEOUT (default 300s) and PIP_RETRY_NO_CACHE
-# (default 1; the CUDA script turns it off to reuse its build cache).
+# (default 1; the shared entrypoint enables caching for every platform).
 #
 # `install_cpu_torch` measures both CPU-torch indexes before it installs from
 # one, and honours TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL (an empty value disables
@@ -425,7 +425,7 @@ install_cpu_torch() {
   if [[ -n "$mirror" && "$mirror" != "$CPU_TORCH_INDEX_URL" ]]; then
     index="$(faster_cpu_torch_index "$CPU_TORCH_INDEX_URL" "$mirror")"
   fi
-  pip_retry --index-url "$index" "torch==${CPU_TORCH_VERSION}"
+  pip_retry --index-url "$index" "$@" "torch==${CPU_TORCH_VERSION}"
 }
 
 # Install the published FlagTree wheel for this platform (its Triton build).

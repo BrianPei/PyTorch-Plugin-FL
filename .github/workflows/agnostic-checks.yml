@@ -46,6 +46,7 @@
 # install. That is the file's own subject -- the pin wiring -- and setup.py
 # needs no torch to be read, only setuptools. It is listed explicitly rather
 # than assumed from the runner image.
+# PyYAML parses the workflows exercised by the pip-cache regression tests.
 
 name: Platform-agnostic checks
 
@@ -70,8 +71,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pytest and transformers
-        run: pip install pytest "transformers>=4.51" setuptools
+      - name: Install platform-agnostic test dependencies
+        run: pip install pytest "transformers>=4.51" setuptools PyYAML
 
       - name: Check setup-script syntax
         run: |
@@ -88,6 +89,7 @@ jobs:
           set -euo pipefail
           python -m pytest \
             tests/unit/test_backend_autoload_contract.py \
+            tests/unit/test_ci_pip_cache.py \
             tests/unit/test_ci_version_pins.py \
             tests/unit/test_cupti_runtime_cbid_table.py \
             tests/unit/test_dcu_core_decoupling.py \
