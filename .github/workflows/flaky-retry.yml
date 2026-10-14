@@ -30,19 +30,20 @@ on:
     types: [completed]
 
 permissions:
-  contents: read
-  actions: write
-  pull-requests: write
+  contents: none
 
 jobs:
-  detect-and-retry:
-    name: Detect flaky failure and retry if warranted
+  analyze:
+    name: Classify failed run
     runs-on: ubuntu-latest
     # Only fire on failed runs; skip if CI passed or was skipped.
     if: github.event.workflow_run.conclusion == 'failure'
+    permissions:
+      actions: read
+      pull-requests: read
+    outputs:
+      classification: ${{ steps.classify.outputs.structured_output }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Fetch failed logs
         id: logs
         env:
@@ -57,9 +58,10 @@ jobs:
         uses: anthropics/claude-code-action@v1
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_non_write_users: ${{ github.event.workflow_run.actor.login }}
           prompt: |
             CI workflow "${{ github.event.workflow_run.name }}" failed.
             Run URL: ${{ github.event.workflow_run.html_url }}
@@ -89,52 +91,62 @@ jobs:
             --allowedTools 'Read' 'Bash(cat /tmp/failed.log)' 'Bash(wc -l /tmp/failed.log)'
             --max-turns 10
 
+  act:
+    name: Retry flaky run or report real bug
+    needs: analyze
+    if: needs.analyze.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: write
+    steps:
       # ── Auto-retry path ────────────────────────────────────────────────────
       # Only retry once: if this is already a retry run (attempt > 1) skip it.
       - name: Auto-retry flaky run
         if: |
-          fromJSON(steps.classify.outputs.structured_output).is_flaky == true &&
-          fromJSON(steps.classify.outputs.structured_output).confidence >= 0.7 &&
+          fromJSON(needs.analyze.outputs.classification).is_flaky == true &&
+          fromJSON(needs.analyze.outputs.classification).confidence >= 0.7 &&
           github.event.workflow_run.run_attempt == 1
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
+          CLASSIFICATION: ${{ needs.analyze.outputs.classification }}
         run: |
-          OUTPUT='${{ steps.classify.outputs.structured_output }}'
-          CONFIDENCE=$(echo "$OUTPUT" | jq -r '.confidence')
-          SUMMARY=$(echo "$OUTPUT"   | jq -r '.summary')
-          echo "Flaky (confidence $CONFIDENCE): $SUMMARY"
+          CONFIDENCE=$(jq -r '.confidence' <<<"$CLASSIFICATION")
+          SUMMARY=$(jq -r '.summary' <<<"$CLASSIFICATION")
+          printf 'Flaky (confidence %s): %s\n' "$CONFIDENCE" "$SUMMARY"
           echo "Re-running $RUN_ID …"
           gh run rerun "$RUN_ID" --failed
 
       # ── PR comment path ────────────────────────────────────────────────────
       - name: Comment on PR with root-cause analysis
         if: |
-          fromJSON(steps.classify.outputs.structured_output).is_flaky == false &&
+          fromJSON(needs.analyze.outputs.classification).is_flaky == false &&
           github.event.workflow_run.event == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
+          REPO: ${{ github.repository }}
+          PR_NUM: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SUMMARY: ${{ fromJSON(needs.analyze.outputs.classification).summary }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
-          SUMMARY='${{ fromJSON(steps.classify.outputs.structured_output).summary }}'
-
           # Resolve PR number.
-          PR_NUM="${{ github.event.workflow_run.pull_requests[0].number }}"
           if [ -z "$PR_NUM" ]; then
-            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
-            PR_NUM=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/pulls" \
+            PR_NUM=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" \
               --jq '.[0].number // empty' 2>/dev/null || true)
           fi
           [ -z "$PR_NUM" ] && exit 0
 
-          gh pr comment "$PR_NUM" --body "$(cat <<EOF
+          BODY_FILE="$RUNNER_TEMP/ci-failure.md"
+          cat > "$BODY_FILE" <<EOF
           ## CI failure detected (not flaky)
 
-          **Summary**: ${SUMMARY}
+          **Summary**: $SUMMARY
 
-          [View failed run](${{ github.event.workflow_run.html_url }})
+          [View failed run]($RUN_URL)
 
           > Auto-retry was skipped because this looks like a real bug.
           > Fix the issue and push a new commit to re-run CI.
           EOF
-          )"
+          gh pr comment "$PR_NUM" --repo "$REPO" --body-file "$BODY_FILE"

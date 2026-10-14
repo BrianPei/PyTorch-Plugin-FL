@@ -16,7 +16,8 @@
 """
 CI platform matrix generator with changed-file filtering and label routing.
 
-For schedule / push / workflow_dispatch: returns all configured platforms.
+For schedule / push: returns all configured platforms.
+For workflow_dispatch: uses ``--dispatch-platforms`` (``all`` by default).
 For pull_request:
   1. If a PR label matches ``platform:<name>``   → run only that platform.
   2. If a PR label matches ``platform:all``       → run all platforms.
@@ -30,6 +31,7 @@ Usage (called from a GitHub Actions step):
         --base-ref    main \\
         --configs-dir .github/configs \\
         --pr-labels   "platform:ascend,ci" \\
+        --dispatch-platforms "ascend" \\
         >> "$GITHUB_OUTPUT"
 
 Output written to GITHUB_OUTPUT:
@@ -162,6 +164,23 @@ def _platforms_from_labels(
     return selected if selected else all_platforms
 
 
+def _platforms_from_dispatch(
+    requested: str,
+    all_platforms: list[str],
+) -> list[str]:
+    """Validate and return platforms requested by workflow_dispatch."""
+    values = [value.strip() for value in requested.split(",") if value.strip()]
+    if not values or values == ["all"]:
+        return all_platforms
+    if "all" in values or any(value not in all_platforms for value in values):
+        unknown = sorted(set(values) - set(all_platforms) - {"all"})
+        detail = f": {', '.join(unknown)}" if unknown else ""
+        raise ValueError(f"invalid workflow_dispatch platform selection{detail}")
+    # Preserve config order and remove duplicates from the user input.
+    requested_set = set(values)
+    return [platform for platform in all_platforms if platform in requested_set]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event-name", required=True, help="GitHub event name")
@@ -185,6 +204,11 @@ def main() -> None:
         default="",
         help="Comma-separated PR label names (used for triage routing)",
     )
+    parser.add_argument(
+        "--dispatch-platforms",
+        default="",
+        help="Comma-separated platforms for workflow_dispatch; empty means all",
+    )
     args = parser.parse_args()
 
     configs_dir = pathlib.Path(args.configs_dir)
@@ -203,7 +227,19 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # Non-PR events: always run the full matrix.
+    if args.event_name == "workflow_dispatch":
+        try:
+            selected = _platforms_from_dispatch(
+                args.dispatch_platforms,
+                all_platforms,
+            )
+        except ValueError as exc:
+            print(f"::error::{exc}", file=sys.stderr)
+            sys.exit(2)
+        print(f"platforms={json.dumps(selected)}")
+        return
+
+    # Other non-PR events always run the full matrix.
     if args.event_name != "pull_request":
         print(f"platforms={json.dumps(all_platforms)}")
         return
