@@ -25,19 +25,10 @@
 #
 # Implementation
 # ──────────────
-# GitHub Actions cannot trigger workflow_dispatch on a PR branch via the
-# standard API from within a workflow triggered by issue_comment.  The
-# approach used here is simpler: re-use the existing CI workflow by pushing
-# a no-op commit whose message encodes the platform override as a
-# `[ci platform:<name>]` trailer, then trigger the CI workflow on that commit.
-# The commit is force-pushed to the PR branch so no merge conflict can occur,
-# and it is cleaned up automatically when the PR is merged or closed.
-#
-# Alternatively — and more robustly for team use — the job below applies a
-# `platform:<name>` label to the PR.  This approach requires no force-push
-# and integrates directly with the label-routing path in generate_matrix.py.
-# It is the strategy used here because it leaves a clear audit trail in the
-# PR timeline.
+# The job applies a `platform:<name>` label for triage and dispatches the
+# existing CI workflow with its explicit `platforms` input.  The dispatch
+# ref must be a branch in this repository; a fork PR is reported as an error
+# instead of silently acknowledging a run that cannot execute on the PR head.
 
 name: Slash command (/ci)
 
@@ -74,21 +65,22 @@ jobs:
             ARGS=$(echo "$LINE" | sed 's|^/ci run *||')
             if [ -z "$ARGS" ]; then
               echo "platforms=all"    >> "$GITHUB_OUTPUT"
-              echo "label=platform:all" >> "$GITHUB_OUTPUT"
+              echo "labels=platform:all" >> "$GITHUB_OUTPUT"
             else
-              # Multiple platforms → join with comma for the label; take the first
-              # platform name for a single-platform label.
-              FIRST=$(echo "$ARGS" | awk '{print $1}')
-              COUNT=$(echo "$ARGS" | wc -w | tr -d ' ')
-              if [ "$COUNT" -eq 1 ]; then
-                echo "platforms=$FIRST"       >> "$GITHUB_OUTPUT"
-                echo "label=platform:$FIRST"  >> "$GITHUB_OUTPUT"
-              else
-                # Multiple explicit platforms: run them all via platform:all label
-                # and add a comment clarifying the scope.
-                echo "platforms=$ARGS"          >> "$GITHUB_OUTPUT"
-                echo "label=platform:all"       >> "$GITHUB_OUTPUT"
-              fi
+              platforms=$(printf '%s\n' "$ARGS" | tr ' ' '\n' | awk 'NF' | paste -sd, -)
+              labels=$(printf '%s\n' "$ARGS" | tr ' ' '\n' | awk 'NF {print "platform:" $0}' | paste -sd, -)
+              for platform in $(printf '%s' "$ARGS" | tr ' ' '\n'); do
+                case "$platform" in
+                  ascend|cuda|dcu|gcu|kunlunxin|metax|musa|ppu)
+                    ;;
+                  *)
+                    echo "valid=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                    ;;
+                esac
+              done
+              echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+              echo "labels=$labels"       >> "$GITHUB_OUTPUT"
             fi
             echo "valid=true" >> "$GITHUB_OUTPUT"
           else
@@ -125,24 +117,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.issue.number }}
-          LABEL: ${{ steps.parse.outputs.label }}
+          LABELS: ${{ steps.parse.outputs.labels }}
         run: |
-          # Ensure the label exists in the repo.
-          gh label create "$LABEL" --color "0075ca" --description "CI platform routing" \
-            --repo "$REPO" 2>/dev/null || true
-
           # Remove any existing platform: labels first, then apply the new one.
           EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
             --jq '[.[].name | select(startswith("platform:"))] | join(",")' 2>/dev/null || true)
           if [ -n "$EXISTING" ]; then
             IFS=',' read -ra OLD_LABELS <<< "$EXISTING"
             for old_label in "${OLD_LABELS[@]}"; do
+              encoded=$(printf '%s' "$old_label" | jq -sRr @uri)
               gh api --method DELETE \
-                "repos/${REPO}/issues/${PR_NUMBER}/labels/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$old_label'))")" \
+                "repos/${REPO}/issues/${PR_NUMBER}/labels/${encoded}" \
                 2>/dev/null || true
             done
           fi
-          gh issue edit "$PR_NUMBER" --add-label "$LABEL" --repo "$REPO"
+
+          IFS=',' read -ra NEW_LABELS <<< "$LABELS"
+          for label in "${NEW_LABELS[@]}"; do
+            gh label create "$label" --color "0075ca" \
+              --description "CI platform routing" --repo "$REPO" 2>/dev/null || true
+            gh issue edit "$PR_NUMBER" --add-label "$label" --repo "$REPO"
+          done
 
       - name: Trigger CI via workflow_dispatch on PR head
         if: |
@@ -151,18 +146,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.issue.pull_request.url }}
+          PLATFORMS: ${{ steps.parse.outputs.platforms }}
+          PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          # Resolve PR head branch.
-          PR_NUMBER="${{ github.event.issue.number }}"
-          HEAD_BRANCH=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
-            --jq '.head.ref' 2>/dev/null)
-          [ -z "$HEAD_BRANCH" ] && exit 1
+          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          HEAD_REPO=$(jq -r '.head.repo.full_name // empty' <<<"$PR_DATA")
+          HEAD_BRANCH=$(jq -r '.head.ref // empty' <<<"$PR_DATA")
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "::error::/ci run cannot dispatch a workflow on a fork PR head ($HEAD_REPO). Run CI from the PR Actions tab or push a new commit."
+            exit 1
+          fi
+          [ -n "$HEAD_BRANCH" ] || { echo "::error::PR head branch is unavailable"; exit 1; }
 
           gh workflow run ci.yml \
             --repo "$REPO" \
             --ref "$HEAD_BRANCH" \
-            2>/dev/null || echo "::notice::workflow_dispatch may need manual run; label routing is active."
+            --field "platforms=$PLATFORMS"
 
       - name: React to comment (acknowledge)
         if: steps.parse.outputs.valid == 'true'

@@ -25,11 +25,13 @@ on:
       - 'examples/**'
   pull_request:
     branches: [main, dev, devops, dev-hygon]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'examples/**'
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Comma-separated platforms to run, or all'
+        required: false
+        default: all
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -76,13 +78,15 @@ jobs:
 
       - name: Detect configured platforms
         id: detect
+        env:
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
         run: |
           # Collect PR label names so generate_matrix.py can apply triage routing
           # (platform:<name> labels override file-change filtering).
           PR_LABELS=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_LABELS=$(echo '${{ toJSON(github.event.pull_request.labels.*.name) }}' \
-              | jq -r 'join(",")')
+            PR_LABELS=$(jq -r 'join(",")' <<<"$PR_LABELS_JSON")
           fi
 
           # generate_matrix.py writes platforms=JSON to GITHUB_OUTPUT;
@@ -92,6 +96,7 @@ jobs:
             --base-ref  "${{ github.base_ref || 'main' }}" \
             --configs-dir .github/configs \
             --pr-labels "$PR_LABELS" \
+            --dispatch-platforms "$DISPATCH_PLATFORMS" \
             >> "$GITHUB_OUTPUT"
 
           platforms=$(grep '^platforms=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
