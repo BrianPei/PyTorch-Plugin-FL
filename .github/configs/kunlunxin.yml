@@ -27,6 +27,12 @@ ci_image: harbor.baai.ac.cn/flagos-runtime/flagos-runtime-kunlunxin-xre5.37.1:2.
 runner_labels:
   - p800-8g-cicd-pytorch
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/kunlunxin/
+  - .github/scripts/hooks/set_env_kunlunxin.sh
+  - csrc/aten/backends/kunlunxin/
+
 container_volumes: []
 
 integration_environment: {}

@@ -27,6 +27,12 @@ ci_image: harbor.baai.ac.cn/flagtree/flagtree-enflame3.6-py312-torch2.10.0-ubunt
 runner_labels:
   - sy-8g-cicd-pytorch
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/gcu/
+  - .github/scripts/hooks/set_env_gcu.sh
+  - csrc/aten/backends/gcu/
+
 container_volumes: []
 
 integration_environment: {}

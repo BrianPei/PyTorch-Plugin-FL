@@ -1,0 +1,183 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Slash-command CI trigger for pull requests.
+#
+# Supported commands (posted as PR comments):
+#
+#   /ci run              — run CI on all platforms
+#   /ci run <platform>   — run CI on the named platform only
+#   /ci run <p1> <p2>    — run CI on the listed platforms
+#
+# The command must appear on the first line of the comment and the commenter
+# must have write access to the repository (or be the PR author).
+#
+# Implementation
+# ──────────────
+# GitHub Actions cannot trigger workflow_dispatch on a PR branch via the
+# standard API from within a workflow triggered by issue_comment.  The
+# approach used here is simpler: re-use the existing CI workflow by pushing
+# a no-op commit whose message encodes the platform override as a
+# `[ci platform:<name>]` trailer, then trigger the CI workflow on that commit.
+# The commit is force-pushed to the PR branch so no merge conflict can occur,
+# and it is cleaned up automatically when the PR is merged or closed.
+#
+# Alternatively — and more robustly for team use — the job below applies a
+# `platform:<name>` label to the PR.  This approach requires no force-push
+# and integrates directly with the label-routing path in generate_matrix.py.
+# It is the strategy used here because it leaves a clear audit trail in the
+# PR timeline.
+
+name: Slash command (/ci)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: write
+
+jobs:
+  dispatch:
+    name: Handle /ci command
+    # Only fires on PR comments (not issue comments) that begin with /ci.
+    if: |
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Parse command
+        id: parse
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          # Extract the first line only; trim whitespace.
+          LINE=$(echo "$COMMENT" | head -1 | xargs)
+
+          # /ci run [platform...]
+          if echo "$LINE" | grep -qE '^/ci run( |$)'; then
+            ARGS=$(echo "$LINE" | sed 's|^/ci run *||')
+            if [ -z "$ARGS" ]; then
+              echo "platforms=all"    >> "$GITHUB_OUTPUT"
+              echo "label=platform:all" >> "$GITHUB_OUTPUT"
+            else
+              # Multiple platforms → join with comma for the label; take the first
+              # platform name for a single-platform label.
+              FIRST=$(echo "$ARGS" | awk '{print $1}')
+              COUNT=$(echo "$ARGS" | wc -w | tr -d ' ')
+              if [ "$COUNT" -eq 1 ]; then
+                echo "platforms=$FIRST"       >> "$GITHUB_OUTPUT"
+                echo "label=platform:$FIRST"  >> "$GITHUB_OUTPUT"
+              else
+                # Multiple explicit platforms: run them all via platform:all label
+                # and add a comment clarifying the scope.
+                echo "platforms=$ARGS"          >> "$GITHUB_OUTPUT"
+                echo "label=platform:all"       >> "$GITHUB_OUTPUT"
+              fi
+            fi
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check commenter permission
+        id: perm
+        if: steps.parse.outputs.valid == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ github.event.issue.user.login }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Allow the PR author and anyone with write+ permissions.
+          if [ "$COMMENTER" = "$PR_AUTHOR" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PERM=$(gh api "repos/${REPO}/collaborators/${COMMENTER}/permission" \
+            --jq '.permission' 2>/dev/null || echo "none")
+          if [ "$PERM" = "admin" ] || [ "$PERM" = "write" ] || [ "$PERM" = "maintain" ]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply platform label to PR
+        if: |
+          steps.parse.outputs.valid == 'true' &&
+          steps.perm.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          LABEL: ${{ steps.parse.outputs.label }}
+        run: |
+          # Ensure the label exists in the repo.
+          gh label create "$LABEL" --color "0075ca" --description "CI platform routing" \
+            --repo "$REPO" 2>/dev/null || true
+
+          # Remove any existing platform: labels first, then apply the new one.
+          EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --jq '[.[].name | select(startswith("platform:"))] | join(",")' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            IFS=',' read -ra OLD_LABELS <<< "$EXISTING"
+            for old_label in "${OLD_LABELS[@]}"; do
+              gh api --method DELETE \
+                "repos/${REPO}/issues/${PR_NUMBER}/labels/$(python3 -c "import urllib.parse; print(urllib.parse.quote('$old_label'))")" \
+                2>/dev/null || true
+            done
+          fi
+          gh issue edit "$PR_NUMBER" --add-label "$LABEL" --repo "$REPO"
+
+      - name: Trigger CI via workflow_dispatch on PR head
+        if: |
+          steps.parse.outputs.valid == 'true' &&
+          steps.perm.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.issue.pull_request.url }}
+        run: |
+          # Resolve PR head branch.
+          PR_NUMBER="${{ github.event.issue.number }}"
+          HEAD_BRANCH=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" \
+            --jq '.head.ref' 2>/dev/null)
+          [ -z "$HEAD_BRANCH" ] && exit 1
+
+          gh workflow run ci.yml \
+            --repo "$REPO" \
+            --ref "$HEAD_BRANCH" \
+            2>/dev/null || echo "::notice::workflow_dispatch may need manual run; label routing is active."
+
+      - name: React to comment (acknowledge)
+        if: steps.parse.outputs.valid == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          ALLOWED: ${{ steps.perm.outputs.allowed }}
+        run: |
+          if [ "$ALLOWED" = "true" ]; then
+            # +1 reaction = acknowledged
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              --method POST --field content="+1" 2>/dev/null || true
+          else
+            # Eyes reaction = seen but not acted on (no write permission)
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              --method POST --field content="eyes" 2>/dev/null || true
+          fi

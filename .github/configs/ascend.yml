@@ -31,6 +31,14 @@ ci_image: harbor.baai.ac.cn/flagtree/flagtree-ascend3.5-910c-py311-cann9.0.0-ubu
 runner_labels:
   - flagcicd-910c
 
+# Files whose change triggers this platform's CI on PRs.  Core infrastructure
+# (.github/configs/, .github/workflows/, etc.) always triggers all platforms
+# regardless of this list.
+paths_watch:
+  - torch_fl/accelerator/ascend/
+  - .github/scripts/hooks/set_env_ascend.sh
+  - csrc/aten/backends/ascend/
+
 container_volumes: []
 
 integration_environment: {}
