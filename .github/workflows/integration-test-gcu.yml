@@ -20,6 +20,14 @@ name: Integration Tests (Enflame GCU)
 on:
   workflow_call:
     inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
       timeout-minutes:
         description: "Timeout for the entire job in minutes"
         required: false
@@ -38,6 +46,8 @@ jobs:
     uses: ./.github/workflows/load-platform-tests.yml
     with:
       platform: gcu
+      checkout_repository: ${{ inputs.checkout_repository }}
+      checkout_ref: ${{ inputs.checkout_ref }}
 
   integration-tests:
     name: Build and test (Enflame GCU)
@@ -59,6 +69,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       # Discard host leftovers before restoring the managed pip download cache.
       - name: Reset pip cache dir

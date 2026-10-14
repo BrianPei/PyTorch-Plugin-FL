@@ -14,6 +14,10 @@
 
 name: CI
 
+permissions:
+  contents: read
+  pull-requests: read
+
 on:
   schedule:
     - cron: '0 18 * * *'   # 02:00 CST daily
@@ -32,14 +36,74 @@ on:
         required: false
         default: all
         type: string
+      pr_number:
+        description: 'PR number for a trusted fork on-demand run'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Resolve the source repository and immutable commit before any reusable
+  # workflow starts. Fork on-demand runs are dispatched from this workflow on
+  # the base branch, so the workflow definition remains trusted while the
+  # jobs test the PR head commit supplied by the API.
+  resolve-checkout:
+    name: Resolve checkout source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      repository: ${{ steps.resolve.outputs.repository }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve trusted source
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          PR_NUMBER: ${{ inputs.pr_number || '' }}
+        run: |
+          set -euo pipefail
+
+          repository="$EVENT_REPOSITORY"
+          ref="$EVENT_REF"
+          if [[ -n "$PR_NUMBER" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::pr_number must be a positive integer"
+              exit 1
+            fi
+            pr=$(gh api "repos/${EVENT_REPOSITORY}/pulls/${PR_NUMBER}")
+            repository=$(jq -r '.head.repo.full_name // empty' <<<"$pr")
+            ref=$(jq -r '.head.sha // empty' <<<"$pr")
+            state=$(jq -r '.state // empty' <<<"$pr")
+            if [[ "$state" != "open" ]]; then
+              echo "::error::PR #${PR_NUMBER} is not open"
+              exit 1
+            fi
+            if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR head repository is unavailable (the fork may have been deleted)"
+              exit 1
+            fi
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::PR head SHA is not a full commit SHA"
+              exit 1
+            fi
+            echo "Testing PR #${PR_NUMBER} from ${repository}@${ref}"
+          fi
+
+          printf 'repository=%s\n' "$repository" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+
   lint:
+    needs: resolve-checkout
     uses: ./.github/workflows/lint.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   # Repository-wide checks that need no accelerator, no vendor image, and no
   # built wheel (generated-conf freshness, setup-script syntax, hardware-free
@@ -48,17 +112,23 @@ jobs:
   # vendor job on a breakage no platform owns.
   agnostic-checks:
     name: Platform-agnostic checks
-    needs: lint
+    needs: [resolve-checkout, lint]
     uses: ./.github/workflows/agnostic-checks.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   codegen-checks:
     name: Codegen checks
-    needs: lint
+    needs: [resolve-checkout, lint]
     uses: ./.github/workflows/codegen-checks.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   discover-platforms:
     name: Discover platforms
-    needs: [lint, agnostic-checks, codegen-checks]
+    needs: [resolve-checkout, lint, agnostic-checks, codegen-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -74,6 +144,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ needs.resolve-checkout.outputs.repository }}
+          ref: ${{ needs.resolve-checkout.outputs.ref }}
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Detect configured platforms
@@ -125,21 +198,26 @@ jobs:
 
   ascend-pipeline:
     name: Platform pipeline (ascend)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_ascend == 'true'
     uses: ./.github/workflows/integration-test-ascend.yml
     with:
       timeout-minutes: 120
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   cuda-pipeline:
     name: Platform pipeline (cuda)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_cuda == 'true'
     uses: ./.github/workflows/integration-test-cuda.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   dcu-pipeline:
     name: Platform pipeline (dcu)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_dcu == 'true'
     uses: ./.github/workflows/integration-test-dcu.yml
     with:
@@ -147,36 +225,53 @@ jobs:
       # does not read: the dedicated pipelines take their timeout from the
       # workflow input, and the reusable workflow's own default is 60.
       timeout-minutes: 90
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   metax-pipeline:
     name: Platform pipeline (metax)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_metax == 'true'
     uses: ./.github/workflows/integration-test-metax.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   musa-pipeline:
     name: Platform pipeline (musa)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_musa == 'true'
     uses: ./.github/workflows/integration-test-musa.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   ppu-pipeline:
     name: Platform pipeline (ppu)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_ppu == 'true'
     uses: ./.github/workflows/integration-test-ppu.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   gcu-pipeline:
     name: Platform pipeline (gcu)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_gcu == 'true'
     uses: ./.github/workflows/integration-test-gcu.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   kunlunxin-pipeline:
     name: Platform pipeline (kunlunxin)
-    needs: discover-platforms
+    needs: [resolve-checkout, discover-platforms]
     if: needs.discover-platforms.outputs.has_kunlunxin == 'true'
     uses: ./.github/workflows/integration-test-kunlunxin.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   # Single required-check gate for branch protection.
   # Add only "ci-complete" to the repository's required status checks; every
@@ -187,6 +282,7 @@ jobs:
     name: CI complete
     if: always()
     needs:
+      - resolve-checkout
       - lint
       - agnostic-checks
       - codegen-checks

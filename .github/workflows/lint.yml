@@ -16,6 +16,15 @@ name: Lint
 
 on:
   workflow_call:
+    inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
 
 jobs:
@@ -24,6 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
