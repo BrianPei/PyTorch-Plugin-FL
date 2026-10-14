@@ -77,10 +77,21 @@ jobs:
       - name: Detect configured platforms
         id: detect
         run: |
+          # Collect PR label names so generate_matrix.py can apply triage routing
+          # (platform:<name> labels override file-change filtering).
+          PR_LABELS=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_LABELS=$(echo '${{ toJSON(github.event.pull_request.labels.*.name) }}' \
+              | jq -r 'join(",")')
+          fi
+
+          # generate_matrix.py writes platforms=JSON to GITHUB_OUTPUT;
+          # derive the per-platform flags from that list.
           python .github/scripts/ci/generate_matrix.py \
             --event-name "${{ github.event_name }}" \
             --base-ref  "${{ github.base_ref || 'main' }}" \
             --configs-dir .github/configs \
+            --pr-labels "$PR_LABELS" \
             >> "$GITHUB_OUTPUT"
 
           platforms=$(grep '^platforms=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
@@ -161,3 +172,44 @@ jobs:
     needs: discover-platforms
     if: needs.discover-platforms.outputs.has_kunlunxin == 'true'
     uses: ./.github/workflows/integration-test-kunlunxin.yml
+
+  # Single required-check gate for branch protection.
+  # Add only "ci-complete" to the repository's required status checks; every
+  # individual platform pipeline rolls up here.  Platforms that were filtered
+  # out by generate_matrix.py are skipped, not failed, so skipped is treated as
+  # success.
+  ci-complete:
+    name: CI complete
+    if: always()
+    needs:
+      - lint
+      - agnostic-checks
+      - codegen-checks
+      - discover-platforms
+      - ascend-pipeline
+      - cuda-pipeline
+      - dcu-pipeline
+      - metax-pipeline
+      - musa-pipeline
+      - ppu-pipeline
+      - gcu-pipeline
+      - kunlunxin-pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all pipelines passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          jobs = json.loads(os.environ["RESULTS"])
+          failed = False
+          for name, job in jobs.items():
+              result = job["result"]
+              if result not in ("success", "skipped"):
+                  print(f"::error::{name}: {result}")
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print("All CI checks passed or were skipped.")
+          PY

@@ -26,6 +26,12 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260816-dcu-ci
 runner_labels:
   - hg-8g-cicd-pytorch
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/dcu/
+  - .github/scripts/hooks/set_env_dcu.sh
+  - csrc/aten/backends/dcu/
+
 # Bind-mount the host hyhal driver into the container. libhydmi.so (Hygon DMI
 # device management) and its sibling driver libs live here on the host, not in
 # the flagos image; set_env_dcu.sh probes /usr/local/hyhal/lib and prepends it

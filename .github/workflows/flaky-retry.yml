@@ -1,0 +1,140 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Automatic flaky-test detection and retry.
+#
+# Fires after every CI run that concludes with "failure".  A Claude-powered
+# step reads the failed logs and classifies the root cause:
+#   - Network / timeout / driver flake → auto-retry the whole run (max 1 time).
+#   - Real bug on a PR → comment on the PR with root-cause analysis.
+#
+# Secrets required (same as notify-feishu.yml):
+#   ANTHROPIC_AUTH_TOKEN  — Claude OAuth token for anthropics/claude-code-action
+
+name: Flaky Test Retry
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+
+jobs:
+  detect-and-retry:
+    name: Detect flaky failure and retry if warranted
+    runs-on: ubuntu-latest
+    # Only fire on failed runs; skip if CI passed or was skipped.
+    if: github.event.workflow_run.conclusion == 'failure'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch failed logs
+        id: logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          gh run view "$RUN_ID" --log-failed > /tmp/failed.log 2>&1 || true
+          echo "log_bytes=$(wc -c < /tmp/failed.log)" >> "$GITHUB_OUTPUT"
+
+      - name: Classify failure (flaky vs real bug)
+        id: classify
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          prompt: |
+            CI workflow "${{ github.event.workflow_run.name }}" failed.
+            Run URL: ${{ github.event.workflow_run.html_url }}
+
+            READ-ONLY mode: do NOT modify files, push commits, or create branches.
+
+            The failed log is in /tmp/failed.log.  Read it and decide:
+
+            Classify as FLAKY when the failure is caused by:
+              - Network timeouts or connection errors (pip, curl, HuggingFace Hub,
+                harbor registry, GitHub API).
+              - NCCL/HCCL/XCCL watchdog timeouts or collective hang with no
+                assertion failure.
+              - Driver-side device errors (EE9999, ERR02005, rtEvent*) that are
+                not deterministically reproducible.
+              - Process killed by OOM or signal without a pytest assertion.
+
+            Classify as REAL BUG otherwise (assertion error, import error,
+            wrong output, test logic failure).
+
+            Return JSON with these fields:
+              is_flaky  — boolean
+              confidence — float 0-1
+              summary   — one sentence
+          claude_args: |
+            --json-schema '{"type":"object","properties":{"is_flaky":{"type":"boolean"},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["is_flaky","confidence","summary"]}'
+            --allowedTools 'Read' 'Bash(cat /tmp/failed.log)' 'Bash(wc -l /tmp/failed.log)'
+            --max-turns 10
+
+      # ── Auto-retry path ────────────────────────────────────────────────────
+      # Only retry once: if this is already a retry run (attempt > 1) skip it.
+      - name: Auto-retry flaky run
+        if: |
+          fromJSON(steps.classify.outputs.structured_output).is_flaky == true &&
+          fromJSON(steps.classify.outputs.structured_output).confidence >= 0.7 &&
+          github.event.workflow_run.run_attempt == 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          OUTPUT='${{ steps.classify.outputs.structured_output }}'
+          CONFIDENCE=$(echo "$OUTPUT" | jq -r '.confidence')
+          SUMMARY=$(echo "$OUTPUT"   | jq -r '.summary')
+          echo "Flaky (confidence $CONFIDENCE): $SUMMARY"
+          echo "Re-running $RUN_ID …"
+          gh run rerun "$RUN_ID" --failed
+
+      # ── PR comment path ────────────────────────────────────────────────────
+      - name: Comment on PR with root-cause analysis
+        if: |
+          fromJSON(steps.classify.outputs.structured_output).is_flaky == false &&
+          github.event.workflow_run.event == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          SUMMARY='${{ fromJSON(steps.classify.outputs.structured_output).summary }}'
+
+          # Resolve PR number.
+          PR_NUM="${{ github.event.workflow_run.pull_requests[0].number }}"
+          if [ -z "$PR_NUM" ]; then
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            PR_NUM=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/pulls" \
+              --jq '.[0].number // empty' 2>/dev/null || true)
+          fi
+          [ -z "$PR_NUM" ] && exit 0
+
+          gh pr comment "$PR_NUM" --body "$(cat <<EOF
+          ## CI failure detected (not flaky)
+
+          **Summary**: ${SUMMARY}
+
+          [View failed run](${{ github.event.workflow_run.html_url }})
+
+          > Auto-retry was skipped because this looks like a real bug.
+          > Fix the issue and push a new commit to re-run CI.
+          EOF
+          )"

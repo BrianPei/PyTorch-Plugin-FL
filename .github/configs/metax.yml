@@ -22,6 +22,12 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260731-metax-d
 runner_labels:
   - mx-8g-cicd-pytorch
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/metax/
+  - .github/scripts/hooks/set_env_metax.sh
+  - csrc/aten/backends/metax/
+
 container_volumes: []
 
 # Issue #253. The MetaX image exports TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, which

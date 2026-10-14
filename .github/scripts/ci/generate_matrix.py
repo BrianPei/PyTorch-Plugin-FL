@@ -14,18 +14,22 @@
 # limitations under the License.
 
 """
-CI platform matrix generator with changed-file filtering.
+CI platform matrix generator with changed-file filtering and label routing.
 
 For schedule / push / workflow_dispatch: returns all configured platforms.
-For pull_request: intersects the changed-file list against per-platform
-path patterns; falls back to all platforms when core infrastructure files
-change.
+For pull_request:
+  1. If a PR label matches ``platform:<name>``   → run only that platform.
+  2. If a PR label matches ``platform:all``       → run all platforms.
+  3. Otherwise intersect the changed-file list against per-platform
+     path patterns; falls back to all platforms when core infrastructure files
+     change.
 
 Usage (called from a GitHub Actions step):
-    python .github/scripts/ci/generate_matrix.py \
-        --event-name  pull_request \
-        --base-ref    main \
-        --configs-dir .github/configs \
+    python .github/scripts/ci/generate_matrix.py \\
+        --event-name  pull_request \\
+        --base-ref    main \\
+        --configs-dir .github/configs \\
+        --pr-labels   "platform:ascend,ci" \\
         >> "$GITHUB_OUTPUT"
 
 Output written to GITHUB_OUTPUT:
@@ -129,6 +133,35 @@ def _platform_is_affected(
     return True
 
 
+def _platforms_from_labels(
+    labels: list[str],
+    all_platforms: list[str],
+) -> list[str] | None:
+    """
+    Return a platform list derived from PR labels, or None if no routing label.
+
+    Label conventions
+    -----------------
+    ``platform:all``      → run the full matrix (same as no filter).
+    ``platform:<name>``   → run only the named platform; unknown names are
+                            silently ignored (they may refer to a platform not
+                            yet registered in .github/configs/).
+
+    If multiple ``platform:`` labels are present, their union is returned.
+    Returns None when no ``platform:`` label is found (caller falls through
+    to the file-change-based filtering).
+    """
+    prefix = "platform:"
+    routing = [lb[len(prefix):].strip() for lb in labels if lb.startswith(prefix)]
+    if not routing:
+        return None
+    if "all" in routing:
+        return all_platforms
+    selected = [p for p in routing if p in all_platforms]
+    # Unknown labels → conservative fallback: run everything rather than nothing.
+    return selected if selected else all_platforms
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event-name", required=True, help="GitHub event name")
@@ -146,6 +179,11 @@ def main() -> None:
         "--changed-files",
         default="",
         help="Newline-separated list of changed files (overrides git diff)",
+    )
+    parser.add_argument(
+        "--pr-labels",
+        default="",
+        help="Comma-separated PR label names (used for triage routing)",
     )
     args = parser.parse_args()
 
@@ -168,6 +206,13 @@ def main() -> None:
     # Non-PR events: always run the full matrix.
     if args.event_name != "pull_request":
         print(f"platforms={json.dumps(all_platforms)}")
+        return
+
+    # PR: label routing takes priority over file-change filtering.
+    labels = [lb.strip() for lb in args.pr_labels.split(",") if lb.strip()]
+    label_platforms = _platforms_from_labels(labels, all_platforms)
+    if label_platforms is not None:
+        print(f"platforms={json.dumps(label_platforms)}")
         return
 
     # PR: compute reduced matrix from changed files.

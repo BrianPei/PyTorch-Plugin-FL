@@ -30,6 +30,12 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl@sha256:eea3302ee25e0e33
 runner_labels:
   - torch-fl-nv
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/cuda/
+  - .github/scripts/hooks/set_env_cuda.sh
+  - csrc/aten/backends/cuda/
+
 container_volumes:
   - /data/models/Qwen/Qwen3-0.6B:/models/Qwen3-0.6B:ro
 

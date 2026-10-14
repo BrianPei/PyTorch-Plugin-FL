@@ -26,6 +26,12 @@ ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public@sha256:13f
 runner_labels:
   - mt-8g-cicd-pytorch
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/musa/
+  - .github/scripts/hooks/set_env_musa.sh
+  - csrc/aten/backends/musa/
+
 container_volumes: []
 
 integration_environment: {}

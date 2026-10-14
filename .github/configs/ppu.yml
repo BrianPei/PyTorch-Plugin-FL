@@ -22,6 +22,12 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260811-ppu-dev
 runner_labels:
   - flagcicd-810e
 
+# Files whose change triggers this platform's CI on PRs.
+paths_watch:
+  - torch_fl/accelerator/ppu/
+  - .github/scripts/hooks/set_env_ppu.sh
+  - csrc/aten/backends/ppu/
+
 container_volumes:
   # PPU_SDK (underscore, /usr/local/PPU_SDK) is baked into the image with
   # CUDA_SDK/lib64/libcudart.so; no host mount needed. Neither is FlagGems: the
