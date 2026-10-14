@@ -57,10 +57,8 @@ container_options: >-
   --cap-add=SYS_PTRACE
 
 timeout_minutes: 60
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-metax
-# Keep MetaX integration self-contained; transferring the ~670MB wheel through
-# the Actions artifact service can exceed the self-hosted runner job timeout.
-integration_wheel_source: local-build
 
 integration_tests:
   - name: Diagnose bundled MetaX ELF symbols (temporary)

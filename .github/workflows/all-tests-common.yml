@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Common Platform Pipeline
+# Kept for release/manual wheel-build callers. Hardware CI uses the dedicated
+# integration-test-<platform>.yml workflows and does not transfer wheel artifacts.
+name: Common Platform Wheel Build
 
 on:
   workflow_call:
@@ -24,20 +26,10 @@ on:
         required: false
         type: boolean
         default: true
-      run_integration_tests:
-        required: false
-        type: boolean
-        default: true
       upload_artifact:
         required: false
         type: boolean
         default: true
-      integration_wheel_source:
-        required: false
-        type: string
-        default: auto
-        description: >-
-          Wheel source for integration tests: auto, artifact, or local-build.
       timeout_minutes:
         required: false
         type: number
@@ -73,9 +65,6 @@ jobs:
       container_options: ${{ steps.config.outputs.container_options }}
       timeout_minutes: ${{ steps.config.outputs.timeout_minutes }}
       wheel_artifact_name: ${{ steps.config.outputs.wheel_artifact_name }}
-      integration_wheel_source: ${{ steps.config.outputs.integration_wheel_source }}
-      integration_tests: ${{ steps.config.outputs.integration_tests }}
-      integration_environment: ${{ steps.config.outputs.integration_environment }}
     steps:
       - uses: actions/checkout@v4
 
@@ -105,33 +94,6 @@ jobs:
           OPTIONS=$(yq -r '.container_options' "$CONFIG_FILE")
           TIMEOUT_MINUTES=$(yq -r '.timeout_minutes' "$CONFIG_FILE")
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
-          INTEGRATION_TESTS=$(yq -o=json -I=0 '.integration_tests // []' "$CONFIG_FILE")
-          INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
-          CONFIG_WHEEL_SOURCE=$(yq -r '.integration_wheel_source // "auto"' "$CONFIG_FILE")
-          INTEGRATION_WHEEL_SOURCE="${{ inputs.integration_wheel_source }}"
-
-          if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
-            INTEGRATION_WHEEL_SOURCE="$CONFIG_WHEEL_SOURCE"
-          fi
-          if [[ "$INTEGRATION_WHEEL_SOURCE" == "auto" ]]; then
-            if [[ "${{ inputs.run_build }}" == "true" ]]; then
-              INTEGRATION_WHEEL_SOURCE="artifact"
-            else
-              INTEGRATION_WHEEL_SOURCE="local-build"
-            fi
-          fi
-          if [[ "$INTEGRATION_WHEEL_SOURCE" != "artifact" &&
-                "$INTEGRATION_WHEEL_SOURCE" != "local-build" ]]; then
-            echo "::error::integration_wheel_source must be artifact or local-build"
-            exit 1
-          fi
-          if [[ "${{ inputs.run_integration_tests }}" == "true" &&
-                "$INTEGRATION_WHEEL_SOURCE" == "artifact" &&
-                ( "${{ inputs.run_build }}" != "true" ||
-                  "${{ inputs.upload_artifact }}" != "true" ) ]]; then
-            echo "::error::artifact integration requires run_build and upload_artifact"
-            exit 1
-          fi
 
           if [[ "${{ inputs.timeout_minutes }}" -gt 0 ]]; then
             TIMEOUT_MINUTES="${{ inputs.timeout_minutes }}"
@@ -153,14 +115,6 @@ jobs:
             echo "::error::timeout_minutes must be a positive integer"
             exit 1
           fi
-          VALIDATE_ARGS=(--validate-only)
-          if [[ "${{ inputs.run_integration_tests }}" != "true" ]]; then
-            VALIDATE_ARGS+=(--allow-empty)
-          fi
-          INTEGRATION_TESTS="$INTEGRATION_TESTS" \
-          INTEGRATION_ENVIRONMENT="$INTEGRATION_ENVIRONMENT" \
-            python .github/scripts/run_integration_tests.py "${VALIDATE_ARGS[@]}"
-
           printf '%s=%s\n' display_name "$DISPLAY_NAME" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' setup_script "$SETUP_SCRIPT" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' setup_platform "$SETUP_PLATFORM" >> "$GITHUB_OUTPUT"
@@ -168,11 +122,8 @@ jobs:
           printf '%s=%s\n' container_options "$OPTIONS" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' timeout_minutes "$TIMEOUT_MINUTES" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' wheel_artifact_name "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          printf '%s=%s\n' integration_wheel_source "$INTEGRATION_WHEEL_SOURCE" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' runs_on "$RUNS_ON" >> "$GITHUB_OUTPUT"
           printf '%s=%s\n' container_volumes "$VOLUMES" >> "$GITHUB_OUTPUT"
-          printf '%s=%s\n' integration_tests "$INTEGRATION_TESTS" >> "$GITHUB_OUTPUT"
-          printf '%s=%s\n' integration_environment "$INTEGRATION_ENVIRONMENT" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build
@@ -193,28 +144,3 @@ jobs:
       publish: ${{ inputs.publish }}
     secrets:
       NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}
-
-  integration-tests:
-    name: Integration tests
-    if: >-
-      always() &&
-      inputs.run_integration_tests &&
-      needs.configuration.result == 'success' &&
-      (inputs.run_build == false || needs.build.result == 'success')
-    needs:
-      - configuration
-      - build
-    uses: ./.github/workflows/integration-tests-common.yml
-    with:
-      display_name: ${{ needs.configuration.outputs.display_name }}
-      setup_script: ${{ needs.configuration.outputs.setup_script }}
-      setup_platform: ${{ needs.configuration.outputs.setup_platform }}
-      image: ${{ needs.configuration.outputs.ci_image }}
-      runs_on: ${{ needs.configuration.outputs.runs_on }}
-      container_volumes: ${{ needs.configuration.outputs.container_volumes }}
-      container_options: ${{ needs.configuration.outputs.container_options }}
-      timeout_minutes: ${{ fromJson(needs.configuration.outputs.timeout_minutes) }}
-      artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
-      wheel_source: ${{ needs.configuration.outputs.integration_wheel_source }}
-      integration_tests: ${{ needs.configuration.outputs.integration_tests }}
-      integration_environment: ${{ needs.configuration.outputs.integration_environment }}

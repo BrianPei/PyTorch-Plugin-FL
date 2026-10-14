@@ -44,12 +44,10 @@ container_options: >-
   --cap-add=SYS_PTRACE
 
 timeout_minutes: 60
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-cuda
-# Keep CUDA integration self-contained; transferring the ~475MB wheel through
-# the Actions artifact service can exceed the self-hosted runner job timeout.
-integration_wheel_source: local-build
 
-# The common workflow only executes this platform-provided test manifest.
+# The dedicated integration workflow executes this test manifest.
 integration_tests:
   - name: Check model availability
     command: test -d "$MODEL_PATH"

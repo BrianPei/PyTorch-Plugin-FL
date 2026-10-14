@@ -57,13 +57,10 @@ container_options: >-
 # is the per-file coverage that caught the cp310 `tomllib` collection error, and
 # nothing else runs it. Ascend, the other long manifest, is already at 120.
 timeout_minutes: 90
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-dcu
-# Keep DCU integration self-contained; transferring the bundled libtorch wheel
-# through the Actions artifact service can exceed the self-hosted runner job
-# timeout.
-integration_wheel_source: local-build
 
-# The common workflow only executes this platform-provided test manifest.
+# The dedicated integration workflow executes this test manifest.
 # DCU is a boxing build (DTK torch is hipified, HIP kernels live under the CUDA
 # dispatch key), so the vendor backend path and the FlagGems runtime path
 # (backends_dcu.conf, DTK triton hcu + cuda boxing fallback) mirror

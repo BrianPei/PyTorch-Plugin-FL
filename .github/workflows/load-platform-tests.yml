@@ -14,7 +14,7 @@
 
 # Reads the integration test list for one platform out of .github/configs/.
 #
-# The dedicated per-platform pipelines (ascend, cuda, dcu, metax) keep their own
+# The dedicated per-platform pipelines keep their own
 # hardcoded runner labels and container images, but used to carry a second copy
 # of the test list inline as JSON. That duplication silently went stale: a step
 # renamed in .github/configs/ kept running the old command on hardware, and a
@@ -76,8 +76,6 @@ jobs:
           INTEGRATION_TESTS=$(yq -o=json -I=0 '.integration_tests // []' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
 
-          # Same validation the shared pipeline applies, so a malformed manifest
-          # fails here in seconds instead of after a multi-minute vendor build.
           INTEGRATION_TESTS="$INTEGRATION_TESTS" \
           INTEGRATION_ENVIRONMENT="$INTEGRATION_ENVIRONMENT" \
             python .github/scripts/run_integration_tests.py --validate-only

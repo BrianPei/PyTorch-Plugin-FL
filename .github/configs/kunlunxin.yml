@@ -39,10 +39,8 @@ container_options: >-
   --cap-add=SYS_PTRACE
 
 timeout_minutes: 60
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-kunlunxin
-# Used only by the generic pipeline. The dedicated Kunlunxin CI workflow
-# builds and tests the wheel in one job, without transferring an artifact.
-integration_wheel_source: artifact
 
 integration_tests:
   - name: Check isolated Kunlunxin environment
