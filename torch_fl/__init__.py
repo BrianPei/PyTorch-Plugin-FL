@@ -77,7 +77,7 @@ def _select_backend_config() -> None:
       * a native-kernel vendor marker -> backends_<that platform>.conf
       * a MetaX build                 -> backends_metax.conf (boxing-only build)
       * a DCU build                   -> backends_dcu.conf
-      * a Kunlunxin build             -> backends_kunlunxin.conf (CUDA-ABI boxing)
+      * a Kunlunxin build             -> backends_kunlunxin.conf (native XPU)
       * a PPU wheel                   -> backends_ppu.conf
       * otherwise                     -> backends_cuda.conf
 
@@ -987,6 +987,22 @@ def _patch_flaggems_codegen_config():
     # --- Moore Threads MUSA branch ---
     if _build_accelerator() == "musa":
         _env.set_foreign("GEMS_VENDOR", "mthreads")
+        return
+
+    # --- Kunlunxin XPU branch (native vendor kernels) ---
+    # Keyed on the build accelerator, like MUSA. The de-boxed Kunlunxin wheel
+    # talks to the vendor SDK (libxpurt + xdnn_pytorch) over the flagos
+    # PrivateUse1 device rather than the CUDA key, so the generic NVIDIA branch
+    # below must not claim it: its CUDA shim reports itself available through the
+    # vendor's CUDA-compatible runtime headers and then installs CUDA-backed
+    # generators, rebinding torch.flagos.get_rng_state/set_rng_state onto
+    # torch.Generator(device="cuda") -- which this CPU wheel cannot construct
+    # ("Cannot get CUDA generator without ATen_cuda library"). The native
+    # torch_fl.flagos.random module (PrivateUse1-backed _C._get_default_generator)
+    # is the correct implementation and must be left in place, so this branch
+    # only labels the vendor and returns before any shim runs.
+    if _build_accelerator() == "kunlunxin":
+        _env.set_foreign("GEMS_VENDOR", "kunlunxin")
         return
 
     # --- MetaX branch (boxing + FlagGems) ---

@@ -44,14 +44,16 @@ Gloo requests
 
 View conversion
     flagos tensors on CUDA-ABI vendors
-    (nvidia/metax/iluvatar/kunlunxin/du/thead/hygon)
+    (nvidia/metax/iluvatar/du/thead/hygon)
     share physical GPU memory with CUDA, so they are reinterpreted as CUDA
     tensors via a zero-copy shared-storage view (``_C._flagos_to_cuda_view``)
     before being handed to NCCL / FlagCX-cuda. The underlying buffer is the
     same physical memory, so the backend's write-back is visible to the flagos
     side immediately. Vendors whose flagos tensor is NOT a cuda alias
-    (ascend/musa/cambricon) have ``view=None`` in their profile and currently
-    require the FlagCX path; see ``_resolve_view``.
+    (ascend/musa/cambricon, and the de-boxed native kunlunxin backend) do not
+    take the cuda view -- musa and kunlunxin use ``_flagos_identity_view``, the
+    rest have ``view=None`` -- and currently require the FlagCX path; see
+    ``_resolve_view``.
 
 GCU device guard
     Enflame GCU streams and pointers are device-scoped. The communicator must
@@ -128,7 +130,6 @@ _VENDOR_PROFILES = {
     "nvidia": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
     "metax": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
     "iluvatar": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
-    "kunlunxin": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
     "du": _VendorProfile("cuda", "_flagos_to_cuda_view", "_try_build_nccl"),
     # T-Head PPU (Zhenwu ZW810E). FlagGems reports vendor "thead" when PPU_SDK is
     # set, while torch_fl sets GEMS_VENDOR=nvidia; list it so either value routes
@@ -159,6 +160,15 @@ _VENDOR_PROFILES = {
     "musa": _VendorProfile("musa", "_flagos_identity_view", "_try_build_mccl"),
     # FlagGems 5.x calls the same Moore Threads vendor "mthreads".
     "mthreads": _VendorProfile("musa", "_flagos_identity_view", "_try_build_mccl"),
+    # Kunlunxin (Kunlun P800 XPU), de-boxed from the CUDA ABI to a native
+    # backend: its flagos tensors live in XPU memory and are NOT a cuda alias,
+    # so ``_flagos_to_cuda_view`` would reinterpret XPU storage as CUDA -- a
+    # correctness break -- and NCCL is not its collective. The identity view
+    # hands the privateuseone tensor to FlagCX's kunlunxin adaptor unchanged,
+    # exactly as ``musa`` does. Native collective builder not yet provided;
+    # flagcx is the route (no ``_try_build_*`` for kunlunxin exists), so without
+    # FlagCX the path falls through to host-staged gloo.
+    "kunlunxin": _VendorProfile("kunlunxin", "_flagos_identity_view", None),
     # Cambricon: FlagCX only (no cuda alias, no native fallback wired).
     "cambricon": _VendorProfile("mlu", None, None),
 }
@@ -618,7 +628,7 @@ class ProcessGroupFlagOS(dist.ProcessGroup):
         """Build a ProcessGroupNCCL (native binding, else _flagos_nccl ext).
 
         Returns True and sets self._inner on success. Covers all CUDA-ABI
-        vendors (nvidia/metax/iluvatar/kunlunxin/du/thead).
+        vendors (nvidia/metax/iluvatar/du/thead).
         """
         nccl_cls = getattr(torch.distributed, "ProcessGroupNCCL", None)
         if nccl_cls is not None:
@@ -1176,16 +1186,24 @@ def register_flagos_backend() -> None:
     if "flagos" in dist.Backend.backend_list:
         return  # already registered
 
+    # The device type every c10d lookup normalises to.  torch_fl renames
+    # PrivateUse1 to "flagos", and even ``torch.device("privateuseone:0")``
+    # resolves to type ``"flagos"`` before the map lookup, so the literal
+    # ``"privateuseone"`` this registration used to carry was unreachable and
+    # ``get_default_backend_for_device`` raised for the device the plugin
+    # serves (#506).
+    device_type = torch._C._get_privateuse1_backend_name()
+
     dist.Backend.register_backend(
         "flagos",
         _create_flagos_pg,
         extended_api=False,
-        devices=["privateuseone"],
+        devices=[device_type],
     )
 
-    # Make `init_process_group(device_id=torch.device("privateuseone:0"))`
+    # Make `init_process_group(device_id=torch.device(f"{device_type}:0"))`
     # auto-select "flagos" without the user specifying a backend string.
-    dist.Backend.default_device_backend_map.setdefault("privateuseone", "flagos")
+    dist.Backend.default_device_backend_map.setdefault(device_type, "flagos")
 
     # Serve plain gloo requests with this backend instead (see
     # redirect_gloo_requests). Separate try/except on purpose: the backend above
