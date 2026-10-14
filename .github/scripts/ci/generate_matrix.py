@@ -21,9 +21,9 @@ For workflow_dispatch: uses ``--dispatch-platforms`` (``all`` by default).
 For pull_request:
   1. If a PR label matches ``platform:<name>``   → run only that platform.
   2. If a PR label matches ``platform:all``       → run all platforms.
-  3. Otherwise intersect the changed-file list against per-platform
-     path patterns; falls back to all platforms when core infrastructure files
-     change.
+  3. Otherwise match every changed file against per-platform watch paths.
+     Shared or unrecognized code runs all platforms; documentation alone
+     runs the platform-agnostic checks without hardware jobs.
 
 Usage (called from a GitHub Actions step):
     python .github/scripts/ci/generate_matrix.py \\
@@ -35,32 +35,19 @@ Usage (called from a GitHub Actions step):
         >> "$GITHUB_OUTPUT"
 
 Output written to GITHUB_OUTPUT:
-    platforms=["cuda","ascend","hygon"]
+    platforms=["ascend","cuda","dcu"]
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import pathlib
 import subprocess
 import sys
 
-# ---------------------------------------------------------------------------
-# Files / directory prefixes whose change triggers all platforms regardless of
-# per-platform filtering.  Keep this list minimal — it is the "everything
-# breaks" set.
-# ---------------------------------------------------------------------------
-CORE_TRIGGERS: tuple[str, ...] = (
-    ".github/configs/",
-    ".github/workflows/",
-    ".github/scripts/ci/",
-    "setup.py",
-    "setup.cfg",
-    "pyproject.toml",
-    "CMakeLists.txt",
-    "requirements",
-)
+import yaml
 
 # Config file stems that are metadata, not platform names.
 _NON_PLATFORM_STEMS: frozenset[str] = frozenset(
@@ -75,64 +62,85 @@ def _load_platforms(configs_dir: pathlib.Path) -> list[str]:
     )
 
 
-def _changed_files(base_ref: str) -> list[str]:
-    """Return files changed between HEAD and origin/<base_ref>."""
-    cmd = ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"]
+def _changed_files(
+    base_ref: str, base_sha: str = "", head_sha: str = "HEAD"
+) -> list[str] | None:
+    """Compare immutable PR commits, retaining both sides of a rename."""
+    base = base_sha or f"origin/{base_ref}"
+    cmd = [
+        "git",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        f"{base}...{head_sha}",
+        "--",
+    ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return [f for f in result.stdout.splitlines() if f.strip()]
+        return [path for path in result.stdout.split("\0") if path]
     except subprocess.CalledProcessError as exc:
         print(
-            f"::warning::git diff failed ({exc}); returning empty list",
+            f"::warning::git diff failed ({exc}); running all platforms",
             file=sys.stderr,
         )
-        return []
+        return None
 
 
-def _touches_core(changed: list[str]) -> bool:
-    """Return True if any changed file is a core-trigger path."""
-    for f in changed:
-        for trigger in CORE_TRIGGERS:
-            if f.startswith(trigger) or trigger in f:
-                return True
-    return False
+def _matches(path: str, pattern: str) -> bool:
+    """Watch paths are exact files, directory prefixes or shell-style globs."""
+    if pattern.endswith("/"):
+        return path.startswith(pattern)
+    return fnmatch.fnmatchcase(path, pattern)
 
 
-def _platform_is_affected(
-    platform: str,
-    changed: list[str],
+def _platforms_from_files(
+    changed: list[str] | None,
+    all_platforms: list[str],
     configs_dir: pathlib.Path,
-) -> bool:
-    """
-    Return True if the platform should run given the changed file list.
-
-    Resolution order:
-    1. If the platform config file itself changed → include.
-    2. If the config declares ``paths_watch`` → match against changed list.
-    3. If no ``paths_watch`` is declared → always include (conservative).
-    """
-    # Rule 1: config file itself changed.
-    if f".github/configs/{platform}.yml" in changed:
-        return True
-
-    # Rule 2: config-declared watch paths.
-    config_path = configs_dir / f"{platform}.yml"
-    if config_path.exists():
+) -> list[str]:
+    if changed is None:
+        return all_platforms
+    code = [
+        path
+        for path in changed
+        if not path.startswith("docs/") and not path.endswith((".md", ".rst"))
+    ]
+    if not code:
+        return []
+    watches = {}
+    for platform in all_platforms:
         try:
-            import yaml  # optional; installed by callers that need it
-
-            with config_path.open() as fh:
-                cfg = yaml.safe_load(fh) or {}
-            watch = cfg.get("paths_watch", [])
-            if watch:
-                return any(
-                    any(f.startswith(pat) or pat in f for pat in watch) for f in changed
-                )
-        except Exception:  # yaml missing or parse error
-            pass
-
-    # Rule 3: conservative fallback — no filter defined.
-    return True
+            cfg = yaml.safe_load((configs_dir / f"{platform}.yml").read_text())
+            watch = cfg.get("paths_watch")
+            if (
+                not isinstance(watch, list)
+                or not watch
+                or not all(isinstance(pattern, str) and pattern for pattern in watch)
+            ):
+                return all_platforms
+            watches[platform] = watch + [
+                f".github/configs/{platform}.yml",
+                f".github/workflows/integration-test-{platform}.yml",
+            ]
+        except (OSError, yaml.YAMLError, AttributeError):
+            print(
+                f"::warning::Invalid watch paths for {platform}; running all platforms",
+                file=sys.stderr,
+            )
+            return all_platforms
+    selected = set()
+    for path in code:
+        affected = {
+            platform
+            for platform, watch in watches.items()
+            if any(_matches(path, pattern) for pattern in watch)
+        }
+        if not affected:
+            # Unknown/shared code must never disappear behind one vendor match.
+            return all_platforms
+        selected.update(affected)
+    return [platform for platform in all_platforms if platform in selected]
 
 
 def _platforms_from_labels(
@@ -145,9 +153,8 @@ def _platforms_from_labels(
     Label conventions
     -----------------
     ``platform:all``      → run the full matrix (same as no filter).
-    ``platform:<name>``   → run only the named platform; unknown names are
-                            silently ignored (they may refer to a platform not
-                            yet registered in .github/configs/).
+    ``platform:<name>``   → run only the named platform; any unknown name
+                            conservatively restores the full matrix.
 
     If multiple ``platform:`` labels are present, their union is returned.
     Returns None when no ``platform:`` label is found (caller falls through
@@ -159,9 +166,9 @@ def _platforms_from_labels(
         return None
     if "all" in routing:
         return all_platforms
-    selected = [p for p in routing if p in all_platforms]
-    # Unknown labels → conservative fallback: run everything rather than nothing.
-    return selected if selected else all_platforms
+    if any(platform not in all_platforms for platform in routing):
+        return all_platforms
+    return [platform for platform in all_platforms if platform in set(routing)]
 
 
 def _platforms_from_dispatch(
@@ -196,9 +203,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--changed-files",
-        default="",
+        default=None,
         help="Newline-separated list of changed files (overrides git diff)",
     )
+    parser.add_argument("--base-sha", default="", help="Immutable PR base SHA")
+    parser.add_argument("--head-sha", default="HEAD", help="Immutable PR head SHA")
     parser.add_argument(
         "--pr-labels",
         default="",
@@ -252,25 +261,12 @@ def main() -> None:
         return
 
     # PR: compute reduced matrix from changed files.
-    if args.changed_files.strip():
+    if args.changed_files is not None:
         changed = [f for f in args.changed_files.splitlines() if f.strip()]
     else:
-        changed = _changed_files(args.base_ref)
-
-    if not changed:
-        # No diff info → safe to run everything.
-        print(f"platforms={json.dumps(all_platforms)}")
-        return
-
-    if _touches_core(changed):
-        print(f"platforms={json.dumps(all_platforms)}")
-        return
-
-    selected = [
-        p for p in all_platforms if _platform_is_affected(p, changed, configs_dir)
-    ]
-    # Guarantee at least one platform runs even if filtering produces empty set.
-    print(f"platforms={json.dumps(selected or all_platforms)}")
+        changed = _changed_files(args.base_ref, args.base_sha, args.head_sha)
+    selected = _platforms_from_files(changed, all_platforms, configs_dir)
+    print(f"platforms={json.dumps(selected)}")
 
 
 if __name__ == "__main__":

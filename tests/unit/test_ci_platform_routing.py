@@ -101,18 +101,50 @@ def test_dispatch_can_select_each_dedicated_platform(platform):
     assert json.loads(result.stdout.removeprefix("platforms=")) == [platform]
 
 
+@pytest.mark.parametrize("platform", PLATFORMS)
+@pytest.mark.parametrize("selected", [True, False])
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
-def test_required_gate_checks_gcu_result(result):
+def test_required_gate_checks_platform_result(platform, selected, result):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
     assert gate["if"] == "always()"
     results = {name: {"result": "success"} for name in gate["needs"]}
-    results["gcu-pipeline"]["result"] = result
+    results["discover-platforms"]["outputs"] = {
+        "platforms": json.dumps([platform] if selected else [])
+    }
+    results[f"{platform}-pipeline"]["result"] = result
     process = subprocess.run(
         ["bash", "-e", "-c", gate["steps"][0]["run"]],
         env={**os.environ, "RESULTS": json.dumps(results)},
         capture_output=True,
         text=True,
     )
-    assert (process.returncode == 0) == (result in {"success", "skipped"})
+    assert (process.returncode == 0) == (
+        result == "success" or (not selected and result == "skipped")
+    )
     if process.returncode:
-        assert f"gcu-pipeline: {result}" in process.stdout
+        assert f"{platform}-pipeline: {result}" in process.stdout
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "resolve-checkout",
+        "lint",
+        "agnostic-checks",
+        "codegen-checks",
+        "discover-platforms",
+    ],
+)
+def test_required_gate_rejects_skipped_shared_checks(name):
+    gate = _workflow("ci.yml")["jobs"]["ci-complete"]
+    results = {job: {"result": "success"} for job in gate["needs"]}
+    results["discover-platforms"]["outputs"] = {"platforms": "[]"}
+    results[name]["result"] = "skipped"
+    process = subprocess.run(
+        ["bash", "-e", "-c", gate["steps"][0]["run"]],
+        env={**os.environ, "RESULTS": json.dumps(results)},
+        capture_output=True,
+        text=True,
+    )
+    assert process.returncode == 1
+    assert f"{name}: skipped" in process.stdout

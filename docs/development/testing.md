@@ -2,6 +2,9 @@
 
 This document describes the test structure, pytest markers, and commands for running torch_fl tests.
 
+For platform selection, routing labels, the required CI gate, `/ci` comments and
+bounded network retries, see [CI selection and maintainer controls](ci-controls.md).
+
 ## Test Structure
 
 Tests are organized by scope and purpose:

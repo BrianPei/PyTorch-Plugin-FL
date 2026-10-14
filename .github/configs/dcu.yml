@@ -26,11 +26,19 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260816-dcu-ci
 runner_labels:
   - hg-8g-cicd-pytorch
 
-# Files whose change triggers this platform's CI on PRs.
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
 paths_watch:
   - torch_fl/accelerator/dcu/
-  - .github/scripts/hooks/set_env_dcu.sh
+  - torch_fl/configs/backends_dcu.conf
   - csrc/aten/backends/dcu/
+  - csrc/runtime/accelerator/dcu/
+  - csrc/runtime/accelerator/cuda/
+  - csrc/runtime/allocator/backends/dcu_memory.h
+  - .github/scripts/hooks/set_env_dcu.sh
+  - .github/scripts/set_env_dcu.sh
+  - scripts/vendor/bundle_dcu_libtorch.sh
+  - scripts/vendor/check_dcu_core_abi.py
 
 # Bind-mount the host hyhal driver into the container. libhydmi.so (Hygon DMI
 # device management) and its sibling driver libs live here on the host, not in

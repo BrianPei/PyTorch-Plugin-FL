@@ -22,11 +22,19 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260811-ppu-dev
 runner_labels:
   - flagcicd-810e
 
-# Files whose change triggers this platform's CI on PRs.
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
 paths_watch:
   - torch_fl/accelerator/ppu/
-  - .github/scripts/hooks/set_env_ppu.sh
+  - torch_fl/configs/backends_ppu.conf
   - csrc/aten/backends/ppu/
+  - csrc/runtime/accelerator/ppu/
+  - csrc/runtime/accelerator/cuda/
+  - csrc/runtime/allocator/backends/cuda_memory.h
+  - csrc/runtime/allocator/backends/ppu_memory.h
+  - .github/scripts/hooks/set_env_ppu.sh
+  - .github/scripts/set_env_ppu.sh
+  - scripts/vendor/bundle_ppu_libtorch.sh
 
 container_volumes:
   # PPU_SDK (underscore, /usr/local/PPU_SDK) is baked into the image with

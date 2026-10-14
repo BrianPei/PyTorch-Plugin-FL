@@ -22,11 +22,18 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260731-metax-d
 runner_labels:
   - mx-8g-cicd-pytorch
 
-# Files whose change triggers this platform's CI on PRs.
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
 paths_watch:
   - torch_fl/accelerator/metax/
-  - .github/scripts/hooks/set_env_metax.sh
+  - torch_fl/configs/backends_metax.conf
   - csrc/aten/backends/metax/
+  - csrc/runtime/accelerator/metax/
+  - csrc/runtime/allocator/backends/metax_memory.h
+  - csrc/runtime/allocator/backends/cuda_memory.h
+  - .github/scripts/hooks/set_env_metax.sh
+  - .github/scripts/set_env_metax.sh
+  - scripts/vendor/bundle_maca_libtorch.sh
 
 container_volumes: []
 

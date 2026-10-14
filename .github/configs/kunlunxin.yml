@@ -27,11 +27,17 @@ ci_image: harbor.baai.ac.cn/flagos-runtime/flagos-runtime-kunlunxin-xre5.37.1:2.
 runner_labels:
   - p800-8g-cicd-pytorch
 
-# Files whose change triggers this platform's CI on PRs.
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
 paths_watch:
   - torch_fl/accelerator/kunlunxin/
-  - .github/scripts/hooks/set_env_kunlunxin.sh
+  - torch_fl/configs/backends_kunlunxin.conf
   - csrc/aten/backends/kunlunxin/
+  - csrc/runtime/accelerator/kunlunxin/
+  - csrc/runtime/allocator/backends/kunlunxin_memory.h
+  - .github/scripts/hooks/set_env_kunlunxin.sh
+  - .github/scripts/set_env_kunlunxin.sh
+  - scripts/codegen/codegen_kunlunxin.py
 
 container_volumes: []
 

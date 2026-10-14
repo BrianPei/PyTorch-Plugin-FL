@@ -12,25 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Slash-command CI trigger for pull requests.
-#
-# Supported commands (posted as PR comments):
-#
-#   /ci run              — run CI on all platforms
-#   /ci run <platform>   — run CI on the named platform only
-#   /ci run <p1> <p2>    — run CI on the listed platforms
-#
-# The command must appear on the first line of the comment and the commenter
-# must have write access to the repository (or be the PR author).
-#
-# Implementation
-# ──────────────
-# The job applies a `platform:<name>` label for triage and dispatches the
-# existing CI workflow with its explicit `platforms` and `pr_number` inputs.
-# CI resolves the PR head repository and immutable SHA from the API while its
-# workflow definition stays on the base repository's default branch. This is
-# what lets the command test fork PRs without executing a fork's workflow YAML.
-
+# Commands run from the default branch, with code from the resolved PR commit.
+# Only repository writers can start hardware jobs through this privileged route.
 name: Slash command (/ci)
 
 on:
@@ -43,145 +26,32 @@ permissions:
   issues: write
   actions: write
 
+concurrency:
+  group: slash-command-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
 jobs:
   dispatch:
     name: Handle /ci command
-    # Only fires on PR comments (not issue comments) that begin with /ci.
-    if: |
+    if: >-
       github.event.issue.pull_request != null &&
       startsWith(github.event.comment.body, '/ci')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Parse command
-        id: parse
-        env:
-          COMMENT: ${{ github.event.comment.body }}
-        run: |
-          # Extract the first line only; trim whitespace.
-          LINE=$(echo "$COMMENT" | head -1 | xargs)
+      - name: Checkout trusted control scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/configs
 
-          # /ci run [platform...]
-          if echo "$LINE" | grep -qE '^/ci run( |$)'; then
-            ARGS=$(echo "$LINE" | sed 's|^/ci run *||')
-            if [ -z "$ARGS" ]; then
-              echo "platforms=all"    >> "$GITHUB_OUTPUT"
-              echo "labels=platform:all" >> "$GITHUB_OUTPUT"
-            else
-              platforms=$(printf '%s\n' "$ARGS" | tr ' ' '\n' | awk 'NF' | paste -sd, -)
-              labels=$(printf '%s\n' "$ARGS" | tr ' ' '\n' | awk 'NF {print "platform:" $0}' | paste -sd, -)
-              for platform in $(printf '%s' "$ARGS" | tr ' ' '\n'); do
-                case "$platform" in
-                  ascend|cuda|dcu|gcu|kunlunxin|metax|musa|ppu)
-                    ;;
-                  *)
-                    echo "valid=false" >> "$GITHUB_OUTPUT"
-                    exit 0
-                    ;;
-                esac
-              done
-              echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
-              echo "labels=$labels"       >> "$GITHUB_OUTPUT"
-            fi
-            echo "valid=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "valid=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Install configuration parser
+        run: python -m pip install PyYAML
 
-      - name: Check commenter permission
-        id: perm
-        if: steps.parse.outputs.valid == 'true'
+      - name: Handle maintainer command
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_AUTHOR: ${{ github.event.issue.user.login }}
-          COMMENTER: ${{ github.event.comment.user.login }}
-          REPO: ${{ github.repository }}
-        run: |
-          # Allow the PR author and anyone with write+ permissions.
-          if [ "$COMMENTER" = "$PR_AUTHOR" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          PERM=$(gh api "repos/${REPO}/collaborators/${COMMENTER}/permission" \
-            --jq '.permission' 2>/dev/null || echo "none")
-          if [ "$PERM" = "admin" ] || [ "$PERM" = "write" ] || [ "$PERM" = "maintain" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "allowed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Apply platform label to PR
-        if: |
-          steps.parse.outputs.valid == 'true' &&
-          steps.perm.outputs.allowed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-          LABELS: ${{ steps.parse.outputs.labels }}
-        run: |
-          # Remove any existing platform: labels first, then apply the new one.
-          EXISTING=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
-            --jq '[.[].name | select(startswith("platform:"))] | join(",")' 2>/dev/null || true)
-          if [ -n "$EXISTING" ]; then
-            IFS=',' read -ra OLD_LABELS <<< "$EXISTING"
-            for old_label in "${OLD_LABELS[@]}"; do
-              encoded=$(printf '%s' "$old_label" | jq -sRr @uri)
-              gh api --method DELETE \
-                "repos/${REPO}/issues/${PR_NUMBER}/labels/${encoded}" \
-                2>/dev/null || true
-            done
-          fi
-
-          IFS=',' read -ra NEW_LABELS <<< "$LABELS"
-          for label in "${NEW_LABELS[@]}"; do
-            gh label create "$label" --color "0075ca" \
-              --description "CI platform routing" --repo "$REPO" 2>/dev/null || true
-            gh issue edit "$PR_NUMBER" --add-label "$label" --repo "$REPO"
-          done
-
-      - name: Trigger CI via trusted workflow_dispatch
-        if: |
-          steps.parse.outputs.valid == 'true' &&
-          steps.perm.outputs.allowed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PLATFORMS: ${{ steps.parse.outputs.platforms }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
-          [ -n "$DEFAULT_BRANCH" ] || {
-            echo "::error::repository default branch is unavailable"
-            exit 1
-          }
-
-          gh workflow run ci.yml \
-            --repo "$REPO" \
-            --ref "$DEFAULT_BRANCH" \
-            --field "platforms=$PLATFORMS" \
-            --field "pr_number=$PR_NUMBER"
-
-          # The dispatch API returns 204 rather than a run URL. Link to the
-          # workflow page so the comment remains useful even while the run is
-          # still queued.
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
-            "CI dispatched for \`$PLATFORMS\`. [View workflow runs](https://github.com/${REPO}/actions/workflows/ci.yml)"
-
-      - name: React to comment (acknowledge)
-        if: steps.parse.outputs.valid == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-          ALLOWED: ${{ steps.perm.outputs.allowed }}
-        run: |
-          if [ "$ALLOWED" = "true" ]; then
-            # +1 reaction = acknowledged
-            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-              --method POST --field content="+1" 2>/dev/null || true
-          else
-            # Eyes reaction = seen but not acted on (no write permission)
-            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-              --method POST --field content="eyes" 2>/dev/null || true
-          fi
+        run: python .github/scripts/ci/slash_command.py

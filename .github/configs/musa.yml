@@ -26,11 +26,18 @@ ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public@sha256:13f
 runner_labels:
   - mt-8g-cicd-pytorch
 
-# Files whose change triggers this platform's CI on PRs.
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
 paths_watch:
   - torch_fl/accelerator/musa/
-  - .github/scripts/hooks/set_env_musa.sh
+  - torch_fl/configs/backends_musa.conf
   - csrc/aten/backends/musa/
+  - csrc/runtime/accelerator/musa/
+  - csrc/runtime/allocator/backends/musa_memory.h
+  - .github/scripts/hooks/set_env_musa.sh
+  - .github/scripts/set_env_musa.sh
+  - scripts/codegen/codegen_musa_flaggems.py
+  - scripts/codegen/codegen_mudnn.py
 
 container_volumes: []
 
