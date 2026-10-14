@@ -154,7 +154,7 @@ def _platforms_from_labels(
     to the file-change-based filtering).
     """
     prefix = "platform:"
-    routing = [lb[len(prefix):].strip() for lb in labels if lb.startswith(prefix)]
+    routing = [lb[len(prefix) :].strip() for lb in labels if lb.startswith(prefix)]
     if not routing:
         return None
     if "all" in routing:
