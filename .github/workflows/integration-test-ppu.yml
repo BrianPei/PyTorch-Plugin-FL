@@ -87,7 +87,11 @@ jobs:
       # Discard host leftovers before restoring the managed pip download cache.
       - name: Reset pip cache dir
         shell: bash
-        run: rm -rf "${RUNNER_TEMP}/pip-cache"
+        run: |
+          PIP_CACHE_DIR="${RUNNER_TEMP:-$GITHUB_WORKSPACE/.ci}/pip-cache"
+          rm -rf "$PIP_CACHE_DIR"
+          mkdir -p "$PIP_CACHE_DIR"
+          printf 'PIP_CACHE_DIR=%s\n' "$PIP_CACHE_DIR" >> "$GITHUB_ENV"
 
       # Look up first: a transfer timeout can return success with no matched key.
       # A cold miss may save later; a failed matched transfer must not upload.
@@ -97,8 +101,8 @@ jobs:
         continue-on-error: true
         timeout-minutes: 1
         with:
-          path: ${{ runner.temp }}/pip-cache
-          key: ppu-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_ppu.sh') }}
+          path: ${{ env.PIP_CACHE_DIR }}
+          key: ppu-pip-${{ runner.os }}-${{ hashFiles('pyproject.toml', 'setup.py', '.github/version-pins.env', '.github/constraints.txt', '.github/scripts/set_env.sh', '.github/scripts/lib/set_env_common.sh', '.github/scripts/hooks/set_env_ppu.sh', '.github/configs/ppu.yml', '.github/workflows/integration-test-ppu.yml') }}
           lookup-only: true
           restore-keys: |
             ppu-pip-${{ runner.os }}-
@@ -113,7 +117,7 @@ jobs:
         env:
           SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
         with:
-          path: ${{ runner.temp }}/pip-cache
+          path: ${{ env.PIP_CACHE_DIR }}
           key: ${{ steps.pip-cache-lookup.outputs.cache-matched-key }}
 
       - name: Prepare PPU build environment
@@ -143,6 +147,8 @@ jobs:
         run: python .github/scripts/run_integration_tests.py
 
       # Save outside post-job cleanup so the upload has its own deadline.
+      # Keep downloaded dependencies even if a later build/test step fails:
+      # !cancelled() intentionally permits saving after failure (no success()).
       # Skip exact hits, failed lookups/transfers and cancelled jobs.
       # Cache errors must not change the build/test result.
       - name: Save pip downloads
@@ -151,5 +157,5 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         with:
-          path: ${{ runner.temp }}/pip-cache
+          path: ${{ env.PIP_CACHE_DIR }}
           key: ${{ steps.pip-cache-lookup.outputs.cache-primary-key }}

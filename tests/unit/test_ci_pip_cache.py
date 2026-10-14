@@ -14,20 +14,20 @@
 
 """Replay cache-action outputs, including download errors reported as success."""
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW_DIR = ROOT / ".github/workflows"
 WORKFLOWS = [
     "build-wheel-common.yml",
-    "integration-tests-common.yml",
-    *[
-        f"integration-test-{p}.yml"
-        for p in ("ascend", "cuda", "dcu", "metax", "musa", "ppu")
-    ],
+    *sorted(path.name for path in WORKFLOW_DIR.glob("integration-test-*.yml")),
 ]
 
 
@@ -36,7 +36,7 @@ def _steps(workflow):
     return next(job["steps"] for job in document["jobs"].values() if "steps" in job)
 
 
-def _condition(expression, states, cancelled=False):
+def _condition(expression, states, cancelled=False, success=True):
     """Evaluate the workflow's boolean expression against recorded action outputs."""
 
     def output(match):
@@ -46,16 +46,24 @@ def _condition(expression, states, cancelled=False):
         return repr(value)
 
     expression = expression.removeprefix("${{").removesuffix("}}").strip()
+    # Actions supplies success() unless the expression already checks status.
+    if not re.search(r"\b(?:success|failure|cancelled|always)\(\)", expression):
+        if not success:
+            return False
     expression = re.sub(
         r"steps\.([a-z-]+)\.(outcome|outputs\.([a-z-]+))", output, expression
     )
     expression = expression.replace("cancelled()", repr(cancelled))
+    expression = expression.replace("success()", repr(success))
+    expression = expression.replace("failure()", repr(not success and not cancelled))
+    expression = expression.replace("always()", "True")
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = re.sub(r"!(?!=)", "not ", expression)
     return eval(expression.strip(), {"__builtins__": {}}, {})
 
 
 @pytest.mark.parametrize("workflow", WORKFLOWS)
+@pytest.mark.parametrize("job_success", [True, False])
 @pytest.mark.parametrize(
     "lookup_outcome,primary,hit,matched,restore_outcome,restored,cancelled,download,save",
     [
@@ -189,6 +197,7 @@ def _condition(expression, states, cancelled=False):
 )
 def test_cache_transfer_decisions(
     workflow,
+    job_success,
     lookup_outcome,
     primary,
     hit,
@@ -218,8 +227,10 @@ def test_cache_transfer_decisions(
         },
     }
     assert lookup["with"]["lookup-only"] is True
-    assert _condition(restore["if"], states, cancelled) is download
-    assert _condition(upload["if"], states, cancelled) is save
+    assert _condition(restore["if"], states, cancelled, success=job_success) is (
+        download and job_success
+    )
+    assert _condition(upload["if"], states, cancelled, success=job_success) is save
     assert (
         upload["with"]["key"]
         == "${{ steps.pip-cache-lookup.outputs.cache-primary-key }}"
@@ -240,16 +251,103 @@ def test_cache_failure_budgets_do_not_gate_installation(workflow):
             assert "pip-cache" not in step.get("if", "")
 
 
-def test_common_build_and_integration_share_the_dependency_key():
-    keys = []
-    for workflow in WORKFLOWS[:2]:
-        lookup = next(
-            step for step in _steps(workflow) if step.get("id") == "pip-cache-lookup"
-        )
-        keys.append(lookup["with"]["key"])
-        assert "set_env_*.sh" not in keys[-1]
-        assert "inputs.setup_platform" in keys[-1]
-    assert keys[0] == keys[1]
+def test_every_routed_integration_workflow_is_covered():
+    document = yaml.safe_load((WORKFLOW_DIR / "ci.yml").read_text())
+    routed = {
+        Path(job["uses"]).name
+        for job in document["jobs"].values()
+        if job.get("uses", "").startswith("./.github/workflows/integration-test-")
+    }
+    assert routed
+    assert routed <= set(WORKFLOWS)
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS)
+def test_cache_key_tracks_the_effective_dependencies(workflow):
+    lookup = next(
+        step for step in _steps(workflow) if step.get("id") == "pip-cache-lookup"
+    )
+    key = lookup["with"]["key"]
+    for dependency in (
+        "pyproject.toml",
+        "setup.py",
+        ".github/version-pins.env",
+        ".github/constraints.txt",
+        ".github/scripts/set_env.sh",
+        ".github/scripts/lib/set_env_common.sh",
+    ):
+        assert dependency in key
+    assert "set_env_*.sh" not in key
+    assert f".github/workflows/{workflow}" in key
+    if workflow == "build-wheel-common.yml":
+        assert "inputs.setup_platform" in key
+        assert "format('.github/configs/{0}.yml', inputs.setup_platform)" in key
+    else:
+        platform = workflow.removeprefix("integration-test-").removesuffix(".yml")
+        assert f".github/scripts/hooks/set_env_{platform}.sh" in key
+        assert f".github/configs/{platform}.yml" in key
+
+
+def test_gcu_can_reuse_caches_from_the_retired_split_jobs():
+    lookup = next(
+        step
+        for step in _steps("integration-test-gcu.yml")
+        if step.get("id") == "pip-cache-lookup"
+    )
+    assert lookup["with"]["key"].startswith("gcu-pip-")
+    for prefix in (
+        "Enflame GCU-pip-",
+        "Enflame GCU-build-pip-",
+        "Enflame GCU-integration-pip-",
+    ):
+        assert prefix in lookup["with"]["restore-keys"]
+
+
+@pytest.mark.parametrize("workflow", WORKFLOWS)
+@pytest.mark.parametrize("runner_temp", [True, False])
+def test_cache_cleanup_actions_and_setup_share_one_directory(
+    tmp_path, workflow, runner_temp
+):
+    """Execute the real cleanup and entrypoint, using an empty platform hook."""
+    checkout = tmp_path / "checkout with spaces"
+    scripts = checkout / ".github/scripts"
+    shutil.copytree(ROOT / ".github/scripts", scripts)
+    shutil.copy(ROOT / ".github/version-pins.env", scripts.parent / "version-pins.env")
+    (scripts / "hooks/set_env_cache_test.sh").write_text(":\n")
+    github_env = tmp_path / "github-env"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("RUNNER_TEMP", "PIP_CACHE_DIR")
+    }
+    env.update(
+        GITHUB_WORKSPACE=str(checkout), GITHUB_ENV=str(github_env), CI_STAGE="build"
+    )
+    if runner_temp:
+        env["RUNNER_TEMP"] = str(tmp_path / "runner temp")
+    expected = (
+        Path(env["RUNNER_TEMP"]) / "pip-cache"
+        if runner_temp
+        else checkout / ".ci/pip-cache"
+    )
+    expected.mkdir(parents=True)
+    (expected / "stale").write_text("leftover")
+    steps = _steps(workflow)
+    reset = next(step for step in steps if step.get("name") == "Reset pip cache dir")
+    subprocess.run(["bash", "-e", "-c", reset["run"]], env=env, check=True)
+    assert expected.is_dir()
+    assert not (expected / "stale").exists()
+    assert github_env.read_text().splitlines() == [f"PIP_CACHE_DIR={expected}"]
+    env["PIP_CACHE_DIR"] = str(expected)
+    subprocess.run(
+        ["bash", str(scripts / "set_env.sh"), "--platform", "cache_test"],
+        env=env,
+        check=True,
+    )
+    assert github_env.read_text().splitlines() == [f"PIP_CACHE_DIR={expected}"] * 2
+    for step in steps:
+        if step.get("uses", "").startswith("actions/cache/"):
+            assert step["with"]["path"] == "${{ env.PIP_CACHE_DIR }}"
 
 
 def test_cuda_caches_cpu_torch_without_the_vendor_wheel_set():

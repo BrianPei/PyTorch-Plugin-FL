@@ -65,7 +65,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Keep pip downloads in the directory restored by the integration/build jobs.
 # /github/home may be unwritable inside vendor containers, while RUNNER_TEMP is
 # available to the job user. Later workflow steps need the same location.
-export PIP_CACHE_DIR="${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${RUNNER_TEMP:-$REPO_ROOT/.ci}/pip-cache}"
 mkdir -p "$PIP_CACHE_DIR"
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'PIP_CACHE_DIR=%s\n' "$PIP_CACHE_DIR" >> "$GITHUB_ENV"
