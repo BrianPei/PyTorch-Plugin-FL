@@ -239,14 +239,29 @@ def test_cache_transfer_decisions(
 
 @pytest.mark.parametrize("workflow", WORKFLOWS)
 def test_cache_failure_budgets_do_not_gate_installation(workflow):
+    # One bounded warm-cache trial; DCU and release/manual builds retain their
+    # previous budgets. Keep these caps explicit so tuning cannot become an
+    # unbounded wait for a stalled cache service.
+    restore_maximum, segment_maximum = {
+        "integration-test-cuda.yml": (3, 2),
+        "integration-test-dcu.yml": (2, 2),
+        "integration-test-gcu.yml": (5, 3),
+        "build-wheel-common.yml": (3, 2),
+    }.get(workflow, (4, 3))
+    save_maximum = 5 if workflow == "integration-test-kunlunxin.yml" else 3
     for step in _steps(workflow):
         if step.get("uses", "").startswith("actions/cache/"):
             assert step["continue-on-error"] is True
-            maximum = 1 if step.get("id") == "pip-cache-lookup" else 3
+            maximum = {
+                "pip-cache-lookup": 1,
+                "pip-cache": restore_maximum,
+            }.get(step.get("id"), save_maximum)
             assert 0 < step["timeout-minutes"] <= maximum
             if step.get("id") == "pip-cache":
                 segment_timeout = int(step["env"]["SEGMENT_DOWNLOAD_TIMEOUT_MINS"])
-                assert 0 < segment_timeout <= min(2, step["timeout-minutes"])
+                assert (
+                    0 < segment_timeout <= min(segment_maximum, step["timeout-minutes"])
+                )
         elif "run" in step:
             assert "pip-cache" not in step.get("if", "")
 
