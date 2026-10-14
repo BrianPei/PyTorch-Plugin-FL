@@ -973,6 +973,13 @@ def _patch_flaggems_codegen_config():
       branch is taken only for an Ascend build or an explicit
       GEMS_VENDOR=ascend; any other accelerator reaching this point had vendor
       detection fail, which raises rather than silently selecting Ascend.
+
+    - Iluvatar (corex): set GEMS_VENDOR=iluvatar so FlagGems uses its _iluvatar
+      codegen tree. Iluvatar is FlagGems-primary -- every covered op routes to
+      flaggems in backends_iluvatar.conf and nothing boxes to CUDA. The branch
+      must precede the generic-NVIDIA one: corex's runtime is CUDA-shaped, so a
+      runtime probe cannot separate iluvatar from a real NVIDIA GPU and
+      GEMS_VENDOR=nvidia would select FlagGems' NVIDIA backend instead.
     """
     import os
     import sys
@@ -987,6 +994,22 @@ def _patch_flaggems_codegen_config():
     # --- Moore Threads MUSA branch ---
     if _build_accelerator() == "musa":
         _env.set_foreign("GEMS_VENDOR", "mthreads")
+        return
+
+    # --- Kunlunxin XPU branch (native vendor kernels) ---
+    # Keyed on the build accelerator, like MUSA. The de-boxed Kunlunxin wheel
+    # talks to the vendor SDK (libxpurt + xdnn_pytorch) over the flagos
+    # PrivateUse1 device rather than the CUDA key, so the generic NVIDIA branch
+    # below must not claim it: its CUDA shim reports itself available through the
+    # vendor's CUDA-compatible runtime headers and then installs CUDA-backed
+    # generators, rebinding torch.flagos.get_rng_state/set_rng_state onto
+    # torch.Generator(device="cuda") -- which this CPU wheel cannot construct
+    # ("Cannot get CUDA generator without ATen_cuda library"). The native
+    # torch_fl.flagos.random module (PrivateUse1-backed _C._get_default_generator)
+    # is the correct implementation and must be left in place, so this branch
+    # only labels the vendor and returns before any shim runs.
+    if _build_accelerator() == "kunlunxin":
+        _env.set_foreign("GEMS_VENDOR", "kunlunxin")
         return
 
     # --- MetaX branch (boxing + FlagGems) ---
@@ -1085,6 +1108,17 @@ def _patch_flaggems_codegen_config():
         # reliably before the pipeline exists. Costs a diffusers import -- the
         # call is a no-op when diffusers is not installed.
         patch_diffusers_qwenimage_rope()
+        return
+
+    # --- Iluvatar branch ---
+    # Keyed on the build accelerator for the same reason as DCU: the vendor torch
+    # is a real CUDA build over corex's CUDA-shaped runtime, so
+    # is_nvidia_cuda_available() can report True and the generic-NVIDIA branch
+    # below would claim the platform with GEMS_VENDOR=nvidia -- selecting
+    # FlagGems' NVIDIA backend instead of _iluvatar. No runtime probe distinguishes
+    # the two, so the build record is the only authoritative key.
+    if _build_accelerator() == "iluvatar":
+        _env.set_foreign("GEMS_VENDOR", "iluvatar")
         return
 
     # --- Generic NVIDIA CUDA branch (default) ---

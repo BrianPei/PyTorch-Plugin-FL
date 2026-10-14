@@ -351,9 +351,10 @@ GitHub Actions CI runs a subset of tests based on pytest marks:
 To replicate CI behavior locally, use the same mark expressions shown above.
 
 `.github/configs/<platform>.yml` is the only place that defines what a platform runs. Platforms
-without dedicated hardware requirements go through `all-tests-common.yml`; ascend, cuda, dcu, and
-metax keep their own pipelines (hardcoded runner labels and container images) but pull the test
-list through `load-platform-tests.yml`, an `ubuntu-latest` job that parses the config with `yq`
-and hands the result to the hardware job. Adding or renaming a step means editing only the
-config: nothing lists tests inline. Keeping `yq` off the vendor images is deliberate, so no
+without dedicated hardware requirements go through `all-tests-common.yml`; ascend, cuda, dcu,
+metax, musa, ppu, and kunlunxin keep their own pipelines (hardcoded runner labels and container
+images). Each dedicated pipeline has two jobs: `load-tests` calls `load-platform-tests.yml`, an
+`ubuntu-latest` job that parses the config with `yq`, and `integration-tests` builds, installs,
+and tests the wheel in the same hardware job without transferring a wheel artifact. Adding or
+renaming a step means editing only the config: nothing lists tests inline. Keeping `yq` off the vendor images is deliberate, so no
 accelerator container needs a YAML dependency.

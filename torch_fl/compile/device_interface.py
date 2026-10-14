@@ -62,10 +62,12 @@ DEVICE_TYPE = "flagos"
 # MUSA reaches Triton through MThreads FlagTree; GCU reaches it through
 # FlagTree's enflame backend (or Enflame's older triton_gcu plugin), already
 # redirected onto flagos by
-# torch_fl.accelerator.gcu._gcu_compat.patch_gcu_triton_for_flagos(). The
-# distinction that matters to this module is the same for both, so keep the
-# checks keyed on this set rather than on a vendor name.
-_NATIVE_ACCELERATORS = frozenset({"musa", "gcu"})
+# torch_fl.accelerator.gcu._gcu_compat.patch_gcu_triton_for_flagos(). Kunlunxin
+# reaches it through FlagTree's XPU backend and, like the other two, runs with no
+# CUDA runtime at all. The distinction that matters to this module is the same
+# for all of them, so keep the checks keyed on this set rather than on a vendor
+# name.
+_NATIVE_ACCELERATORS = frozenset({"musa", "gcu", "kunlunxin"})
 
 
 def is_native_accelerator() -> bool:
@@ -164,6 +166,10 @@ def _raw_stream(device_idx: int) -> int:
         from torch_fl.compile.flagtree_shim import get_gcu_current_raw_stream
 
         return get_gcu_current_raw_stream(device_idx)
+    if profile.vendor == "kunlunxin":
+        from torch_fl.compile.flagtree_shim import get_kunlunxin_current_raw_stream
+
+        return get_kunlunxin_current_raw_stream(device_idx)
 
     from torch_fl.accelerator.ascend.acl_stream import current_acl_raw_stream
 
@@ -183,6 +189,10 @@ def _set_stream(stream: Any) -> None:
             return
         torch.cuda.set_stream(stream)
         return
+    if profile.vendor == "kunlunxin":
+        # The XPU runtime has one queue per device, denoted by handle 0, and the
+        # stream stand-in carries it; there is no other stream to switch to.
+        return
     native.set_current()
 
 
@@ -197,6 +207,10 @@ def _set_stream_by_id(stream_id: int, device_index: int, device_type: int) -> No
         from torch_fl.accelerator.gcu.tops_stream import TopsStream
 
         TopsStream.borrowed(stream_id, device=device_index).set_current()
+        return
+    if profile.vendor == "kunlunxin":
+        # Single-queue device (handle 0): there is nothing else to switch to and
+        # no torch stream-id registry to switch it through.
         return
     # Native ACL streams have no torch stream-id registry; the id *is* the
     # aclrtStream handle (see AclStream.stream_id), so switch on it directly.
@@ -312,6 +326,12 @@ class FlagOSDeviceInterface(DeviceInterface):
         if profile.vendor in ("musa", "gcu"):
             props = torch.flagos.get_device_properties(_vendor_device(device))
             return props.major * 10 + props.minor
+        if profile.vendor == "kunlunxin":
+            # The XPU device reports no compute-capability pair of its own -- its
+            # properties fall back to the Ascend-shaped stand-in -- so read the
+            # arch FlagTree's XPU backend compiles for from its driver, the same
+            # number that backend puts in GPUTarget.arch.
+            return _kunlunxin_arch()
         # Ascend: `cc` reaches Triton as GPUTarget.arch, and the Ascend backend
         # expects a SoC name there (e.g. "Ascend910_9382"), not a number. That is
         # what its own driver reports, so read it from the same place.
@@ -369,6 +389,21 @@ def _ascend_arch(_cache: list = []) -> str:
         from triton.backends.ascend.driver import NPUUtils
 
         _cache.append(str(NPUUtils().get_arch()))
+    return _cache[0]
+
+
+def _kunlunxin_arch(_cache: list = []) -> int:
+    """Arch the FlagTree XPU backend compiles for, as ``GPUTarget.arch``.
+
+    Queried once from the installed backend's own driver so the value cannot
+    drift from what ``driver.active.get_current_target()`` would report. The XPU
+    device reports no compute-capability pair to derive it from, so the driver is
+    the only authority.
+    """
+    if not _cache:
+        from triton.runtime import driver
+
+        _cache.append(int(driver.active.get_current_target().arch))
     return _cache[0]
 
 
@@ -435,7 +470,7 @@ def _patch_device_properties() -> None:
             # runtimes keep the flagos device here: there is no torch.cuda to
             # look up, and our own interface is registered for flagos.
             device = torch.device("cuda", device.index or 0)
-        elif is_flagos and vendor in ("musa", "gcu"):
+        elif is_flagos and vendor in ("musa", "gcu", "kunlunxin"):
             # These vendor implementations of DeviceProperties.create cannot
             # read a flagos device, so build the record from our interface.
 
@@ -512,28 +547,51 @@ def _patch_inductor_benchmark_device() -> None:
     benchmarker_cls.benchmark = benchmark  # type: ignore[method-assign]
 
 
-def _repair_cuda_interface_raw_stream() -> None:
-    """Give the stock CudaInterface its raw-stream getter back.
+def _repair_stock_cuda_interface() -> None:
+    """Make the stock `CudaInterface` usable on a build with no CUDA runtime.
 
-    Because DeviceProperties reports flagos as cuda (see _patch_device_properties),
-    inductor's *runtime* launcher resolves the stock `CudaInterface`, and its
-    autotuner calls `get_raw_stream(current_device())`. That attribute is bound at
-    import time from `torch._C._cuda_getCurrentRawStream`, but only when
-    `torch.cuda._is_compiled()` -- which is False for the CPU torch wheel, so it
-    lands on None and the autotuner raises "'NoneType' object is not callable".
+    inductor's *runtime* launcher resolves its device interface by the
+    *reported* device type -- `triton_heuristics.get_device_interface` does
+    `get_interface_for_device(device_props.type)`. flagos reports that type as
+    "cuda" (see `_patch_device_properties`), so inductor reaches the stock
+    `CudaInterface` rather than `FlagOSDeviceInterface`.
 
-    The binding itself is present: torch_fl's torch.cuda shim installs it
-    (accelerator/cuda/_cuda_compat.py). So this just re-attaches what the import
-    time probe missed.
+    Kunlunxin is the one non-CUDA platform that also reports "cuda"; there
+    `register_flagos_device_interface` claims that name for `FlagOSDeviceInterface`,
+    and this function is the safety net for the paths that hold a direct
+    reference to the stock class instead of going through the registry. Two of
+    its members are bound at import time from a `torch.cuda` probe:
+
+    * `get_raw_stream` -> None when `torch.cuda._is_compiled()` is false, so the
+      autotuner raises "'NoneType' object is not callable";
+    * `exchange_device` / `maybe_exchange_device` -> `torch.cuda._exchange_device`,
+      whose CPU-wheel fallback raises "PyTorch was compiled without CUDA
+      support" -- and `DeviceGuard.__enter__` calls exactly that before every
+      kernel launch.
+
+    The two repairs are gated differently, because the underlying probes differ.
+    The raw-stream getter is missing on *every* flagos build, the CUDA lane
+    included: torch_fl ships the CPU torch wheel and installs its own
+    `torch._C._cuda_getCurrentRawStream` from `accelerator/cuda/_cuda_compat.py`,
+    but `torch._dynamo.device_interface` binds `get_raw_stream` from the
+    torch.cuda probe at import time -- before that shim lands -- so it is left at
+    None even where a CUDA runtime exists. It is therefore repaired
+    unconditionally. `exchange_device` is only wrong where there is no CUDA
+    runtime to dispatch to, so on a CUDA-like build the stock binding is already
+    correct and is left alone.
     """
     import torch._dynamo.device_interface as di
 
     getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    if getter is None or di.CudaInterface.get_raw_stream is not None:
+    if getter is not None and di.CudaInterface.get_raw_stream is None:
+        di.get_cuda_stream = getter
+        di.CudaInterface.get_raw_stream = staticmethod(getter)  # type: ignore[assignment]
+
+    if platform_profile().is_cuda_like:
         return
 
-    di.get_cuda_stream = getter
-    di.CudaInterface.get_raw_stream = staticmethod(getter)  # type: ignore[assignment]
+    di.CudaInterface.exchange_device = staticmethod(_exchange_device)  # type: ignore[assignment]
+    di.CudaInterface.maybe_exchange_device = staticmethod(_exchange_device)  # type: ignore[assignment]
 
 
 def _prime_has_triton() -> None:
@@ -714,7 +772,7 @@ def register_flagos_device_interface() -> None:
     _register_gpu_type()
     _patch_device_properties()
     _patch_inductor_benchmark_device()
-    _repair_cuda_interface_raw_stream()
+    _repair_stock_cuda_interface()
     _patch_joint_graph_pattern_init()
     _patch_benchmarker()
     register_interface_for_device(DEVICE_TYPE, FlagOSDeviceInterface)
@@ -722,8 +780,19 @@ def register_flagos_device_interface() -> None:
     # The triton-reported device type ("maca" on MetaX) is what the runtime
     # launcher resolves via `triton_heuristics.get_device_interface`, so that
     # name needs an interface too. It proxies the same hardware as flagos.
+    #
+    # On a CUDA build that name is "cuda" and inductor has already registered
+    # the stock CudaInterface for it, which is correct there and must be left
+    # alone. Kunlunxin is the one platform where the two collide: FlagTree's XPU
+    # backend *reports* the target as "cuda" (see platform_profile), yet the
+    # build has no CUDA runtime, so the stock CudaInterface is wrong for it.
+    # Its exchange_device is `torch.cuda._exchange_device`, which on the
+    # CPU-wheel fallback raises "PyTorch was compiled without CUDA support" --
+    # and the runtime launcher calls exactly that from DeviceGuard.__enter__
+    # before every kernel launch (_make_launchers in triton_heuristics). So for
+    # a native (non-CUDA-like) accelerator, claim the reported name as well.
     device_type, _ = _triton_backend()
-    if device_type != "cuda":  # "cuda" is already registered by inductor
+    if device_type != "cuda" or not platform_profile().is_cuda_like:
         register_interface_for_device(device_type, FlagOSDeviceInterface)
 
     # torch.utils._triton caches this result and may have been queried during
