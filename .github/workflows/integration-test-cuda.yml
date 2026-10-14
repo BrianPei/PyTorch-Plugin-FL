@@ -17,6 +17,14 @@ name: Integration Tests (CUDA)
 on:
   workflow_call:
     inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
       # Longer than the other platforms: this job builds the accelerator payload
       # (CUDA PyTorch) when the selected image does not carry the matching
       # PyTorch version, so it spends minutes the image-based jobs spend on a pull.
@@ -40,6 +48,8 @@ jobs:
     uses: ./.github/workflows/load-platform-tests.yml
     with:
       platform: cuda
+      checkout_repository: ${{ inputs.checkout_repository }}
+      checkout_ref: ${{ inputs.checkout_ref }}
 
   integration-tests:
     name: Build and test (CUDA)
@@ -68,6 +78,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Prepare CUDA build environment
         env:

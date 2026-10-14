@@ -17,6 +17,14 @@ name: Common Wheel Build
 on:
   workflow_call:
     inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
       display_name:
         required: true
         type: string
@@ -79,6 +87,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       # Fail in seconds rather than after seven platform builds. An organization
       # secret that is not visible to this repository, or one of the `secrets:`

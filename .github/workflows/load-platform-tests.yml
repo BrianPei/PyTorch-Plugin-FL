@@ -30,6 +30,14 @@ name: Load platform test manifest
 on:
   workflow_call:
     inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
       platform:
         description: Config basename under .github/configs (without .yml)
         required: true
@@ -55,6 +63,10 @@ jobs:
       integration_environment: ${{ steps.config.outputs.integration_environment }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Read integration test manifest
         id: config

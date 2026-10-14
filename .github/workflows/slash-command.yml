@@ -26,9 +26,10 @@
 # Implementation
 # ──────────────
 # The job applies a `platform:<name>` label for triage and dispatches the
-# existing CI workflow with its explicit `platforms` input.  The dispatch
-# ref must be a branch in this repository; a fork PR is reported as an error
-# instead of silently acknowledging a run that cannot execute on the PR head.
+# existing CI workflow with its explicit `platforms` and `pr_number` inputs.
+# CI resolves the PR head repository and immutable SHA from the API while its
+# workflow definition stays on the base repository's default branch. This is
+# what lets the command test fork PRs without executing a fork's workflow YAML.
 
 name: Slash command (/ci)
 
@@ -139,7 +140,7 @@ jobs:
             gh issue edit "$PR_NUMBER" --add-label "$label" --repo "$REPO"
           done
 
-      - name: Trigger CI via workflow_dispatch on PR head
+      - name: Trigger CI via trusted workflow_dispatch
         if: |
           steps.parse.outputs.valid == 'true' &&
           steps.perm.outputs.allowed == 'true'
@@ -149,19 +150,23 @@ jobs:
           PLATFORMS: ${{ steps.parse.outputs.platforms }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          PR_DATA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
-          HEAD_REPO=$(jq -r '.head.repo.full_name // empty' <<<"$PR_DATA")
-          HEAD_BRANCH=$(jq -r '.head.ref // empty' <<<"$PR_DATA")
-          if [ "$HEAD_REPO" != "$REPO" ]; then
-            echo "::error::/ci run cannot dispatch a workflow on a fork PR head ($HEAD_REPO). Run CI from the PR Actions tab or push a new commit."
+          DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
+          [ -n "$DEFAULT_BRANCH" ] || {
+            echo "::error::repository default branch is unavailable"
             exit 1
-          fi
-          [ -n "$HEAD_BRANCH" ] || { echo "::error::PR head branch is unavailable"; exit 1; }
+          }
 
           gh workflow run ci.yml \
             --repo "$REPO" \
-            --ref "$HEAD_BRANCH" \
-            --field "platforms=$PLATFORMS"
+            --ref "$DEFAULT_BRANCH" \
+            --field "platforms=$PLATFORMS" \
+            --field "pr_number=$PR_NUMBER"
+
+          # The dispatch API returns 204 rather than a run URL. Link to the
+          # workflow page so the comment remains useful even while the run is
+          # still queued.
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+            "CI dispatched for \`$PLATFORMS\`. [View workflow runs](https://github.com/${REPO}/actions/workflows/ci.yml)"
 
       - name: React to comment (acknowledge)
         if: steps.parse.outputs.valid == 'true'

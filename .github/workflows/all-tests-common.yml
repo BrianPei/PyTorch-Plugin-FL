@@ -17,6 +17,14 @@ name: Common Platform Pipeline
 on:
   workflow_call:
     inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
       platform:
         required: true
         type: string
@@ -78,6 +86,10 @@ jobs:
       integration_environment: ${{ steps.config.outputs.integration_environment }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Load and validate platform configuration
         id: config
@@ -191,6 +203,8 @@ jobs:
       artifact_name: ${{ needs.configuration.outputs.wheel_artifact_name }}
       upload_artifact: ${{ inputs.upload_artifact }}
       publish: ${{ inputs.publish }}
+      checkout_repository: ${{ inputs.checkout_repository }}
+      checkout_ref: ${{ inputs.checkout_ref }}
     secrets:
       NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}
 
@@ -218,3 +232,5 @@ jobs:
       wheel_source: ${{ needs.configuration.outputs.integration_wheel_source }}
       integration_tests: ${{ needs.configuration.outputs.integration_tests }}
       integration_environment: ${{ needs.configuration.outputs.integration_environment }}
+      checkout_repository: ${{ inputs.checkout_repository }}
+      checkout_ref: ${{ inputs.checkout_ref }}
