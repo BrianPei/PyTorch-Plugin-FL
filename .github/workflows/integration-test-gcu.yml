@@ -1,0 +1,89 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Like the other dedicated integration pipelines, build and test the same wheel
+# in one hardware job. Keep the test manifest in .github/configs/gcu.yml and use
+# the isolated CPU-PyTorch environment provisioned by set_env.sh.
+name: Integration Tests (Enflame GCU)
+
+on:
+  workflow_call:
+    inputs:
+      timeout-minutes:
+        description: "Timeout for the entire job in minutes"
+        required: false
+        type: number
+        default: 60
+  workflow_dispatch:
+    inputs:
+      timeout-minutes:
+        description: "Timeout for the entire job in minutes"
+        required: false
+        type: number
+        default: 60
+
+jobs:
+  load-tests:
+    uses: ./.github/workflows/load-platform-tests.yml
+    with:
+      platform: gcu
+
+  integration-tests:
+    name: Build and test (Enflame GCU)
+    needs: load-tests
+    runs-on:
+      - sy-8g-cicd-pytorch
+    timeout-minutes: ${{ inputs['timeout-minutes'] }}
+    container:
+      image: harbor.baai.ac.cn/flagtree/flagtree-enflame3.6-py312-torch2.10.0-ubuntu24.04@sha256:fadc6e46fa89dffacc6ebf6b85eb1b19b6098b16ae0ff25186aa83be4f93a718
+      options: >-
+        --privileged
+        --ipc=host
+        --shm-size=512g
+        --ulimit memlock=-1
+        --cap-add=SYS_PTRACE
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare GCU build environment
+        env:
+          CI_STAGE: integration
+        run: bash .github/scripts/set_env.sh --platform gcu
+
+      - name: Build wheel
+        run: python -m build --wheel --no-isolation
+
+      - name: Validate wheel compatibility manifest
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform gcu --check-build-env
+
+      - name: Install wheel and test dependencies
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip install pytest
+
+      - name: Prepare wheel-only test workspace
+        run: |
+          TEST_ROOT=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-gcu.XXXXXX")
+          cp -a tests pyproject.toml "$TEST_ROOT/"
+          printf 'INTEGRATION_WORKDIR=%s\n' "$TEST_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run GCU integration tests
+        env:
+          INTEGRATION_TESTS: ${{ needs.load-tests.outputs.integration_tests }}
+          INTEGRATION_ENVIRONMENT: ${{ needs.load-tests.outputs.integration_environment }}
+        run: python .github/scripts/run_integration_tests.py

@@ -37,7 +37,7 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 PLATFORMS = ["cuda", "ascend", "dcu", "gcu", "kunlunxin", "metax", "musa", "ppu"]
 
 #: The named workflows that provision a platform themselves.
-NAMED_WORKFLOWS = ["cuda", "ascend", "dcu", "metax", "musa", "ppu"]
+NAMED_WORKFLOWS = PLATFORMS
 
 
 def _run(*args: str) -> subprocess.CompletedProcess:
@@ -104,14 +104,13 @@ def test_config_driven_path_uses_the_runner():
 
 
 def test_common_workflows_pass_the_platform():
-    """The config-driven common workflows call the runner with --platform."""
-    for name in ("build-wheel-common.yml", "integration-tests-common.yml"):
-        text = (WORKFLOWS / name).read_text(encoding="utf-8")
-        assert (
-            'bash "${{ inputs.setup_script }}" --platform "${{ inputs.setup_platform }}"'
-            in text
-        ), name
-        assert "      setup_platform:" in text, name
+    """The config-driven wheel build calls the runner with --platform."""
+    text = (WORKFLOWS / "build-wheel-common.yml").read_text(encoding="utf-8")
+    assert (
+        'bash "${{ inputs.setup_script }}" --platform "${{ inputs.setup_platform }}"'
+        in text
+    )
+    assert "      setup_platform:" in text
 
 
 def test_config_discovery_exports_the_platform():
