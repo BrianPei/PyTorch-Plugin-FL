@@ -33,10 +33,11 @@ git push upstream v2.10.0
    then requires the tag and the wheel to name the same version, which is what
    stops a candidate being published under the release's name or the reverse.
 2. **Builds and uploads on every platform**, one job each, on the platform's own
-   runner. The build is the same one CI runs: the `build-wheel-*.yml` wrapper (or
-   `all-tests-common.yml` for GCU, which has no wrapper), the same image and
-   setup hook, and the same `Verify wheel` step that installs the fresh artifact
-   before it is offered to the uploader. The upload happens in that same job, so
+   runner. Release uses the `build-wheel-*.yml` wrapper (or
+   `all-tests-common.yml` for GCU, which has no wrapper), the platform's configured
+   image and setup hook, and a `Verify wheel` step that installs the fresh artifact
+   before it is offered to the uploader. Hardware CI uses separate dedicated
+   build-and-test workflows. The upload happens in the release build job, so
    the wheel never leaves the platform's own network.
 3. **Uploads each wheel to its lane** with
    `.github/scripts/publish_wheels.py`, run by `build-wheel-common.yml` on the

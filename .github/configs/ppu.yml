@@ -65,13 +65,10 @@ container_options: >-
   --device=/dev/alixpu_ppu15
 
 timeout_minutes: 60
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-ppu
-# Keep PPU integration self-contained; the bundled lib_ppu wheel is large and
-# transferring it through the Actions artifact service can exceed the
-# self-hosted runner job timeout.
-integration_wheel_source: local-build
 
-# The common workflow only executes this platform-provided test manifest.
+# The dedicated integration workflow executes this test manifest.
 integration_tests:
   - name: Check model availability
     command: test -d "$MODEL_PATH"

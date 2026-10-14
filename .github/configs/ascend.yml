@@ -55,10 +55,8 @@ container_options: >-
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
 
 timeout_minutes: 120
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-ascend
-# Ascend does not bundle a vendor libtorch, so its wheel is small enough to pass
-# through Actions artifacts. Test the exact wheel produced by the build job.
-integration_wheel_source: artifact
 
 integration_tests:
   - name: Check device availability

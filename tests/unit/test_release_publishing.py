@@ -289,9 +289,9 @@ def test_every_release_build_job_carries_the_upload():
 def test_ci_still_builds_without_publishing():
     """The release flag must be opt-in, or every push would try to upload.
 
-    ci.yml calls the same all-tests-common.yml without it and passes no secrets,
-    which only works because the input defaults to false and the token is not
-    required. Flipping either would fail every push at run creation.
+    Manual wheel builds can call all-tests-common.yml without publishing or
+    passing secrets. Hardware CI uses dedicated integration workflows and must
+    never request a release upload.
     """
     common = (REPO_ROOT / ".github" / "workflows" / "all-tests-common.yml").read_text(
         encoding="utf-8"
@@ -304,7 +304,7 @@ def test_ci_still_builds_without_publishing():
     secrets_at = interfaces.index("    secrets:")
     assert "NEXUS_TOKEN:" in interfaces[secrets_at:]
     assert "required: true" not in interfaces[secrets_at:], (
-        "an optional secret must not become required: ci.yml passes none"
+        "an optional secret must not become required: manual builds may pass none"
     )
 
     assert "publish" not in (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -341,8 +341,7 @@ def test_the_publish_step_runs_before_the_artifact_upload():
     )
 
     step = text[publish_at:artifact_at]
-    # Only release.yml sets it, so a normal CI build of this same workflow is
-    # untouched.
+    # Only release.yml sets it; manual wheel builds leave publishing disabled.
     assert "if: inputs.publish" in step[:200], step[:200]
     # The upload decides its own route to Nexus, which is not the same on every
     # runner: the PPU pod's proxy refuses the CONNECT to resource.flagos.net.

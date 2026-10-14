@@ -42,11 +42,8 @@ container_options: >-
   --env MTHREADS_VISIBLE_DEVICES=all
 
 timeout_minutes: 60
+# Release/manual wheel-build artifact; CI tests the wheel in the build job.
 wheel_artifact_name: wheel-musa
-# MUSA bundles no forked libtorch (native mudnn, no CUDA boxing), so the wheel
-# is small -- but local-build still avoids the artifact transfer round trip and
-# mirrors the MetaX dedicated-pipeline layout.
-integration_wheel_source: local-build
 
 integration_tests:
   # Preflight: the isolated venv must hold CPU torch 2.10 with no torch_musa
