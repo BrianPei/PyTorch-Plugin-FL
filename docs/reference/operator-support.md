@@ -116,15 +116,18 @@ MUSA. The MUSA routing changes recorded under **Native Backend Route Changes** a
 mc550, 810e or bw1000 by that work, and no MUSA row exists here to update. The
 same caveat applies to the raw case counts below.
 
-Iluvatar (BI-V150 / Tianshu) has now been surveyed, but its **own** cohort is 639
-routes (the conf predates `cat` joining the ceiling), not the 546 of the table
-above, so it is kept off the cross-hardware rows rather than entered with a
-different denominator. Its measured split is **STRICT 379 / BASIC_ONLY 66 /
-FAILED 58 / UNTESTED 136 over 639** (445 basic-executable, 69.6% basic, 59.3%
-strict); the detail and the `NATIVE_TRITON_GAPS["iluvatar"]` gap set are in the
-Iluvatar route-change section below and in the raw case table. It is the platform
-the shared FlagGems ceiling is *not* an answer for: 37 measured failures route to
-`cpu_fallback`, so the conf carries 603 `flaggems` routes, not 640.
+Iluvatar (BI-V150 / Tianshu) has now been surveyed against its own conf, but its
+**own** cohort is 603 routes — the conf's FlagGems-routed set, with the 37
+measured failures already off the route — not the 546 of the table above, so it
+is kept off the cross-hardware rows rather than entered with a different
+denominator. Its measured split is **STRICT 380 / BASIC_ONLY 66 / FAILED 21 /
+UNTESTED 136 over 603** (446 basic-executable, 74.0% basic, 63.0% strict); the
+detail and the `NATIVE_TRITON_GAPS["iluvatar"]` gap set are in the Iluvatar
+route-change section below and in the raw case table. It is the platform the
+shared FlagGems ceiling is *not* an answer for: 37 measured failures leave the
+FlagGems route, so the conf carries 603 `flaggems` routes, not 640. One of those
+37 (`native_batch_norm`) is now served by the native `iluvatar` kernel; the other
+36 reach `cpu_fallback`, as do ops outside the ceiling with no vendor kernel.
 
 ## Raw Case Evidence
 
@@ -138,11 +141,14 @@ summary.
 | MetaX mc550 | 1597 | 1309 | 0 | 812 | 90 | 14 | 0 | 0 |
 | PPU 810e | 2158 | 1305 | 0 | 184 | 154 | 21 | 0 | 0 |
 | Hygon DCU bw1000 | 2016 | 1309 | 0 | 337 | 146 | 14 | 0 | 0 |
-| Iluvatar BI-V150 | 2344 | 1695 | 0 | 235 | 178 | 21 | 0 | 0 |
+| Iluvatar BI-V150 | 2351 | 1641 | 0 | 83 | 146 | 0 | 0 | 0 |
 
-The Iluvatar row is the 639-route cohort of the section below (4473 cases), not
+The Iluvatar row is the 603-route cohort of the section below (4221 cases), not
 the 546-op cohort of the rows above, so its PASS/INVALID_CASE volume is larger and
-must not be compared against them directly.
+must not be compared against them directly. Its case counts fell from the previous
+run's 4473 (2344 `PASS` / 235 `ERROR` / 178 `WRONG` / 21 `CRASH`) because that run
+covered 639 routes: the 37 ops since moved to `cpu_fallback` were where its `CRASH`
+volume and most of its `ERROR` volume sat.
 
 The bw1000 baseline excludes 108 initial records that failed before operator
 execution because the child process could not load its MPI runtime. Exactly
@@ -189,75 +195,101 @@ a platform's own full-coverage configuration is a third cohort again — its
 denominator is that file's active route set, not 546 — and the entry states which
 one it measured.
 
-### Iluvatar (BI-V150 / Tianshu): a new FlagGems-primary platform, measured on BI-V150 to 603 FlagGems routes (2026-10-14)
+### Iluvatar (BI-V150 / Tianshu): a new FlagGems-primary platform, measured on BI-V150 to 603 FlagGems routes (2026-10-14; cohort re-measured 2026-10-15)
 
-**One sentence.** `FLAGOS_ACCELERATOR=iluvatar` is a new accelerator whose
-generated full-coverage configuration
+**One sentence.** `FLAGOS_ACCELERATOR=iluvatar` is an accelerator whose generated
+full-coverage configuration
 [`backends_iluvatar.conf`](../../torch_fl/configs/backends_iluvatar.conf) routes
-603 of 2037 ops to the FlagGems Python/Triton key and the remaining 1434 to
-`none` (`cpu_fallback`), because the platform has **neither a vendor kernel
-library nor a CUDA boxing path** — boxing was explicitly ruled out for it. The
+603 of 2037 ops to the FlagGems Python/Triton key, leaves the ops with no
+accelerated implementation at `none` (`cpu_fallback`), and routes a small native
+cohort to its own `iluvatar` vendor slot — a non-boxing backend that calls
+corex's CUDA-named C ABI (ixdnn/ixblas) directly. FlagGems stays primary: the
 603 is the shared 640-overload FlagGems ceiling minus the 37 ops a BI-V150
-overload survey measured failing (see **Coverage is measured** below).
+overload survey measured failing (see **Coverage is measured** below), and
+FlagGems wins an op that the native set also covers.
 
-**Why there is no third route.** Every other `FLAGGEMS_PYTHON_PLATFORMS` entry
-sits on top of a vendor-native tree or a boxing fallback: `ascend` and `gcu` have
-native `.inc` registration sets, `metax` / `dcu` / `ppu` re-dispatch to the CUDA
-boxing kernels. Iluvatar has neither, so the FlagGems Python route is not one of
-several paths — it is the platform's *only* operator path, and every op without a
-FlagGems kernel falls back to `cpu_fallback`. Congruently, the platform's runtime
-directory is `cuda`: the corex 4.5.0 SDK presents a CUDA-shaped runtime, so the
-shared `csrc/runtime/accelerator/cuda/` sources are built as-is and no
-`csrc/runtime/accelerator/iluvatar/` directory exists.
+**The third route is a native vendor slot, not a boxing path.** Iluvatar keeps
+the FlagGems Python/Triton route as its default and adds a second, non-boxing
+route: ops outside the FlagGems ceiling are answered by
+`csrc/aten/backends/iluvatar/`, which calls corex's CUDA-named C ABI
+(`cudnn.h` → ixdnn, `cublas_v2.h` → ixblas) directly against the flagos tensor's
+`data_ptr()`. That is the same shape as Kunlunxin (a native PrivateUse1 vendor
+that wraps its XPU op library), and deliberately *not* the CUDA-boxing shape
+`metax` / `dcu` / `ppu` use: no tensor is retagged onto `DispatchKey::CUDA`, so
+every op stays inside this dispatcher's conf and logging.
+The platform's runtime directory is still `cuda` — the corex 4.5.0 SDK presents a
+CUDA-shaped runtime, so the shared `csrc/runtime/accelerator/cuda/` sources are
+built as-is and no `csrc/runtime/accelerator/iluvatar/` directory exists.
 
-**The `csrc/aten/backends/iluvatar/` directory holds no kernel source.** It is the
-first `FLAGGEMS_PYTHON_PLATFORMS` entry with no native `.inc`: the whole tree is
-`generated/iluvatar_flaggems_register.inc` (603 `m.impl()` lines), included by
-`register.cc` inside `TORCH_LIBRARY_IMPL(aten, PrivateUse1)` under
-`USE_ILUVATAR` + `FLAGOS_FLAGGEMS_PYTHON`. Its header states the consequence
-plainly — an op routed to `flaggems` there but *not* claimed in the file reaches
-the dispatcher with an empty `kFlagGems` slot and raises "backend not registered"
-rather than falling back, which is why the registration set and the conf route set
-must be generated together. The generator's `VENDORS["iluvatar"]` entry declares
-an **empty native-`.inc` slot** — an explicit "no vendor kernels", not a file that
-should exist — so the scan reads the vendor set as empty. `registered_impls()`
-and the `build_all()` existence guard both treat the empty path as the empty set.
+**The `csrc/aten/backends/iluvatar/` directory holds two registration sets.** The
+FlagGems set is `generated/iluvatar_flaggems_register.inc` (the FlagGems Python
+routes) and the native set is `generated/iluvatar_register.inc`, whose
+`m.impl()` lines are backed by `generated/iluvatar_kernels.cc`. Both are included
+by `register.cc` inside `TORCH_LIBRARY_IMPL(aten, PrivateUse1)` under
+`USE_ILUVATAR` — the FlagGems one under `FLAGOS_FLAGGEMS_PYTHON`, the native one
+under `FLAGOS_ILUVATAR_KERNEL` — and they are **disjoint**, because a duplicate
+`m.impl` for one op is a compile error. An op routed to `flaggems` but not claimed
+in the FlagGems file reaches the dispatcher with an empty `kFlagGems` slot and
+raises "backend not registered" rather than falling back, which is why the
+registration set and the conf route set are generated together. The generator's
+`VENDORS["iluvatar"]` entry now names the native `.inc` alongside the FlagGems
+one; routing is decided statically at conf-generation time and FlagGems wins over
+the vendor slot, so an op in both the FlagGems ceiling and the native set routes
+`flaggems` (with a `# iluvatar` annotation) and the native kernel is reachable
+only through an explicit override — `FLAGOS_FORCE_BACKEND=vendor`, or a per-op
+`FLAGOS_OP_<name>=iluvatar` — not through the dispatcher's runtime dtype escape,
+whose predicate (`FlagGemsRejectsArgs`) has no `USE_ILUVATAR` arm on this build
+and so returns false for every operand. The annotation is what makes those
+overrides able to move the op at all.
 
 **Routing, countable from the file alone.** The configuration is generated by
 [`scripts/codegen/gen_vendor_confs.py`](../../scripts/codegen/gen_vendor_confs.py)
 from `FLAGGEMS_PYTHON_PLATFORMS` minus `NATIVE_TRITON_GAPS["iluvatar"]`, in the
-same full-coverage shape as the other FlagGems-primary platforms: all 2037 ops
-listed exactly once, **603 `flaggems` / 0 vendor / 1434 `none`**, which the file's
-own banner reports as 29.6% coverage.
+same full-coverage shape as the other platforms: all 2037 ops listed exactly
+once, **603 `flaggems` / 3 `iluvatar` / 1431 `none`**. The three `iluvatar` routes
+are the first cohort's ops that currently route to `none` and have an ixdnn/ixblas
+kernel (`_convolution`, `convolution`, `native_batch_norm`); the other first-cohort
+ops with a kernel (`_native_batch_norm_legit`,
+`_native_batch_norm_legit_no_training`, `mm`, `bmm`, `addmm`) stay `flaggems`,
+because FlagGems wins the static route and — being already registered in the
+FlagGems `.inc` — cannot appear in the native `.inc` without a duplicate `m.impl`.
+Those kernels exist for the force/override paths but are not conf routes.
 
-**Coverage is measured on BI-V150, over the 639-op pre-`cat` cohort.**
+**Coverage is measured on BI-V150, over the 603-op FlagGems-routed cohort.**
 
 `tests/manual/flaggems_overload_survey.py` (harness version 6) was run on a
 BI-V150 host (`ub22`, `lvyufeng-torch-fl` container, corex 4.5.0, flag_gems 5.3.5
 + flagtree/triton 3.6.0) against `backends_iluvatar.conf` at conf SHA-256
-`f08d420acf4d39104bb6c49db1c72c76513fc82e0509dba5173d6e484739046d`. That conf
-predates the `cat` op joining the ceiling (upstream #498), so the measured cohort
-is **639** routes; `cat` was then measured separately against the 640-route conf
-as **STRICT** (all seven profiles `PASS`). The 639-op result, seven profiles per
-overload:
+`5b2ab727110268857c2e0f27cd7f5f84900f37614be1ae21ba098a2ce6a675bc` — this conf,
+with the native `iluvatar` routes in place and the 37 measured failures already
+off the FlagGems route — so the measured cohort is the conf's own **603**
+`flaggems` routes. The 603-op result, seven profiles per overload:
 
 | Total | STRICT | BASIC_ONLY | FAILED | UNTESTED | Tested | Basic executable | Basic rate | Strict rate |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 639 | 379 | 66 | 58 | 136 | 503 | 445 | 69.6% | 59.3% |
+| 603 | 380 | 66 | 21 | 136 | 467 | 446 | 74.0% | 63.0% |
 
-`STRICT + BASIC_ONLY + FAILED + UNTESTED = 639` and
-`Basic executable = STRICT + BASIC_ONLY`. The 4473 synthesized cases resolve as
-**2344 `PASS` / 1695 `INVALID_CASE` / 235 `ERROR` / 178 `WRONG` / 21 `CRASH`**,
-with no `TIMEOUT`, no `UNVERIFIABLE` and no context poison. This is a
-provisional-cohort caveat on the *route set*, not on the run: 639 of the conf's
-now-640 routes were covered, and the one-op margin is `cat`, measured separately.
+`STRICT + BASIC_ONLY + FAILED + UNTESTED = 603` and
+`Basic executable = STRICT + BASIC_ONLY`. The 4221 synthesized cases resolve as
+**2351 `PASS` / 1641 `INVALID_CASE` / 83 `ERROR` / 146 `WRONG` / 0 `CRASH`**,
+with no `TIMEOUT`, no `UNVERIFIABLE` and no context poison.
 
-`NATIVE_TRITON_GAPS["iluvatar"]` records the **37 of the 58 FAILED ops that are
-defects** rather than harness synthesis limits; those 37 leave the FlagGems route
-for `cpu_fallback`, which is what shrinks the conf to 603. The remaining 21
-FAILED are survey artifacts — the CPU reference itself rejects or segfaults on
-the synthesized call — and stay on FlagGems; the gap entry lists them by name
-with the reason. Three failure families dominate the 37: a **device-name
+This run re-covers the previous one rather than replacing it on a different
+denominator, so the two are directly comparable: the earlier 639-route run
+(conf `f08d420a…`) resolved **58 FAILED**, and this 603-route run resolves
+**21**, with **no op newly failing** — the 37 that left are exactly
+`NATIVE_TRITON_GAPS["iluvatar"]`, verified as a set equality against the
+generator rather than eyeballed. The other count that moves is `cat`, which the
+earlier conf predated (upstream #498) and was measured separately there as
+**STRICT**; here it is one of the 380 in-band. `639 − 37 + 1 = 603` and
+`379 + 1 = 380`, which is where both totals come from.
+
+`NATIVE_TRITON_GAPS["iluvatar"]` records the **37 of the earlier run's 58 FAILED
+ops that are defects** rather than harness synthesis limits; those 37 leave the
+FlagGems route for `cpu_fallback`, which is what shrinks the conf to 603. The
+remaining 21 FAILED are survey artifacts — the CPU reference itself rejects or
+segfaults on the synthesized call — and stay on FlagGems; the gap entry lists
+them by name with the reason. Three failure families dominate the 37: a **device-name
 mismatch** (below), real **kernel/compile defects** (`randint`, `randint_like`,
 `norm.Scalar`, `norm.ScalarOpt_dim`, `unique_consecutive`, the wrong-value
 `special_*` family, `histc`, `gcd_`, and the three CRASHing batch-norm arms), and
@@ -9762,7 +9794,8 @@ the recorded result is unchanged.
 | 2026-10-13 | Kunlunxin P800 (native backend) | Kunlunxin native backend dtype gates (the ten runtime-conformance ops: `add.Tensor`, `mul.Tensor`, `mm`, `bmm`, `neg`, `sum.dim_IntList`) | **Splits the native backend's single flat dtype gate into per-op gates measured against the vendor wrapper, so a dtype the vendor rejects takes the CPU round-trip instead of erroring inside the wrapper.** The lane's first run to reach the portable integration step failed ten `tests/integration/test_dtype_coverage.py` cases, every one of them a dtype the previous build sent straight to the vendor: the generated kernels gated on the flat `KunlunxinSupportsDtype`, whose dtype map admits float64 and int8 for every op, but `xdnn_pytorch_wrapper` validates the scalar types of each entry point at run time and rejects a per-op subset (`add.cpp:151`, `mul.cpp:189`, `neg.cpp:55`, `sum.cpp:81`, `matmul.cpp:106` raise "scalar type of ret : k<dtype> is unsupported", surfaced to the caller as `RuntimeError: <op> failed on the Kunlunxin XPU backend: Interrupted system call (4)`). Five new predicates in `csrc/aten/backends/kunlunxin/kunlunxin_common.h` now name each op's accepted set, each measured against the wrapper rather than inferred from the base map: `KunlunxinSupportsAddDtype` (base − float64 − int8), `KunlunxinSupportsMulDtype` (add − int16), `KunlunxinSupportsMatmulDtype` (exactly float16/float32), `KunlunxinSupportsUnaryDtype` (base − float64) and `KunlunxinSupportsReductionDtype` (float16/bfloat16/float32). The generator drives them through one `{supports}` placeholder and a `SUPPORTS` category→predicate map in `scripts/codegen/codegen_kunlunxin.py`, and `cat`, `_softmax`, `embedding` and `where.self` resolve to the base predicate through the same map (no change to their behaviour). `neg` on bool and the compact int/uint cases are unchanged. No test case was touched — the fleet requires identical test-case code across platforms; the gate is a per-op capability of the vendor wrapper, not a host accommodation. No operator reroutes: `backends_kunlunxin.conf` is byte-identical. | Regeneration is idempotent (`python scripts/codegen/codegen_kunlunxin.py --check` → `[check] 10 kernel(s) up to date`); the regenerated `kunlunxin_kernels.cc` changes exactly the six gate lines and `kunlunxin_register.inc` is byte-identical (the `m.impl` set did not move). The pre-fix failure is the lane's own integration-job log (`test_dtype_coverage.py` → `10 failed, 226 passed, 1 xfailed`). The runtime-conformance cohort this row names builds every operand via `_randn(...)` and is therefore **float32 only** (`tests/integration/runtime/runtime_probe.py`), so per-op gating cannot move it; a `pytest tests/integration/runtime` run on the P800 is the follow-up that closes the hardware-measurement gap — the new gates are **not revalidated** on hardware until the lane re-runs. |
 | 2026-10-13 | Kunlunxin P800 (native backend) | Kunlunxin CI lane (main) + compressed-sparse boxing-guard correction | **Adds the Kunlunxin CI lane on `main`, so the de-boxed backend is guarded like every other accelerator**, and closes the one spot the 2026-10-12 de-boxing missed. The lane (`.github/workflows` `Platform pipeline (kunlunxin)`, its config, and the `set_env` hook) builds a `FLAGOS_ACCELERATOR=kunlunxin` wheel and runs `import torch_fl` as a post-build smoke test. On the first run that smoke test failed on `csrc/aten/sparse_csr_ops.cc`: its two CUDA-boxing guards listed Ascend/GCU/MUSA/TsingMicro/BPU but not `USE_KUNLUNXIN`, so the wheel linked `libtorch_fl.so` and then died at import with `undefined symbol: _ZN2at6native32addmm_out_sparse_compressed_cuda…` — the de-boxed backend links neither the vendor torch nor CUDA kernels, so `at::native::addmm_out_sparse_compressed_cuda` has no definition to bind. Both guards now carry `!defined(USE_KUNLUNXIN)`, and `tests/integration/ops/test_sparse_csr_dispatch.py`'s `NOT_CUDA_BOXING` set matches (the C++ is the source of truth). The `SparseCsrflagos` key's `mm`/`addmm`/`flatten_indices` registrations are therefore not compiled into a Kunlunxin wheel and those ops are left **unimplemented** there (the stock wheel's "DispatchStub: missing kernel" / "Could not run" errors) instead of half-registered. **No operator reroutes:** `backends_kunlunxin.conf` is byte-identical, still zero `cuda` routes, and no other platform's cohort moves — this is a build/link correction plus a CI addition. The lane also locates the vendor `xdnn` op library inside the image venv (`site-packages/torch_xmlir`), where the SDK ships it rather than under a bare `XDNN_ROOT`. | `ruff check .` → "All checks passed!"; `ruff format --check .` → 358 files already formatted; `tests/unit/test_gen_vendor_confs.py test_vendor_conf_single_writer.py test_conf_registration_consistency.py test_setup_build.py test_platform_capability_matrix.py test_device_tracer_selection.py` → 146 passed. The pre-fix failure is the lane's own CI log (`ImportError: …/torch_fl/lib/libtorch_fl.so: undefined symbol: _ZN2at6native32addmm_out_sparse_compressed_cuda…` after `[100%] Built target torch_bindings` / `Linking CXX shared library libtorch_fl.so`). The compressed-sparse surface itself is **not revalidated** on the P800 — the lane proves the wheel builds, imports, and routes; a `pytest tests/integration/runtime` run on the P800 is the follow-up that closes the hardware-measurement gap. |
 | 2026-10-12 | MetaX | MetaX full-coverage conf (2037-route denominator), runtime-conformance subset | `_softmax` and `embedding` leave the `flaggems_cpp` route: both were in `METAX_CPP_MEASURED` (`scripts/codegen/gen_vendor_confs.py`) but the MetaX build carries no FlagGems C++ half, so `Dispatcher::GetFn` degraded the route to the CUDA boxing kernel rather than serving it, and both ops are in `RUNTIME_OPS`. Removed from the measured set; each falls through `route_boxing()` to `flaggems` (both are in `FLAGGEMS_PYTHON_OPS`), so no `none` entry appears on a boxing platform. Route delta `flaggems_cpp` 12 -> **10**, `flaggems` 592 -> **594**, `cuda` 1433 unchanged; total 2037, coverage 2037/2037. Every other platform's conf is byte-identical. Wiring the MACA FlagGems C++ build into the MetaX CI hook and restoring the two routes is a separate follow-up PR. | Conf SHA-256 `8af0f654bb27358c93444b5a1674d447d566f6d3c535d591ee80714da7e95a22` -> `8a3a2e686b2a89a26bfb367fcfabafb7da88b718362c5c69b7c6196e777cbf3f`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` exits 0; `tests/unit/test_conf_registration_consistency.py`, `tests/unit/test_gen_vendor_confs.py`, `tests/unit/test_vendor_conf_single_writer.py` and the full unit suite pass; the metax route counts and the `flaggems` landing are read from the regenerated conf. This unblocks the MetaX runtime-conformance run; no 32/32 result was measured on hardware here. |
-| 2026-10-14 | Iluvatar BI-V150 (new platform row) — **not hardware-revalidated; no FlagGems overload survey has been run on BI-V150** | Iluvatar full-coverage conf (2037-route denominator; FlagGems routing only) | New accelerator id `FLAGOS_ACCELERATOR=iluvatar` (BI-V150 / Tianshu, corex 4.5.0 SDK). It is FlagGems-primary with **no vendor kernel library and no CUDA boxing path** — boxing was explicitly ruled out — so it is the first `FLAGGEMS_PYTHON_PLATFORMS` entry whose only operator path is the FlagGems Python/Triton route through FlagTree's iluvatar backend. `backends_iluvatar.conf` is generated by `scripts/codegen/gen_vendor_confs.py`: **640 `flaggems` / 0 vendor / 1397 `none`** (31.4%), the `none` entries reaching `cpu_fallback`. `runtime_dir` is `cuda` (the shared `csrc/runtime/accelerator/cuda/` sources; no `iluvatar/` runtime directory). `csrc/aten/backends/iluvatar/` exists but contains no kernel source — only `generated/iluvatar_flaggems_register.inc` (640 `m.impl()` lines), the platform's entire PrivateUse1 registration. No route moved in any other platform's cohort; every other `backends_*.conf` is byte-identical. | Routing countable from the generated file: 2037 ops, 640 `flaggems` + 1397 `none`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` exits 0. The `iluvatar` row was added to `docs/reference/platform-capability-matrix.md` and `tests/unit/test_platform_capability_matrix.py` passes, pinning the conf route count, the `csrc/aten/backends/` inventory and the absence of a CI config. **Operator coverage is provisional and not measured**: no FlagGems overload survey has been run on BI-V150, so there is no `STRICT`/`BASIC_ONLY`/`FAILED`/`UNTESTED` split and no `Basic rate`; `tests/manual/flaggems_overload_survey.py` on a BI-V150 host is the tool that closes this gap. No CI lane exists (`.github/configs/iluvatar.yml` absent); the wheel carries the local version segment `corex4.5.0`. |
+| 2026-10-15 | Iluvatar BI-V150 | Iluvatar's own FlagGems cohort: the finalized conf's **603** `flaggems` routes (2037-route denominator) | **Re-measures the platform's FlagGems cohort against the shipped conf, replacing the 639-route provisional number.** The earlier survey predated both the native vendor slot and `cat` joining the ceiling, so it measured 639 routes against a conf the tree no longer ships; every figure in the summary, the raw case table, the route-change section and this history now comes from one run against one conf. | `tests/manual/flaggems_overload_survey.py` on `ub22` against `backends_iluvatar.conf` at conf SHA-256 `5b2ab727110268857c2e0f27cd7f5f84900f37614be1ae21ba098a2ce6a675bc`: **STRICT 380 / BASIC_ONLY 66 / FAILED 21 / UNTESTED 136** over 603 (467 tested, 446 basic-executable, 74.0% basic / 63.0% strict); 4221 synthesized cases resolve as **2351 `PASS` / 1641 `INVALID_CASE` / 83 `ERROR` / 146 `WRONG` / 0 `CRASH`**, no `TIMEOUT`, no `UNVERIFIABLE`, no context poison. `STRICT + BASIC_ONLY + FAILED + UNTESTED = 603`. The run is directly comparable to the 639-route one, not merely a smaller denominator: **no op newly failed**, and the 37 routes that left are an exact set equality with `NATIVE_TRITON_GAPS["iluvatar"]`; the FAILED count falls 58 → 21 because those gapped ops carried most of the old FAILED and all 21 of its `CRASH`. `cat`, measured separately as STRICT in the earlier run, is now in-band: `639 − 37 + 1 = 603` and `379 + 1 = 380`. **The gap set itself is unchanged** — the second run neither adds to nor subtracts from it, so no route moved in or out on this evidence. The native `iluvatar` cohort remains **not hardware-revalidated** beyond the conv2d proof; this row measures FlagGems only. |
+| 2026-10-14 | Iluvatar BI-V150 (native vendor backend added) — **native cohort not hardware-revalidated beyond conv2d; FlagGems cohort measured on BI-V150** | Iluvatar native (non-boxing) vendor slot + full-coverage conf (2037-route denominator) | Iluvatar gains a **native, non-boxing vendor backend** alongside its FlagGems-primary route. `csrc/aten/backends/iluvatar/` now holds, besides the FlagGems `generated/iluvatar_flaggems_register.inc`, a native `generated/iluvatar_register.inc` + `generated/iluvatar_kernels.cc` (generator `scripts/codegen/codegen_iluvatar.py`) whose kernels call corex's CUDA-*named* C ABI (`cudnn.h` → ixdnn, `cublas_v2.h` → ixblas) directly on the flagos `data_ptr()` — no device retag, no `DispatchKey::CUDA`. `cmake/flagos_platforms.json` sets `FLAGOS_BUILD_VENDOR=true` (pinned) and `csrc/CMakeLists.txt` defines `FLAGOS_ILUVATAR_KERNEL` and links `-lcudnn -lcublas`. `scripts/codegen/gen_vendor_confs.py`'s `VENDORS["iluvatar"]` names the native `.inc`, so `backends_iluvatar.conf` is now **603 `flaggems` / 3 `iluvatar` / 1431 `none`**; the three native routes are `_convolution`, `convolution`, `native_batch_norm`. The two `.inc` files are disjoint (both feed one PrivateUse1 `TORCH_LIBRARY_IMPL` body), so the first cohort's GEMM/norm kernels that FlagGems already registers (mm/bmm/addmm, the `_native_batch_norm_legit*` variants) stay `flaggems` and their kernels are reachable only through an explicit override (`FLAGOS_FORCE_BACKEND=vendor` / `FLAGOS_OP_<name>=iluvatar`) — **not** through the runtime dtype escape, which has no `USE_ILUVATAR` arm and so never fires on this build. `runtime_dir` stays `cuda`. No other platform's conf moved. | `gen_vendor_confs.py` run twice leaves every conf byte-identical and `--check` exits 0; the unit suite (`test_conf_registration_consistency.py`, `test_gen_vendor_confs.py`, `test_platform_capability_matrix.py`, `test_setup_build.py`, `test_vendor_conf_single_writer.py`) reports **130 passed**, with the iluvatar route counts derived from the two registration `.inc` files rather than pinned. **The native cohort is not hardware-revalidated beyond the one proof from RECON**: flagos→cuda is a same-pointer view and ixdnn conv2d on flagos memory matches CPU bit-for-bit (max_diff 0.0) on ub22. The GEMM/norm kernels and the force/override paths are unmeasured; a `FLAGOS_FORCE_BACKEND=vendor`/`FLAGOS_OP_*` run on BI-V150 is the follow-up. The FlagGems cohort figure recorded on this row was superseded the next day by the 2026-10-15 row above, which re-measured the finalized conf (603 `flaggems` routes: STRICT 380 / BASIC_ONLY 66 / FAILED 21 / UNTESTED 136); the ratio quoted at the time was over the earlier 639-route cohort. **Contract conflict reported, not silently resolved:** the frozen task named `matmul (GEMM)` as a cohort op, but there is no `WrapperMatmul`/`MatmulFn` in the generated artifacts (matmul is a composite), so the cohort binds the `mm`/`bmm`/`addmm` leaves. The prior "no RNG entry point → handwritten RNG allowed" premise is also contradicted by `libcurand.so` (curand*/mapping_curand.h present), so the handwritten-RNG exception should be re-justified; no RNG op is in this cohort. |
 | 2026-10-12 | Ascend 910C (CANN 9.0.0) | Ascend full-coverage conf (2037-route denominator), runtime-conformance subset | `mm` and `mm.out` rerouted from `ascend` back to `flaggems`, the route #272 moved them off, because the vendor route truncates fp32: `mm` reaches `aclnnMm` through the cube path with `ascend::OpPreparation::get_cube_math_type(true)`, i.e. a bare cube-math type of `1`, which downcasts fp32 operands to HF32 (10-bit mantissa). Both ops leave `NATIVE_TRITON_GAPS["ascend"]` in `scripts/codegen/gen_vendor_confs.py` — their recorded `KeyError: Keyword argument SPLIT_K was specified but unrecognised` no longer reproduces, because `LibEntry.run` launches `kernel[grid[0:3]](*all_args)` from the kernel's own signature and drops an undeclared tune key — and `FlagGemsRejectsOpDtype`'s `USE_ASCEND` table in `csrc/aten/common.cc` gains `mm` and `mm.out` over int64/int32/int16/uint8, so integral matmul still takes the cube kernel while `int8` stays on FlagGems (`tl.dot` accepts it). Route delta `flaggems` 221 -> **223**, `ascend` 154 -> **152**, `none` 1662 unchanged; 375 accelerated (18.4%). Every other platform's conf is byte-identical. | Conf SHA-256 `3e6979f6cc9756d3b2cc6c002cb9925056967ee06f62aab17098bb41a3862f0d` -> `2fd28efe4346cf14f5e721164bc6022e07873ebdcb322d8d97d8fc98c7828795`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` exits 0. Same wheel, same host, one revision of the conf apart: pre-fix `RUNTIME-CONFORMANCE accel=ascend kernels=flaggems,vendor ops_total=10 ops_routed=10 ops_none=0 passed=30 failed=2 skipped=0 errors=0` (`2 failed, 30 passed in 220.88s`), both failures fp32 `mm` at `test_runtime_stream.py`'s 64x64 operands — `Greatest absolute difference: 0.004545688629150391 at index (58, 49) (up to 0.001 allowed)`, 92/4096 elements — and post-fix `RUNTIME-CONFORMANCE accel=ascend kernels=flaggems,vendor ops_total=10 ops_routed=10 ops_none=0 passed=32 failed=0 skipped=0 errors=0` (`32 passed in 196.17s`, pytest exit 0). Per dtype at 64x64 `seed 0` against an fp64 CPU reference: fp32 `mm -> flagos_python` 6.344024e-06 vs `mm -> ascend` 4.674678e-03, and 4.674678e-03 with `ALLOW_HF32=0` set, so the downcast is not a reachable knob; fp16 (7.704686e-03) and bf16 (6.220317e-02) are identical on both routes and bf16 is outside 1e-3 on both, so the route neither causes nor fixes it. `FLAGOS_LOG=dispatch` per dtype: int64/int32/int16/uint8 `mm -> ascend` and int8 `mm -> flagos_python`, all equal to a CPU int64 reference. Cold-cache check with `HOME` pointed at an empty directory (`.flaggems` and `.triton` absent) compiles `mm` and returns 6.344024e-06. Survey (harness v6, conf `2fd28efe`): `mm` `{tested 1, STRICT 1}`, `mm.out` `{tested 1, BASIC_ONLY 1}`, `failed 0 untested 0`, exit 0. Regression gate is the existing suite — red on the pre-fix conf, green on this one — plus the updated `test_conf_route_counts_are_stable` snapshot and `test_runtime_dispatch_route.py`'s conf-to-dispatch comparison. Evidence gaps: `mm.out` over int64 raises `RuntimeError: aclnnMmGetWorkspaceSize failed, ret=161002` on **both** arms (post-fix escape and the pre-fix conf's own direct route), so it is pre-existing and not fixed here; the survey has no bf16 profile; the other 221 Ascend `flaggems` routes and every other accelerator are **not revalidated**. |
 | 2026-10-12 | Kunlunxin P800 (native backend) | De-box Kunlunxin to a native vendor backend (conf + device layer) | **De-boxes Kunlunxin from CUDA-ABI boxing to a first-class native vendor backend, the shape of `musa`/`gcu`/`ascend`.** The generated full-coverage conf `backends_kunlunxin.conf` is now emitted from the `VENDORS` table instead of `BOXING_PLATFORMS`, so every covered op routes to the native `kunlunxin` key — the vendor xdnn op library — or is left at `none`, with **no `cuda` route at all**. The device layer moves off the shared `csrc/runtime/` CUDA sources onto `csrc/runtime/accelerator/kunlunxin/`, built on the XPU SDK's own native `libxpurt` runtime (`<xpu/runtime.h>`, `xpu_malloc`/`xpu_set_device`/`xpuMemcpy`/`xpu_stream_*`); the platform row drops `runtime_dir: "cuda"` for `runtime_dir: "kunlunxin"`, turns `FLAGOS_BUILD_BOXING` off and keeps `FLAGOS_BUILD_VENDOR` on. The CUDA-shaped surface (`cuda_runtime.h`, `libcudart.so*`) survives only as the build input for `csrc/runtime/hooks.h`'s `isPinnedPtr()` probe, which carries no kernel and is unreachable from the routing layer. No other platform's cohort moved. | Routing audited from the regenerated file: the conf carries **zero `cuda` routes**, `gen_vendor_confs.py` twice → empty diff and `--check` exits 0. Platform invariants tightened across `tests/unit/test_conf_registration_consistency.py` (kunlunxin moved from `BOXING_PLATFORMS` to `PLATFORM_REGISTRATION`/`VENDORS`; the census snapshot and route-count pin set to the regenerated numbers), `tests/unit/test_gen_vendor_confs.py` (`VENDORS` includes kunlunxin), and `tests/unit/test_vendor_conf_single_writer.py`, which now asserts `VENDORS` and `BOXING_PLATFORMS` are disjoint so a platform cannot sit in both sets with its native route silently shadowed by the `cuda` fallback. The native device layer and the vendor route are **not measured on hardware in this change**: the checked-in `tests/manual/kunlunxin_runtime_smoke.py` is the harness to run them on a P800 — device count/index, allocation, host↔device round-trip, `Stream`, `synchronize`, `empty_cache`, and `mm`. The FlagGems overload cohort is **not revalidated** on the P800 and no `flaggems` route is enabled; the 2.9-line FlagGems allowlist is deferred to a follow-up PR. |
 | 2026-10-11 | Kunlunxin P800 OAM (new platform row) | Generated full-coverage CUDA-boxing config | **Superseded by the 2026-10-12 de-boxing entry above.** New accelerator id `FLAGOS_ACCELERATOR=kunlunxin`. Kunlunxin is a CUDA-ABI boxing platform (the vendor torch registers under the CUDA dispatch key and drives the XPU SDK's CUDA-shaped runtime), added alongside `dcu`/`ppu`/`metax` with `runtime_dir: "cuda"` and `project_languages: ["CXX","C"]`. `backends_kunlunxin.conf` is generated by `scripts/codegen/gen_vendor_confs.py` from `BOXING_PLATFORMS` with fallback `cuda`: **2037 `cuda` / 0 `flaggems` / 0 `none`**. No op is rerouted to a vendor-native or FlagGems backend; kunlunxin is absent from `FLAGGEMS_PYTHON_PLATFORMS`, so no FlagGems route is claimed. No route moved in any other platform's cohort. | Routing countable from the generated file: 2037 ops, all on `cuda`. `gen_vendor_confs.py` twice → empty diff, `--check` exits 0. `tests/unit/test_conf_registration_consistency.py` pins `{"cuda": 2037}`; `test_setup_build.py` validates the new platform row. On a P800 OAM under a stock torch 2.10 build of this port, `import torch_fl`, backend-config selection to `backends_kunlunxin.conf`, `device_count() == 8`, and the boxing device layer on `flagos:1` (`set_device`, `current_device`, allocation, host↔device round-trip, `Stream`, `synchronize`, `empty_cache`) were measured green; **operators on the `cuda` route, including the harness's `mm` check, are not measured** — the vendor XPU runtime on that box is torch-2.9-bound, so eager ops reaching ATen's CUDA dispatch raise `NotImplementedError` under torch 2.10 and validating them requires a vendor torch 2.10 runtime. The FlagGems overload cohort is **not revalidated** on the P800 and this change claims no FlagGems route; the 2.9-line FlagGems allowlist is deferred to a follow-up PR. |
