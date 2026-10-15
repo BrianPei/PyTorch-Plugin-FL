@@ -374,3 +374,45 @@ instead of being silently omitted. `build-wheel.yml` -- the one parameterized wh
 calls, remain for release/manual wheel builds only; they do not run integration tests.
 `wheel_artifact_name` is used by those build callers, while hardware CI builds and tests its wheel
 in the same job.
+
+## FlagCICD pytest reports
+
+Each selected hardware job collects native `pytest-json-report` JSON from its
+pytest processes and merges it into `pytest-<platform>.json` in the checkout.
+The upload action's `report_path` names this generated file; `file_type` is
+`pytest`. This reports test executions and outcomes, not Python line/branch
+coverage or a percentage of supported operators. Repeated cases in different
+groups remain separate executions, annotated with group/session metadata.
+
+Collection is scoped to the hardware test step through `PYTEST_PLUGINS` and an
+absolute report directory. Every pytest invocation gets a unique file, including
+DCU's per-file unit runs. The collector removes its activation from each pytest
+process's child environment so intentionally failing subprocess fixtures do not
+pollute the platform result. It adds only its own helper directory to
+`PYTHONPATH`, retaining tests against the installed wheel in the isolated cwd.
+
+Completed reports survive a later group failure. Missing or truncated session
+reports are recorded under `flagcicd.incomplete_sessions`; no passing cases are
+invented for a killed process or an unexecuted group. The integration step's
+outcome remains authoritative, including failures in non-pytest checks and the
+existing opt-in teardown-crash policy. `flagcicd.complete` describes the started
+pytest sessions only, not whether every configured group ran. Failure before any
+pytest session produces no merged report. Cancelled jobs do not attempt uploads.
+
+Raw session files and the merged report are retained as
+`pytest-<platform>-<run_attempt>` workflow artifacts. Reporting and upload steps
+have bounded timeouts and do not turn failed tests into successful CI. The
+organization/repository secret `FLAGCICD_API_TOKEN` is passed explicitly from
+`ci.yml` to the reusable integration workflow. An absent token skips the service
+upload with a warning; it does not prevent report generation or artifact retention.
+Fork PRs and the trusted fork diagnostic route retain artifacts but skip the
+credentialed upload in the job executing fork code.
+
+Each job container is created with
+`--add-host=flagcicd-inner.flagos.net:10.1.4.15`, so ARC replacement pods require no
+manual hosts-file edits. Its network must also reach port 8000 on that address.
+The uploader posts to `http://flagcicd-inner.flagos.net:8000/metrics/`, uses a
+platform-specific `job_name`, and treats transport/service errors as warnings.
+Validate the upload's HTTP response and the corresponding FlagCICD record: a
+green workflow alone does not prove ingestion. Backend parsing and dashboard
+interpretation of the merged report require an actual internal-service run.
