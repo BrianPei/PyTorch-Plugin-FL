@@ -107,14 +107,6 @@ def handle(event, platforms, github):
             )
     current = github.repo_api(f"issues/{number}/labels?per_page=100", paginate=True)
     old = {label["name"] for page in current for label in page}
-    github.repo_api(
-        f"issues/{number}/labels", method="POST", payload={"labels": labels}
-    )
-    for label in sorted(old - set(labels)):
-        if label.startswith("platform:"):
-            github.repo_api(
-                f"issues/{number}/labels/{quote(label, safe='')}", method="DELETE"
-            )
     requested = "all" if selected == platforms else ",".join(selected)
     github.command(
         "workflow",
@@ -129,6 +121,16 @@ def handle(event, platforms, github):
         "--field",
         f"pr_number={number}",
     )
+    # Do not change PR routing labels until dispatch succeeds. A failed
+    # request must not alter the platform selected by later automatic CI.
+    github.repo_api(
+        f"issues/{number}/labels", method="POST", payload={"labels": labels}
+    )
+    for label in sorted(old - set(labels)):
+        if label.startswith("platform:"):
+            github.repo_api(
+                f"issues/{number}/labels/{quote(label, safe='')}", method="DELETE"
+            )
     # The API resolves the current PR head once more at run start, then every
     # reusable workflow receives that immutable commit. No fork workflow is loaded.
     github.repo_api(
