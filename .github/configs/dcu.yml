@@ -52,6 +52,14 @@ container_volumes:
 
 integration_environment: {}
 
+# The per-file unit suite executes CI checkout resolution with the real jq.
+# Reuse it when present; provision it before tests in older DCU images.
+integration_test_dependencies:
+  - >-
+    command -v jq >/dev/null 2>&1 ||
+    (apt-get update &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq)
+
 # DCU is non-NVIDIA: expose the /dev/kfd and /dev/dri device nodes through
 # --privileged (mirrors the MetaX layout) instead of --gpus all.
 container_options: >-
