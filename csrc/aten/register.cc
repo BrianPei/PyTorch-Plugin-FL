@@ -578,13 +578,26 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     #include "backends/musa/generated/musa_flaggems_register.inc"
     #endif
   #elif defined(USE_ILUVATAR)
-    // Iluvatar is FlagGems-primary: there is no vendor kernel library, so the
-    // only registrations are the FlagGems dispatcher slots. This arm must exist
-    // even though it claims nothing else -- without it iluvatar would fall to
-    // the generic #else below, which includes the full generated register.inc
-    // and claims every generated op, making `none` in backends_iluvatar.conf a
-    // "backend not registered" raise instead of a cpu_fallback. That is the same
-    // defect the Ascend comment above records.
+    // Iluvatar is FlagGems-primary, with a vendor-native slot alongside it: the
+    // corex ixdnn/ixblas libraries (the CUDA-named C API) back the ops the conf
+    // routes to "iluvatar", and FlagGems stays the default for everything else.
+    // The native set is claimed only under FLAGOS_ILUVATAR_KERNEL so a
+    // FlagGems-only build still compiles; the two .inc files are disjoint, as
+    // both are included into the same PrivateUse1 TORCH_LIBRARY_IMPL body and a
+    // duplicate m.impl for one op is a compile error.
+    //
+    // This arm must exist even when it claimed nothing else -- without it
+    // iluvatar would fall to the generic #else below, which includes the full
+    // generated register.inc and claims every generated op, making `none` in
+    // backends_iluvatar.conf a "backend not registered" raise instead of a
+    // cpu_fallback. That is the same defect the Ascend comment above records.
+    #if defined(FLAGOS_ILUVATAR_KERNEL)
+    #include "backends/iluvatar/generated/iluvatar_register.inc"
+    #endif
+    // Registered whenever the FlagGems Python path is compiled in, not only
+    // under FLAGOS_ILUVATAR_KERNEL: backends_iluvatar.conf routes ops to
+    // FlagGems by default, so these kFlagGems dispatcher slots must exist or
+    // those routes raise "backend not registered". Same contract as MUSA.
     #if defined(FLAGOS_FLAGGEMS_PYTHON)
     #include "backends/iluvatar/generated/iluvatar_flaggems_register.inc"
     #endif
@@ -620,9 +633,37 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // CUDA and does not build the CUDA boxing kernels (FLAGOS_BUILD_BOXING is
     // pinned off in cmake/flagos_platforms.json).
   #else
+  // CUDA-ABI boxing platforms: cuda, metax, dcu, ppu and tsingmicro all share
+  // this arm. With FLAGOS_BUILD_BOXING=ON the wheel carries the generated CUDA
+  // boxing kernels (generated/cuda_kernels.cc), so every generated op may be
+  // claimed here and a `cuda` route lands on a real kernel.
+  //
+  // Boxing is off by default for all five now (cmake/flagos_platforms.json).
+  // Those wheels link no CUDA kernels and no vendor torch, so claiming a
+  // `cuda`-routed op would raise "backend not registered" instead of reaching
+  // the cpu_fallback arm below. Register only the ops the platform's conf routes
+  // to a FlagGems backend, from the generated per-platform list; every other op
+  // stays unregistered and falls through to cpu_fallback. Boxing remains an
+  // explicit opt-in (-DFLAGOS_BUILD_BOXING=ON / FLAGOS_BUILD_BOXING=1).
+  #if defined(FLAGOS_BOXING_BUILD)
   #define FLAGOS_GEN_IMPLS
   #include "generated/register.inc"
   #undef FLAGOS_GEN_IMPLS
+  #elif defined(FLAGOS_FLAGGEMS_PYTHON)
+  #if defined(FLAGOS_ACCEL_CUDA)
+  #include "generated/register_flaggems_cuda.inc"
+  #elif defined(FLAGOS_ACCEL_METAX)
+  #include "generated/register_flaggems_metax.inc"
+  #elif defined(FLAGOS_ACCEL_DCU)
+  #include "generated/register_flaggems_dcu.inc"
+  #elif defined(FLAGOS_ACCEL_PPU)
+  #include "generated/register_flaggems_ppu.inc"
+  #elif defined(FLAGOS_ACCEL_TSINGMICRO)
+  #include "generated/register_flaggems_tsingmicro.inc"
+  #endif
+  // FLAGOS_BUILD_FLAGGEMS=OFF leaves the block empty: no accelerated route is
+  // compiled in, so every op is meant to reach cpu_fallback.
+  #endif
   #endif
 }
 

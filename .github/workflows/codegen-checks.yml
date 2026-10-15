@@ -74,6 +74,12 @@ jobs:
           set -euo pipefail
           echo "=== gen_vendor_confs.py --check ==="
           python3 scripts/codegen/gen_vendor_confs.py --check
+          # Regenerates the per-platform FlagGems register lists that a
+          # FlagGems-primary CUDA-ABI build (FLAGOS_BUILD_BOXING=OFF) compiles
+          # instead of the full generated/register.inc. Reads only committed
+          # sources, so --check needs no vendor toolkit.
+          echo "=== codegen_boxing_flaggems_register.py --check ==="
+          python3 scripts/codegen/codegen_boxing_flaggems_register.py --check
           echo "=== codegen_gcu_flaggems.py --check ==="
           python3 scripts/codegen/codegen_gcu_flaggems.py --check
           echo "=== codegen_musa_flaggems.py --check ==="
@@ -92,6 +98,12 @@ jobs:
           # the CPU torch installed above.
           echo "=== codegen_kunlunxin.py --check ==="
           python3 scripts/codegen/codegen_kunlunxin.py --check
+          # Same contract as kunlunxin: reads the shared generated/register.inc
+          # plus the committed iluvatar_flaggems_register.inc and its own op
+          # table, writes iluvatar_kernels.cc / iluvatar_register.inc. No vendor
+          # toolkit and no built torch_fl -- only the CPU torchgen above.
+          echo "=== codegen_iluvatar.py --check ==="
+          python3 scripts/codegen/codegen_iluvatar.py --check
 
       - name: Run conf/registration consistency tests
         run: |
