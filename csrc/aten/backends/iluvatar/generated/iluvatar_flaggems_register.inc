@@ -4,23 +4,31 @@
 //
 // m.impl() lines for the FlagGems Python ops Iluvatar routes to the `flaggems`
 // backend. Included by register.cc inside TORCH_LIBRARY_IMPL(aten, PrivateUse1)
-// when USE_ILUVATAR and FLAGOS_FLAGGEMS_PYTHON are set. Iluvatar has no vendor
-// kernel library, so this file is the *entire* set of ops the platform claims on
-// PrivateUse1: an op routed to `flaggems` that is not claimed here reaches the
-// dispatcher with an empty kFlagGems slot and raises "backend not registered"
-// instead of falling back to cpu_fallback.
+// when USE_ILUVATAR and FLAGOS_FLAGGEMS_PYTHON are set. Iluvatar also has a
+// vendor-native iluvatar_register.inc (from codegen_iluvatar.py), so this is one
+// half of the platform's PrivateUse1 surface, disjoint from the native half and
+// generated to stay that way: an op routed to `flaggems` that is not claimed
+// here reaches the dispatcher with an empty kFlagGems slot and raises "backend
+// not registered" instead of falling back to cpu_fallback.
 //
 // Excluded ops come from NATIVE_TRITON_GAPS['iluvatar'] in
-// scripts/codegen/gen_vendor_confs.py. That set is the 37 defect ops a BI-V150
-// overload survey measured failing (tests/manual/flaggems_overload_survey.py,
-// 2026-10-14, 639-op cohort: STRICT 379 / BASIC_ONLY 66 / FAILED 58 / UNTESTED
-// 136); the other 21 FAILED were survey synthesis limits and stay here. The list
-// below is the shared FlagGems ceiling (640) minus those 37, so 603. Re-measure
-// and move entries in or out of that set only from BI-V150 results, never by
-// assumption -- and note the DCU precedent: most of the 37 are the device-name
-// mismatch that _ALIGNED_VENDORS (torch_fl/accelerator/cuda/_cuda_compat.py)
-// remediates, so an A/B survey after adding iluvatar there is the way most of
-// them come back.
+// scripts/codegen/gen_vendor_confs.py: the 37 defect ops a BI-V150 overload
+// survey measured failing (tests/manual/flaggems_overload_survey.py), now routed
+// off the FlagGems path to the native slot or to cpu_fallback. The list below is
+// the shared FlagGems ceiling (640) minus those 37, so 603.
+//
+// Measured twice against this same conf, 2026-10-14 over the 639-op cohort
+// (STRICT 379 / BASIC_ONLY 66 / FAILED 58 / UNTESTED 136) and 2026-10-15 over the
+// narrower 603-op cohort (STRICT 380 / BASIC_ONLY 66 / FAILED 21 / UNTESTED 136).
+// The FAILED drop is the cohort change, not a fix: the 37 gap ops carried most of
+// the old FAILED count, and no op newly failed between the runs. The remaining 21
+// are survey synthesis limits and stay here.
+//
+// Re-measure and move entries in or out of that set only from BI-V150 results,
+// never by assumption -- and note the DCU precedent: most of the 37 are the
+// device-name mismatch that _ALIGNED_VENDORS
+// (torch_fl/accelerator/cuda/_cuda_compat.py) remediates, so an A/B survey after
+// adding iluvatar there is the way most of them come back.
 // Excluded ops, left to cpu_fallback:
 //   - _batch_norm_no_update
 //   - _native_batch_norm_legit.no_stats
@@ -60,7 +68,7 @@
 //   - unique_consecutive
 //   - upsample_bicubic2d
 //
-// Total: 603 ops registered here, 0 further FlagGems ops already claimed by iluvatar_register.inc.
+// Total: 603 ops registered here, 1 further FlagGems ops already claimed by iluvatar_register.inc.
 
   m.impl("_adaptive_avg_pool2d", WrapperPrivAdaptiveAvgPool2d);
   m.impl("_adaptive_avg_pool2d_backward", WrapperPrivAdaptiveAvgPool2dBackward);

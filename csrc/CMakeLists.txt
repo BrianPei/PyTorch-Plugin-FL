@@ -149,12 +149,14 @@ endif()
 # MetaX has no native kernel directory: it is a CUDA-boxing vendor, so the
 # hand-written mxcc kernels were removed (git history retains them). Kunlunxin
 # is native: aten/backends/kunlunxin/ wraps the XPU op library (xdnn_pytorch)
-# directly instead of boxing onto CUDA.
+# directly instead of boxing onto CUDA. Iluvatar is native too:
+# aten/backends/iluvatar/ wraps corex's CUDA-named C ABI (ixdnn/ixblas)
+# directly, with FlagGems still owning the ops it covers.
 if(NOT FLAGOS_BUILD_VENDOR)
-  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/(ascend|gcu|kunlunxin|musa|mps)/.*")
+  list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/(ascend|gcu|iluvatar|kunlunxin|musa|mps)/.*")
   message(STATUS "FLAGOS_BUILD_VENDOR=OFF: no vendor native kernels")
 else()
-  foreach(_vendor_dir ascend gcu kunlunxin musa mps)
+  foreach(_vendor_dir ascend gcu iluvatar kunlunxin musa mps)
     if(NOT FLAGOS_ACCELERATOR STREQUAL _vendor_dir)
       list(FILTER SOURCE_FILES EXCLUDE REGEX ".*/aten/backends/${_vendor_dir}/.*")
     endif()
@@ -362,6 +364,15 @@ if(FLAGOS_BUILD_FLAGGEMS)
   target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_FLAGGEMS_PYTHON)
 endif()
 
+# Tells register.cc that the generated CUDA boxing kernels are part of this
+# wheel, so the CUDA-ABI platforms (cuda, metax, dcu, ppu, tsingmicro) may claim
+# every generated op on PrivateUse1. With boxing OFF -- the default for all of
+# them -- those wheels carry no CUDA kernels, so register.cc claims only the ops
+# their conf routes to a FlagGems backend and leaves the rest to cpu_fallback.
+if(FLAGOS_BUILD_BOXING)
+  target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_BOXING_BUILD=1)
+endif()
+
 # Compile the FlagGems C++ dispatch kernels (flaggems_cpp_kernels.cc, guarded by
 # this macro) only when linking against liboperators.so is requested.
 if(FLAGOS_BUILD_FLAGGEMS_CPP)
@@ -419,6 +430,16 @@ endif()
 if(NOT FLAGOS_PLATFORM_USE_MACRO STREQUAL "")
   target_compile_definitions(${LIBRARY_NAME} PRIVATE ${FLAGOS_PLATFORM_USE_MACRO}=1)
 endif()
+
+# FLAGOS_ACCEL_<UPPER> for every accelerator. The USE_* macro above is empty for
+# cuda and ppu and names a vendor SDK (USE_MACA, USE_DCU) at that, so it cannot
+# tell register.cc which FlagGems-primary register list a boxing-OFF CUDA-ABI
+# build should compile: cuda, metax, dcu, ppu and tsingmicro all share the one
+# `#else` arm there. This define is that discriminator and nothing else.
+string(TOUPPER "${FLAGOS_ACCELERATOR}" _FLAGOS_ACCEL_UPPER)
+target_compile_definitions(${LIBRARY_NAME} PRIVATE
+    FLAGOS_ACCEL_${_FLAGOS_ACCEL_UPPER}=1
+)
 
 if(FLAGOS_ACCELERATOR STREQUAL "metax")
   # maca's torch headers are a hard fork gated on USE_MACA (e.g. C10_WARP_SIZE,
@@ -506,9 +527,19 @@ elseif(FLAGOS_ACCELERATOR STREQUAL "iluvatar")
   # Iluvatar's vendor torch is a real CUDA build over the corex CUDA-shaped
   # runtime, so the standard allocator and the c10/cuda stream path apply and the
   # CUDA runtime shim rides ${CUDA_RUNTIME_LIB} inside ${_torch_fl_link_libs}.
-  # Unlike kunlunxin there is no FLAGOS_BUILD_VENDOR arm: ops route to FlagGems,
-  # not to a vendor kernel library, so nothing vendor-specific is linked here.
   target_link_libraries(${LIBRARY_NAME} PRIVATE ${_torch_fl_link_libs})
+  if(FLAGOS_BUILD_VENDOR)
+    # FLAGOS_ILUVATAR_KERNEL gates the m.impl subset in register.cc, mirroring
+    # FLAGOS_KUNLUNXIN_KERNEL: without the vendor kernels there is nothing to
+    # register on PrivateUse1. FlagGems stays primary -- its .inc is still
+    # included -- and the native .inc claims only the ops gen_vendor_confs.py
+    # routes to "iluvatar" (the FlagGems set minus its coverage).
+    target_compile_definitions(${LIBRARY_NAME} PRIVATE FLAGOS_ILUVATAR_KERNEL=1)
+    target_include_directories(${LIBRARY_NAME} PRIVATE
+        ${FLAGOS_ILUVATAR_VENDOR_INCLUDE_DIR})
+    target_link_libraries(${LIBRARY_NAME} PRIVATE
+        ${FLAGOS_ILUVATAR_CUDNN_LIB} ${FLAGOS_ILUVATAR_CUBLAS_LIB})
+  endif()
 elseif(FLAGOS_ACCELERATOR STREQUAL "musa")
   target_link_libraries(${LIBRARY_NAME} PRIVATE ${_torch_fl_link_libs})
   if(FLAGOS_BUILD_VENDOR)
