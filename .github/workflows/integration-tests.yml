@@ -51,6 +51,16 @@ on:
         description: Config basename under .github/configs (without .yml)
         required: true
         type: string
+      checkout_repository:
+        description: Repository containing the source commit to test
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        description: Immutable source commit to test
+        required: false
+        type: string
+        default: ''
   # Kept from the per-platform pipelines: a single re-run of one platform, on
   # its own hardware, without dispatching the whole matrix in ci.yml. The
   # timeout and the test manifest come from the config either way.
@@ -66,6 +76,8 @@ jobs:
     uses: ./.github/workflows/load-platform-config.yml
     with:
       platform: ${{ inputs.platform }}
+      checkout_repository: ${{ inputs.checkout_repository }}
+      checkout_ref: ${{ inputs.checkout_ref }}
 
   integration-tests:
     name: Build and test (${{ needs.configuration.outputs.display_name }})
@@ -82,6 +94,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       # Discard host leftovers before restoring the managed pip download cache.
       - name: Reset pip cache dir

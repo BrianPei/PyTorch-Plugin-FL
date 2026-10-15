@@ -26,6 +26,20 @@ ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20260816-dcu-ci
 runner_labels:
   - hg-8g-cicd-pytorch
 
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
+paths_watch:
+  - torch_fl/accelerator/dcu/
+  - torch_fl/configs/backends_dcu.conf
+  - csrc/aten/backends/dcu/
+  - csrc/runtime/accelerator/dcu/
+  - csrc/runtime/accelerator/cuda/
+  - csrc/runtime/allocator/backends/dcu_memory.h
+  - .github/scripts/hooks/set_env_dcu.sh
+  - .github/scripts/set_env_dcu.sh
+  - scripts/vendor/bundle_dcu_libtorch.sh
+  - scripts/vendor/check_dcu_core_abi.py
+
 # Bind-mount the host hyhal driver into the container. libhydmi.so (Hygon DMI
 # device management) and its sibling driver libs live here on the host, not in
 # the flagos image; set_env_dcu.sh probes /usr/local/hyhal/lib and prepends it
@@ -37,6 +51,14 @@ container_volumes:
   - /usr/local/hyhal:/usr/local/hyhal:ro
 
 integration_environment: {}
+
+# The per-file unit suite executes CI checkout resolution with the real jq.
+# Reuse it when present; provision it before tests in older DCU images.
+integration_test_dependencies:
+  - >-
+    command -v jq >/dev/null 2>&1 ||
+    (apt-get update &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq)
 
 # DCU is non-NVIDIA: expose the /dev/kfd and /dev/dri device nodes through
 # --privileged (mirrors the MetaX layout) instead of --gpus all.

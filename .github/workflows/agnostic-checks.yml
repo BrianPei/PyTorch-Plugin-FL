@@ -52,6 +52,15 @@ name: Platform-agnostic checks
 
 on:
   workflow_call:
+    inputs:
+      checkout_repository:
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
 
 jobs:
@@ -65,6 +74,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -90,6 +103,10 @@ jobs:
           python -m pytest \
             tests/unit/test_backend_autoload_contract.py \
             tests/unit/test_ci_pip_cache.py \
+            tests/unit/test_ci_platform_routing.py \
+            tests/unit/test_ci_matrix.py \
+            tests/unit/test_ci_commands.py \
+            tests/unit/test_ci_resolution.py \
             tests/unit/test_ci_version_pins.py \
             tests/unit/test_cupti_runtime_cbid_table.py \
             tests/unit/test_dcu_core_decoupling.py \

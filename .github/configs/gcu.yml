@@ -27,6 +27,19 @@ ci_image: harbor.baai.ac.cn/flagtree/flagtree-enflame3.6-py312-torch2.10.0-ubunt
 runner_labels:
   - sy-8g-cicd-pytorch
 
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
+paths_watch:
+  - torch_fl/accelerator/gcu/
+  - torch_fl/configs/backends_gcu.conf
+  - csrc/aten/backends/gcu/
+  - csrc/runtime/accelerator/gcu/
+  - csrc/runtime/allocator/backends/gcu_memory.h
+  - .github/scripts/hooks/set_env_gcu.sh
+  - .github/scripts/set_env_gcu.sh
+  - scripts/codegen/codegen_gcu.py
+  - scripts/codegen/codegen_gcu_flaggems.py
+
 container_volumes: []
 
 integration_environment: {}

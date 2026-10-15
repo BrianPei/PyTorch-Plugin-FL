@@ -37,6 +37,19 @@ ci_image: harbor.baai.ac.cn/flagtree/flagtree-ascend3.5-910c-py311-cann9.0.0-ubu
 runner_labels:
   - flagcicd-910c
 
+# Platform-specific code selects this hardware lane on PRs.
+# Shared or unrecognized code selects every lane conservatively.
+paths_watch:
+  - torch_fl/accelerator/ascend/
+  - torch_fl/configs/backends_ascend.conf
+  - csrc/aten/backends/ascend/
+  - csrc/runtime/accelerator/ascend/
+  - csrc/runtime/allocator/backends/ascend_memory.h
+  - .github/scripts/hooks/set_env_ascend.sh
+  - .github/scripts/set_env_ascend.sh
+  - scripts/vendor/patch_triton_ascend.py
+  - scripts/codegen/codegen_ascend.py
+
 container_volumes: []
 
 integration_environment: {}

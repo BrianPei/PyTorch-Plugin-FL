@@ -45,6 +45,16 @@ on:
         description: Config basename under .github/configs (without .yml)
         required: true
         type: string
+      checkout_repository:
+        description: Repository containing the source commit to inspect
+        required: false
+        type: string
+        default: ''
+      checkout_ref:
+        description: Immutable source commit to inspect
+        required: false
+        type: string
+        default: ''
     outputs:
       display_name:
         description: Human-readable platform name, used in job and step names
@@ -118,6 +128,10 @@ jobs:
       integration_test_dependencies: ${{ steps.config.outputs.integration_test_dependencies }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
 
       - name: Load and validate platform configuration
         id: config
