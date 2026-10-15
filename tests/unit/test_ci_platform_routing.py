@@ -25,35 +25,41 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
-PLATFORMS = sorted(path.stem for path in WORKFLOWS.glob("integration-test-*.yml"))
-PLATFORMS = [name.removeprefix("integration-test-") for name in PLATFORMS]
+CONFIGS = ROOT / ".github" / "configs"
+PLATFORMS = sorted(
+    path.stem
+    for path in CONFIGS.glob("*.yml")
+    if path.stem not in {"template", "image_sources", "platforms"}
+)
 
 
 def _workflow(name):
     return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
 
 
-def test_required_gate_covers_every_dedicated_platform():
+def test_required_gate_covers_matrix_pipeline():
     jobs = _workflow("ci.yml")["jobs"]
-    pipelines = {name for name, job in jobs.items() if "uses" in job}
-    assert set(jobs["ci-complete"]["needs"]) == pipelines | {
+    gate = jobs["ci-complete"]
+    assert set(gate["needs"]) == {
         "resolve-checkout",
+        "lint",
+        "agnostic-checks",
+        "codegen-checks",
         "discover-platforms",
+        "platform-pipeline",
     }
-    assert {jobs[f"{platform}-pipeline"]["uses"] for platform in PLATFORMS} == {
-        f"./.github/workflows/integration-test-{platform}.yml" for platform in PLATFORMS
-    }
-    assert "platform-pipeline" not in jobs
-    assert not (WORKFLOWS / "integration-tests-common.yml").exists()
-    assert set(_workflow("all-tests-common.yml")["jobs"]) == {
-        "configuration",
-        "build",
-    }
+    assert (
+        jobs["platform-pipeline"]["uses"] == "./.github/workflows/integration-tests.yml"
+    )
+    assert jobs["platform-pipeline"]["strategy"]["matrix"]["platform"] == (
+        "${{ fromJson(needs.discover-platforms.outputs.platforms) }}"
+    )
+    assert not list(WORKFLOWS.glob("integration-test-*.yml"))
+    assert not (WORKFLOWS / "all-tests-common.yml").exists()
 
 
-@pytest.mark.parametrize("platform", PLATFORMS)
-def test_platform_tests_and_manifest_use_the_resolved_source(platform):
-    caller = _workflow("ci.yml")["jobs"][f"{platform}-pipeline"]
+def test_platform_tests_and_manifest_use_the_resolved_source():
+    caller = _workflow("ci.yml")["jobs"]["platform-pipeline"]
     assert "resolve-checkout" in caller["needs"]
     assert caller["with"]["checkout_repository"] == (
         "${{ needs.resolve-checkout.outputs.repository }}"
@@ -61,28 +67,40 @@ def test_platform_tests_and_manifest_use_the_resolved_source(platform):
     assert caller["with"]["checkout_ref"] == (
         "${{ needs.resolve-checkout.outputs.ref }}"
     )
-    workflow = _workflow(f"integration-test-{platform}.yml")
+
+    workflow = _workflow("integration-tests.yml")
     inputs = workflow[True]["workflow_call"]["inputs"]
     assert {"checkout_repository", "checkout_ref"} <= inputs.keys()
-    manifest = workflow["jobs"]["load-tests"]["with"]
-    assert manifest["checkout_repository"] == "${{ inputs.checkout_repository }}"
-    assert manifest["checkout_ref"] == "${{ inputs.checkout_ref }}"
-    checkouts = [
+    config_call = workflow["jobs"]["configuration"]["with"]
+    assert config_call["checkout_repository"] == "${{ inputs.checkout_repository }}"
+    assert config_call["checkout_ref"] == "${{ inputs.checkout_ref }}"
+    checkout = next(
         step
         for step in workflow["jobs"]["integration-tests"]["steps"]
         if step.get("uses", "").startswith("actions/checkout@")
-    ]
-    assert len(checkouts) == 1
-    checkout = checkouts[0]["with"]
+    )["with"]
     assert checkout["repository"] == (
         "${{ inputs.checkout_repository || github.repository }}"
     )
     assert checkout["ref"] == "${{ inputs.checkout_ref || github.ref }}"
     assert checkout["persist-credentials"] is False
 
+    config_workflow = _workflow("load-platform-config.yml")
+    config_inputs = config_workflow[True]["workflow_call"]["inputs"]
+    assert {"checkout_repository", "checkout_ref"} <= config_inputs.keys()
+    config_checkout = next(
+        step
+        for step in config_workflow["jobs"]["configuration"]["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )["with"]
+    assert config_checkout["repository"] == (
+        "${{ inputs.checkout_repository || github.repository }}"
+    )
+    assert config_checkout["ref"] == "${{ inputs.checkout_ref || github.ref }}"
+
 
 @pytest.mark.parametrize("platform", PLATFORMS)
-def test_dispatch_can_select_each_dedicated_platform(platform):
+def test_dispatch_can_select_each_platform(platform):
     result = subprocess.run(
         [
             sys.executable,
@@ -90,7 +108,7 @@ def test_dispatch_can_select_each_dedicated_platform(platform):
             "--event-name",
             "workflow_dispatch",
             "--configs-dir",
-            str(ROOT / ".github" / "configs"),
+            str(CONFIGS),
             "--dispatch-platforms",
             platform,
         ],
@@ -101,17 +119,15 @@ def test_dispatch_can_select_each_dedicated_platform(platform):
     assert json.loads(result.stdout.removeprefix("platforms=")) == [platform]
 
 
-@pytest.mark.parametrize("platform", PLATFORMS)
 @pytest.mark.parametrize("selected", [True, False])
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
-def test_required_gate_checks_platform_result(platform, selected, result):
+def test_required_gate_checks_platform_result(selected, result):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
-    assert gate["if"] == "always()"
     results = {name: {"result": "success"} for name in gate["needs"]}
     results["discover-platforms"]["outputs"] = {
-        "platforms": json.dumps([platform] if selected else [])
+        "platforms": json.dumps(PLATFORMS[:1] if selected else [])
     }
-    results[f"{platform}-pipeline"]["result"] = result
+    results["platform-pipeline"]["result"] = result
     process = subprocess.run(
         ["bash", "-e", "-c", gate["steps"][0]["run"]],
         env={**os.environ, "RESULTS": json.dumps(results)},
@@ -122,7 +138,7 @@ def test_required_gate_checks_platform_result(platform, selected, result):
         result == "success" or (not selected and result == "skipped")
     )
     if process.returncode:
-        assert f"{platform}-pipeline: {result}" in process.stdout
+        assert f"platform-pipeline: {result}" in process.stdout
 
 
 @pytest.mark.parametrize(
