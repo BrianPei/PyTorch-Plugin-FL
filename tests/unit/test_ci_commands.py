@@ -241,9 +241,7 @@ def test_failed_dispatch_does_not_claim_success():
     github.fail_dispatch = True
     with pytest.raises(API.GitHubError):
         SLASH.handle(COMMENT_EVENT, PLATFORMS, github)
-    assert not any(
-        call[1].startswith("issues/42/labels") for call in github.writes()
-    )
+    assert not any(call[1].startswith("issues/42/labels") for call in github.writes())
     assert not any(
         call[1].endswith(("/comments", "/reactions")) for call in github.writes()
     )
