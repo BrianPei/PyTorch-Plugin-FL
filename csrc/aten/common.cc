@@ -123,6 +123,8 @@ bool ParseBackendName(const std::string& raw, Backend* out) {
     *out = Backend::kMusa;
   } else if (val == "tileops") {
     *out = Backend::kTileOps;
+  } else if (val == "mps") {
+    *out = Backend::kMps;
   } else if (val == "flaggems_cpp" || val == "flagos") {
     *out = Backend::kFlagGemsCpp;
   } else if (val == "flaggems" || val == "flaggems_python" ||
@@ -149,6 +151,7 @@ const char* BackendName(Backend b) {
     case Backend::kKunlunxin:    return "kunlunxin";
     case Backend::kIluvatar:     return "iluvatar";
     case Backend::kTileOps:      return "tileops";
+    case Backend::kMps:          return "mps";
     case Backend::kNone:         return "none";
     default:                     return "unknown";
   }
@@ -489,7 +492,54 @@ bool HasBackendForOp(const std::string& op_name) {
 }
 
 bool FlagGemsRejectsDtype(at::ScalarType dtype) {
-#if defined(USE_ASCEND)
+#if defined(FLAGOS_ACCEL_METAX)
+  // Triton's MetaX backend cannot lower complex pointers. FlagGems kernels
+  // therefore fail before launch for every complex-valued op measured here
+  // (the first FlagQuantum failure is flip):
+  //
+  //   KeyError: 'complex64'
+  //
+  // MetaX is CUDA ABI compatible, and boxing the same calls into the vendor
+  // torch kernels preserves both the complex dtype and device residency.
+  return dtype == at::kComplexFloat || dtype == at::kComplexDouble;
+#elif defined(FLAGOS_ACCEL_DCU)
+  // Same gap, same shape as MetaX, and measured separately in the shipped DCU
+  // environment (torch 2.10.0+dtk2604, HIP 6.3.26113, DTK, `backends_dcu.conf`,
+  // boxing ON). The released wheel predates this change, so it reproduces the
+  // two defects below; the fix was measured on a libtorch_fl.so rebuilt from
+  // this source and copied into that same environment.
+  //
+  // Without this arm a complex factory never failed loudly: it silently lost
+  // its dtype before FlagGems was reached, because the wheel's dtype converter
+  // had no complex arm (issue #540). The visible result was
+  //
+  //   torch.zeros(4, dtype=torch.complex64, device="flagos:0").dtype
+  //   # -> torch.float32
+  //
+  // FlagGems' HCU Triton backend has no complex pointer type either, so simply
+  // preserving the dtype in the converter is not enough -- the call must leave
+  // the FlagGems route. With this escape the complex call reroutes to the DCU
+  // CUDA boxing kernels, measured on the rebuilt build (FLAGOS_LOG=dispatch,
+  // and values checked against the CPU reference):
+  //
+  //   zeros  -> cuda   complex64/128 preserved (was silent float32)
+  //   ones   -> cuda   complex64/128 preserved (was silent float32)
+  //   randn  -> cuda   complex64/128 preserved (was silent float32)
+  //   abs    -> cuda   correct real result    (was KeyError: 'complex64')
+  //   fill_  -> cuda   correct               (composed through the same escape)
+  //
+  // the last one because OnesKernelCuda and ZeroKernelCuda are compositional
+  // (`at::empty(...).fill_(1)` / `.zero_()`), and the inner in-place call is
+  // itself diverted -- `fill_` and `zero_` are registered on the FlagGems
+  // route and the DCU codegen has a kCuda kernel for each. The escape is
+  // dtype-scoped, so the same op over float is untouched: measured
+  // `ones(float32)` still logs `ones -> flagos_python`.
+  //
+  // ResolveFn returns the FlagGems route unchanged when no vendor kernel
+  // exists, so an op outside this intersection keeps its own outcome (loud
+  // failure) rather than changing route.
+  return dtype == at::kComplexFloat || dtype == at::kComplexDouble;
+#elif defined(USE_ASCEND)
   // See the declaration in common.h for the measurement. float64 is the only
   // dtype FlagGems' Ascend route could not serve across the pointwise family;
   // fp32/fp16/bf16/int64/bool all compile and run.

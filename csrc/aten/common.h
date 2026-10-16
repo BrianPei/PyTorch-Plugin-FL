@@ -32,6 +32,7 @@ enum class Backend {
   kKunlunxin,
   kIluvatar,
   kTileOps,
+  kMps,            // Apple Metal / MPSGraph (conf key: mps)
   // No accelerated implementation on this platform. The op is deliberately not
   // registered on PrivateUse1, so it reaches the boxed cpu_fallback instead of
   // arriving here with an empty kernel slot. Recorded explicitly (rather than
@@ -115,6 +116,20 @@ bool LogEnabled(const char* item);
 // and the comparison ops -- which lower through a different path -- do work.
 // The same calls reach aclnn kernels through the vendor slot and return the
 // right float64 answer, so the fallback is a gain rather than a loss.
+//
+// On MetaX the broad gap is complex64/complex128. Its Triton backend has no
+// complex pointer type, so a FlagGems kernel instantiated from either dtype
+// fails during compilation with ``KeyError: 'complex64'`` (or complex128).
+// The CUDA-ABI boxing kernels reach MetaX torch's native complex support, so
+// the vendor slot is both available and the correct fallback for these calls.
+// DCU is the same gap and the same fallback, measured separately on its own
+// shipped wheel (see common.cc); the difference is that DCU reached it through
+// a silent dtype loss first, because its dtype converter had no complex arm
+// either (issue #540), so the symptom there was a complex request quietly
+// returning float32 rather than a KeyError. The converter is fixed alongside
+// the escape, and the diversion then carries the factory family (`zeros`,
+// `ones`, `randn`, `abs`) to the vendor kernels with dtype and device intact.
+// See the measurement in common.cc.
 //
 // On GCU the same shape of gap exists for int64, and it fails in two
 // different places on the way to the same non-existent kernel. A kernel whose

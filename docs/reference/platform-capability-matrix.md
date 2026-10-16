@@ -22,10 +22,10 @@ when a platform gains or loses one.
 | `ascend` | vendor-native (ACLNN) | `ascend` | `ascend` | `ascend` | 2037 | yes |
 | `gcu` | vendor-native (topsaten) | `gcu` | `gcu` | `gcu` | 2037 | yes |
 | `musa` | vendor-native (mudnn) | `musa` | `musa` | `musa` (stream/event only) | 2037 | yes |
-| `tsingmicro` | CUDA-ABI (FlagGems-primary; boxing opt-in) | `tsingmicro` | — (FlagGems / boxing opt-in) | — (no dir) | 53 | no |
+| `tsingmicro` | CUDA-ABI (FlagGems-primary; boxing opt-in) | `tsingmicro` | — (FlagGems / boxing opt-in) | — (no dir) | 67 | no |
 | `bpu` | no per-op kernels (graph compile) | `bpu` | — | `bpu` | 0 | no |
 | `iluvatar` | FlagGems-primary + native vendor kernels (no boxing) | `cuda` | `iluvatar` (FlagGems register + ixdnn/ixblas native kernels) | — (no dir) | 2037 | no |
-| `mps` | vendor-native (Metal / MPSGraph) | `mps` | — (MPSGraph-first, none yet) | `mps` (stream/event only) | 0 | no |
+| `mps` | vendor-native (Metal / MPSGraph) | `mps` | `mps` (MPSGraph-first: `abs`, the elementwise `add`/`sub`/`mul` forms, `sum`/`mean`) | `mps` (stream/event only) | 2037 | no |
 
 Column notes:
 
@@ -61,7 +61,7 @@ toolkit) and adds `dcu/` for its DTK-core ABI shim; `ppu` reuses `cuda` too.
   the ops FlagGems does not cover.
 - **conf routes** is the number of `op = backend` entries in
   `torch_fl/configs/backends_<platform>.conf`. 2037 is the full-coverage set; 0
-  and 53 are the by-design BPU/MPS and hand-written TsingMicro files.
+  and 67 are the by-design BPU/MPS and hand-written TsingMicro files.
 - **CI** is whether `.github/configs/<platform>.yml` and a platform pipeline job
   exist.
 
@@ -80,19 +80,22 @@ build opts into boxing.
 - **BPU** has no aten backend and an empty conf: its unit of execution is a whole
   compiled graph, so eager ops reach `cpu_fallback` and acceleration comes from
   the `torch.compile(backend="bpu")` path.
-- **MPS** (Apple Silicon) has the device runtime floor only: allocate, copy,
-  synchronize and real Metal streams/events work, but no operator is claimed
-  yet, so every aten op reaches `cpu_fallback` and its conf is empty. The
-  operator layer is MPSGraph-first with a hand-written MSL fallback (see
-  `docs/superpowers/specs/2026-10-14-apple-mps-native-backend-design.md`), and
-  it is native — no dispatch re-tag onto `DispatchKey::MPS`/`CUDA` and no CUDA
-  boxing kernels (`FLAGOS_BUILD_BOXING` is pinned off). It has a
+- **MPS** (Apple Silicon) has the device runtime floor — allocate, copy,
+  synchronize and real Metal streams/events work — plus the first two stages of
+  the MPSGraph operator layer: 9 ops run on the PrivateUse1 `mps` slot — `abs`,
+  the elementwise `add`/`sub`/`mul` tensor and scalar forms (with aten's `alpha`),
+  and the `sum`/`mean` reductions (with aten's axis and keepdim handling) — and
+  everything else reaches `cpu_fallback`. The operator layer is MPSGraph-first
+  with a hand-written MSL fallback (see
+  `docs/superpowers/specs/2026-10-14-apple-mps-native-backend-design.md`). It is
+  native — no dispatch re-tag onto `DispatchKey::MPS`/`CUDA` and no CUDA boxing
+  kernels (`FLAGOS_BUILD_BOXING` is pinned off). It has a
   `torch_fl/accelerator/mps/` directory holding only `mps_stream.py` (the
   stream/event wrappers `torch.flagos.Stream` dispatches to), so the Python
   compat column reads "stream/event only". There is no CI job: the pipeline is
   container-based on self-hosted runners, and a macOS arm64 runner has not been
   wired in.
-- **TsingMicro** has a sparse hand-written conf (53 routes) and no CI job; its
+- **TsingMicro** has a sparse hand-written conf (67 routes) and no CI job; its
   Python compat module does not exist.
 - **MUSA** has no Python compat module and no compile-only CI job. It does have a
   `torch_fl/accelerator/musa/` directory, but it holds only `musa_stream.py` (the
@@ -142,5 +145,5 @@ Authoritative membership of the three per-platform trees. Machine-checked
 against `os.listdir` by `tests/unit/test_platform_capability_matrix.py`.
 
 - `csrc/runtime/accelerator/`: ascend, bpu, cuda, dcu, gcu, kunlunxin, metax, mps, musa, tsingmicro
-- `csrc/aten/backends/`: ascend, flagos, gcu, iluvatar, kunlunxin, musa, soft_lowp
+- `csrc/aten/backends/`: ascend, flagos, gcu, iluvatar, kunlunxin, mps, musa, soft_lowp
 - `torch_fl/accelerator/`: ascend, bpu, cuda, dcu, gcu, metax, mps, musa, ppu

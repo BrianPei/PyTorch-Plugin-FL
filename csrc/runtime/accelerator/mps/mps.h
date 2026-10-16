@@ -36,6 +36,41 @@ extern "C" {
 // Reports zeros when no MPS-capable device is present.
 FLAGOS_EXPORT void FlagosMPSDeviceMemoryInfo(size_t* freeBytes, size_t* totalBytes);
 
+// The MTLBuffer whose `contents` cover `ptr`, and the byte offset of `ptr`
+// inside it, for the operator layer (csrc/aten/backends/mps/).
+//
+// This is what lets a kernel describe an aten tensor to MPSGraph without a
+// copy: the tensor's `data_ptr` is the buffer's contents plus its storage
+// offset, and the caching allocator subdivides one MTLBuffer into many blocks,
+// so the pointer is usually interior. Returns NULL -- and leaves *byteOffset
+// untouched -- when `ptr` is not inside a Metal allocation this runtime owns
+// (a host tensor, a foreign pointer, a stale one). The returned buffer is a
+// borrowed reference: it lives until the owning allocation is freed, and the
+// caller must not release it.
+FLAGOS_EXPORT void* FlagosMPSBufferForPointer(const void* ptr, size_t* byteOffset);
+
+// The MTLCommandQueue a flagos stream runs on, as an opaque pointer. A null
+// `stream` resolves to the default stream, matching the rest of this runtime.
+// Returns NULL when no Metal device is present. Borrowed like the buffer above.
+FLAGOS_EXPORT void* FlagosMPSCommandQueue(Stream_t stream);
+
+// Records a completion sentinel for a producer that schedules work on the
+// stream's queue without handing back the MTLCommandBuffer it used, which is
+// what MPSGraph's asynchronous runs do.
+//
+// The stream layer tracks "the newest committed buffer" and answers
+// StreamQuery/StreamSynchronize/DeviceSynchronize from it, on the guarantee that
+// Metal executes a queue in order. A producer that keeps its own command buffer
+// private would leave that pointer naming older work, so a query could report a
+// stream idle while the producer's kernel is still writing the buffer a tensor
+// points at -- and the caching allocator reads StreamQuery to decide whether a
+// freed block may be reused. This commits one empty command buffer to the
+// stream's queue and records it as the newest, which puts the producer's work
+// behind the sentinel without the sentinel waiting for anything itself.
+//
+// A no-op when `stream` has no queue (no Metal device), like the accessor above.
+FLAGOS_EXPORT void FlagosMPSStreamSentinel(Stream_t stream);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

@@ -195,6 +195,137 @@ a platform's own full-coverage configuration is a third cohort again — its
 denominator is that file's active route set, not 546 — and the entry states which
 one it measured.
 
+### TsingMicro TX8110: the metadata-only view family moves from the dead CUDA boxing slot to the `tsingmicro` vendor slot (2026-10-16, TX8110 / Kuiper)
+
+**One sentence.** 14 pure-metadata view ops
+(`alias`, `detach`, `permute`, `select.int`, `slice.Tensor`, `squeeze`,
+`squeeze.dim`, `t`, `transpose.int`, `unbind.int`, `unsqueeze`, `_conj`,
+`_neg_view`, `_unsafe_view`) move from the conf's `flaggems` default to the
+`tsingmicro` vendor slot on the TX8110 build, because the FlagGems route they
+used to take has no kernel behind it and degraded to a CUDA boxing kernel this
+wheel cannot run.
+
+**Route change.** `backends_tsingmicro.conf` gains 14 explicit
+`= tsingmicro` entries (previously unlisted, i.e. the default `flaggems`).
+`csrc/aten/strided_ops.cc` registers the corresponding
+`at::native::flagos::*` metadata helpers under `Backend::kTsingMicro`; they were
+previously registered for `Backend::kAscend` only. The list is now emitted once
+per accelerator from a single macro, so an op added for one platform cannot be
+forgotten for the other. `permute` is included here: it is in the macro's list
+but was initially left out of the conf, so it kept the `flaggems` default and
+still hit the empty-slot degrade on a boxing-ON build.
+
+**Reachability depends on the build (boxing ON vs OFF).**
+`REGISTER_IMPL_TO_DISPATCHER` (`csrc/aten/dispatcher.h`) only fills this
+dispatcher's backend slot — it is **not** an `m.impl()` claim on PrivateUse1. The
+op must additionally be claimed by the build's generated registration for the
+dispatcher to be consulted at all, and the two platforms get there differently:
+
+* **Ascend** ships a private registration set,
+  `csrc/aten/backends/ascend/generated/ascend_register.inc` (374 `m.impl`, incl.
+  `select.int` and `permute`), included at `csrc/aten/register.cc:568` under
+  `#elif defined(USE_ASCEND)`. That claim is what makes the `kAscend` slots
+  reachable.
+* **TsingMicro has no equivalent `.inc`.** It takes `register.cc`'s `#else` arm.
+  With `FLAGOS_BUILD_BOXING=ON` the generated `register.inc` claims these ops and
+  the `kTsingMicro` slots are reachable. With boxing OFF — the in-tree default in
+  `cmake/flagos_platforms.json`, and what `_kernel_switches("tsingmicro")`
+  returns — only `register_flaggems_tsingmicro.inc` is included, which lists the
+  ops the conf routes to `flaggems`; the `tsingmicro`-routed view ops are not in
+  it. On that build they are unclaimed, reach `cpu_fallback`, and the handlers
+  are dead code.
+
+The TX8110 build the fleet measured is **boxing ON** (non-default): the live
+`[flagos dispatch] select.int -> tsingmicro` line below can only be printed when
+`select.int` is claimed on PrivateUse1, and `select.int` is absent from
+`register_flaggems_tsingmicro.inc`. So this change is necessary and correct for
+that build, and inert (not harmful) on a boxing-OFF wheel. The target build must
+be chosen deliberately.
+
+**Why the FlagGems route was wrong here.** Two separate gaps had to line up.
+First, the generated FlagGems kernel set has no entry for any view op — they are
+stride arithmetic with no device kernel to write — so
+`Dispatcher::GetFn(Backend::kFlagGems)` took its documented empty-slot arm and
+degraded to `cuda_fn_` (`csrc/aten/dispatcher.h`). Second, the TX8110 dev build
+has `FLAGOS_BUILD_BOXING:BOOL=ON` in its `CMakeCache.txt` and
+`KERNELS = ("boxing", "flaggems", "vendor")` in `torch_fl/_build_config.py`, so
+that CUDA boxing slot is populated with kernels that need a vendor CUDA runtime
+the wheel does not link. The call therefore died in `torch/cuda/__init__.py`
+with
+
+```
+NotImplementedError: Could not run 'aten::as_strided' with arguments from the
+'CUDA' backend
+```
+
+raised from `torch_fl/__init__.py:1411`. Every `attn_mask[:, 0] = 1`
+(`tests/test_modeling_common.py:6533`), every `select` and every slicing index
+reduces to `aten::as_strided`, so this was one defect with a wide blast radius:
+160 of the 161 failures in the pre-fix transformers-5.19.0 `bert` run carried it
+(320 raises across 161 failing tests).
+
+**Measured.** On the TX8110 host, with no conf override and the rebuilt
+`libtorch_fl.so`:
+
+```
+[flagos dispatch] select.int -> tsingmicro
+PROBE: slice-assign OK
+PROBE: slice OK flagos:0
+PROBE: select OK
+PROBE: squeeze OK
+PROBE: unbind OK
+PROBE: squeeze.dim ok (3, 1)
+PROBE: squeeze ok (3,)
+```
+
+**What is NOT claimed.** The fix was not observed through a completed `bert`
+suite. The post-fix `bert` run does clear the `as_strided`/CUDA defect — but it
+then stalls inside the TX8110 runtime on the second test, before a tally is
+produced:
+
+```
+[flagos dispatch] ... ids_tensor (tests/test_modeling_common.py:6526)
+    txr::Event::awaitCompletion (libhpgr.so)
+    itxMemcpy (libhpgr.so)
+    tx::runtime::txMemcpy (libhpgr.so)
+    Memcpy (libflagos.so)
+    at::native::flagos::_to_copy (libtorch_fl.so)
+```
+
+with the device reporting
+
+```
+accel 0000:cf:00.0: ctx is busy, does not support multi process job
+accel 0000:cf:00.0: failed to acquire kcq job channel: 0
+accel 0000:cf:00.0: ctx[python] failed to submit no.0 compute job: -110
+```
+
+so the hang is a device-runtime limitation, not this route. The TX8110 board
+went into a hardware-exception state while this change was being measured and
+could not be brought back in software (the `accel` driver is built into the
+kernel, dmesg reports `failed to startup rv cores: -110` and every card reports
+`CachingDeviceAllocator: invalid device index`), so the end-to-end per-test tally
+for this change is **not revalidated** and no raw `bert` case results are added.
+The 13-op matrix above and the `bert: 161 failed → 145 failed` transition from an
+earlier override-based run of the same routing are the evidence.
+
+**The other platforms are not revalidated** by this change. The `kAscend`
+registration list is textually unchanged (it is now emitted through a macro, and
+the pre-macro and post-macro expansions are identical).
+
+**Generator coupling.** `scripts/codegen/codegen_boxing_flaggems_register.py`
+classifies a conf value as a FlagGems route unless it is `cuda`, `none` or
+empty, and emits an `m.impl()` for every such op — a slot the runtime cannot
+fill for these view ops. It gains a `VENDOR_ROUTES` table so the per-platform
+vendor key is excluded: without it the generator treats `permute`,
+`slice.Tensor`, `transpose.int`, `unsqueeze`, `alias`, `_conj` and
+`_unsafe_view` as FlagGems routes (the six of the fourteen that happen to have a
+kFlagGems dispatcher in `flaggems_python_kernels.cc`) and grows
+`register_flaggems_tsingmicro.inc` from 51 to 57 `m.impl` — claims on the very
+slot that has no kernel, which is the defect this change is fixing. The table is
+therefore load-bearing, not cosmetic. The five `register_flaggems_*.inc` files
+are unchanged by the change as committed and `--check` passes.
+
 ### Iluvatar (BI-V150 / Tianshu): a new FlagGems-primary platform, measured on BI-V150 to 603 FlagGems routes (2026-10-14; cohort re-measured 2026-10-15)
 
 **One sentence.** `FLAGOS_ACCELERATOR=iluvatar` is an accelerator whose generated
@@ -808,6 +939,350 @@ snapshot assertion above catches a conf edited without its generator.
   whose `mm` rows are neither revalidated nor affected: `FlagGemsRejectsOpDtype`'s
   new rows live in the `USE_ASCEND` branch alone.
 
+### Ascend: `ones`/`ones_like`/`max`/`max.dim` leave the FlagGems route for their aclnn kernels (2026-10-16, Ascend 910C)
+
+**One sentence.** The `_ascend` backend overrides of two FlagGems kernels are
+wrong on Ascend -- `flag_gems/runtime/backend/_ascend/ops/ones.py:56` sizes its
+grid with `triton.cdiv(N, next_power_of_2(ceil(sqrt(volume))))`, which is
+`cdiv(0, 0)` and a `ZeroDivisionError` for any zero-element shape, where the
+generic `flag_gems/ops/ones.py` hardcodes 1024 and does not have the bug, and
+`flag_gems/runtime/backend/_ascend/ops/max.py:100` builds its block mask with
+Python `and` on non-scalar tensors, the deprecated form that does not produce the
+intended elementwise mask -- so `ones`, `ones_like`, `max` and `max.dim` move off
+the FlagGems route to the aclnn kernels that already serve them and are already
+registered.
+
+**The failure, on the route being left.** Both defects reproduce standalone on
+this host's `torch-fl-ascend-py311` interpreter with the FlagGems route in
+force, which is what makes this an entry about the kernel rather than about the
+model:
+
+```text
+>>> torch.ones((2, 0), device="flagos")
+ZeroDivisionError: integer division or modulo by zero
+  File ".../flag_gems/runtime/backend/_ascend/ops/ones.py", line 56, in ones
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+>>> torch.ones(0, device="flagos")
+ZeroDivisionError: integer division or modulo by zero
+```
+
+`torch.ones((4,), device="flagos")`, `torch.zeros((2, 0), device="flagos")` and
+`torch.full((2, 0), 1.0, device="flagos")` all succeed, so the division is the
+whole of the `ones` failure and `zeros`/`full` are unaffected. The Ascend override
+is what runs -- `flag_gems.ones` resolves to `_ascend/ops/ones.py:46`, not to the
+generic `ops/ones.py:44`. `ones_like` on a `(2, 0)` tensor fails in the same
+kernel.
+
+The `max` defect shows as a value rather than a raise: the BERT cohort's
+`test_forward_with_logits_to_keep` compares `all_logits[:, -1:, :]` against
+`last_token_logits` at `rtol=atol=1e-5` and reports
+
+```text
+AssertionError: Tensor-likes are not close!
+Mismatched elements: 558 / 1287 (43.4%)
+Greatest absolute difference: 6.57886266708374e-05 at index (10, 0, 66) (up to 1e-05 allowed)
+Greatest relative difference: 0.047847408801317215 at index (3, 0, 95) (up to 1e-05 allowed)
+```
+
+and the same run's captured warnings name the source:
+
+```text
+.../flag_gems/runtime/backend/_ascend/ops/max.py:100: UserWarning: Logical operators 'and' and 'or' are deprecated for non-scalar tensors; please use '&' or '|' instead
+    mask = m_offset[:, None] < M and n_offset[None, :] < N
+```
+
+The Ascend `max` kernel is genuinely reached: replacing `flag_gems.max` with a
+raising stub makes `torch.max(t)` raise that stub's exception.
+
+**Why the route is the torch_fl lever and not the bug.** Both defects are in the
+FlagGems `_ascend` backend override, upstream of torch_fl, and are reported here
+as such. What torch_fl owns is the route: `backends_ascend.conf` sent all four
+ops to `flaggems`, and each line carried the `# ascend` annotation, which is the
+generator's statement that an aclnn kernel exists behind the winning route.
+`codegen_ascend.py` emits them -- `ones`/`ones_like` from `T_ONES`
+(`at::empty(size, options)` then `fill_(1)`, "Same shape as T_ZEROS") and
+`max`/`max.dim` from `reduce_minmax_all` -- and `ascend_register.inc` registers
+`WrapperOnes`, `WrapperOnesLike`, `WrapperMax` and `WrapperMaxDim`. The kernels
+were reachable through `FLAGOS_FORCE_BACKEND=ascend` all along; the conf simply
+preferred FlagGems. No new kernel is added, so nothing here needs the
+codegen-limitation approval path.
+
+**Route delta.** Ascend `flaggems` 224 -> **220**, `ascend` 151 -> **155**, `none`
+1662 unchanged; 2037 entries, still 375 accelerated (18.4%). Conf SHA-256
+`346a42d765744ea7e52554b29ad165761dc80fb215d239e4ae6ed075754f34e0` (at `2f94db1`)
+-> `eeee6b6eb15a48a918dd2429a448b6e6eb9e71bfdb2d348a7c68350526245138`. The diff is
+six lines: the two header counts and four route lines, `max = flaggems  # ascend`,
+`max.dim = flaggems  # ascend`, `ones = flaggems  # ascend` and
+`ones_like = flaggems  # ascend` becoming `max = ascend`, `max.dim = ascend`,
+`ones = ascend` and `ones_like = ascend`. The conf stays generated output -- the
+four ops enter `NATIVE_TRITON_GAPS["ascend"]` in
+`scripts/codegen/gen_vendor_confs.py` -- and is byte-identical across two runs of
+that script, whose `--check` reports `all vendor confs up to date` (exit 0) with
+every other platform's conf byte-identical. The move is the deliberate update
+`tests/unit/test_conf_registration_consistency.py::test_conf_route_counts_are_stable`
+asks for, its `ascend` snapshot going `{"flaggems": 224, "none": 1662,
+"ascend": 151}` -> `{"flaggems": 220, "none": 1662, "ascend": 155}`, and
+`tests/integration/flaggems/flaggems_caps.py:EXPECTED_FLAGGEMS_ROUTES["ascend"]`
+224 -> 220 in the same change.
+
+**Regression gate.** `tests/unit/test_conf_registration_consistency.py` is the
+gate for the conf/generator pair -- 52 passed, and it fails if the conf is edited
+without its generator or the snapshot is not updated deliberately. The behavioural
+half is the standalone repro above (red on the FlagGems route, green on the aclnn
+route) plus the BERT cohort's `test_forward_with_logits_to_keep`, whose 43.4%
+mismatch is the `max` route's.
+
+**Measured dispatch (post-change conf, on hardware).** Because the change is
+conf-only, this PR's `backends_ascend.conf` was installed over the base build's
+own copy on `bm-jn-zs-zone1-910C-64G-10-108` (container `lvyufeng-torch-fl`,
+interpreter `torch-fl-ascend-py311`, `TORCH_DEVICE_BACKEND_AUTOLOAD=0
+FLAGOS_LOG=dispatch`) and the probe re-run. No rebuild is needed: the four aclnn
+kernels are already in the base `libtorch_fl.so`
+(md5 `340a58b136805a36c8a4c51a2592003d`, 5,267,088 B) and the swap is what the
+change ships. Conf SHA-256
+`eeee6b6eb15a48a918dd2429a448b6e6eb9e71bfdb2d348a7c68350526245138`:
+
+```text
+[flagos dispatch] ones -> ascend
+[flagos dispatch] ones -> ascend
+[flagos dispatch] ones_like -> ascend
+[flagos dispatch] max -> ascend
+[flagos dispatch] max.dim -> ascend
+
+ones((2,0))            -> (2, 0)
+ones(0)                -> (0,)
+ones_like(empty(2,0))  -> (2, 0)
+max(a)                 -> 5.0
+max(a, dim=1).values   -> [2.0, 5.0]
+```
+
+All four leave the FlagGems route, and all five probes that failed there return
+correct values. `fill_.Scalar -> flagos_python` and `arange -> flagos_python` in
+the same log are construction ops the probe itself issues; their routes are
+unchanged. The host conf was then restored to its original SHA-256
+`3e6979f6cc9756d3b2cc6c002cb9925056967ee06f62aab17098bb41a3862f0d`.
+
+**Evidence gaps.** Recorded rather than papered over:
+
+- The two `ZeroDivisionError` sites and the `max` mismatch were reproduced with
+  the FlagGems route forced, and the fix is confirmed per-op at the dispatch and
+  value level above. The **BERT cohort has not been re-run** against this conf,
+  so the end-to-end green is inferred, not observed.
+- The other 220 Ascend `flaggems` routes are **not revalidated** by this change.
+  It moves four ops and measures those four; no sweep of the remainder was run,
+  and the other `NATIVE_TRITON_GAPS["ascend"]` entries are untouched.
+- The `flagos` device is the only accelerator this entry measures. It claims
+  nothing about `dcu`, `musa`, `gcu`, `kunlunxin`, `metax`, `ppu` or `tsingmicro`,
+  whose `ones`/`max` rows are neither revalidated nor affected: the two defects
+  live in the FlagGems `_ascend` backend override, which only this platform
+  loads.
+### Ascend: `bitwise_{and,or,xor}.Scalar` gain a PrivateUse1 claim (2026-10-16, Ascend 910C)
+
+**One sentence.** The three scalar bitwise overloads had no `m.impl` on
+PrivateUse1 on Ascend, so ATen's `CompositeExplicitAutograd` implementation
+served them, decomposed to the `bitwise_and.Tensor` overload that *is* registered
+and routed to FlagGems, and handed FlagGems' tensor kernel a Python scalar it
+rejects -- which failed nine of the BERT cohort's generation tests on Ascend that
+pass on MetaX with byte-identical FlagGems; claiming the overloads on PrivateUse1
+stops the decomposition, so the scalar reaches `flag_gems.bitwise_and_scalar`
+(a correct scalar kernel) instead of `flag_gems.bitwise_and_tensor` (which
+rejects it).
+
+**Which kernel actually runs, and why.** On the default Ascend build the conf
+value is the route: `backends_ascend.conf` carries
+`bitwise_and.Scalar = flaggems  # ascend`, so the dispatcher resolves
+`GetFn(kFlagGems)` -> `flag_gems.bitwise_and_scalar`
+(`csrc/aten/generated/flaggems_python_kernels.cc:4337`,
+`REGISTER_IMPL_TO_DISPATCHER(BitwiseAndScalarFn, ..., Backend::kFlagGems, ...)`),
+**not** the aclnn kernel this change also generates. The `# ascend` annotation is
+inert unless `FLAGOS_FORCE_BACKEND=vendor` is set -- `csrc/aten/common.cc`
+documents the parser as "Runtime routing ignores the annotation" -- and the
+runtime dtype escape does not cover it either, because Ascend's
+`FlagGemsRejectsDtype` is bool-tolerant and the op/dtype pair is not in
+`FlagGemsRejectsOpDtype`. The aclnn `m.impl` in `ascend_register.inc` fills the
+`kAscend` slot as the vendor candidate; the *payload of the fix* is the
+PrivateUse1 claim itself, which is what moves the call off `.Tensor`. Measured
+below.
+
+**The failure, on the route being left.** The minimal repro on this host's
+`torch-fl-ascend-py311` interpreter, with the FlagGems route in force. This is the
+verbatim pre-change traceback, captured on the base build (see **Measured
+dispatch** below for the build identity):
+
+```text
+>>> t = torch.tensor([True, False], dtype=torch.bool, device="flagos")
+>>> t & False
+Traceback (most recent call last):
+  File "...", line 28, in <module>
+    print("t & False =", (t & False))
+  File ".../torch-fl-src/torch_fl/__init__.py", line 1411, in __torch_function__
+    return func(*args, **kwargs)
+  File ".../flag_gems/ops/bitwise_and.py", line 32, in bitwise_and_tensor
+    return bitwise_and_func(A, B)
+  File ".../flag_gems/utils/pointwise_dynamic.py", line 1607, in prepare_args
+    if not check_tensor_attributes(args, (schema._is_tensor)):
+  File ".../flag_gems/utils/shape_utils.py", line 326, in check_tensor_attributes
+    raise ValueError(
+ValueError: Element at index 1 is incorrect. Expected True, but got False.
+```
+
+The same expression on MetaX returns the correct result. The dispatch frames are
+what separate the two, and they show the platforms take *different ops* to the
+FlagGems route rather than the same op behaving differently -- measured on each
+build:
+
+```text
+pre-change  Ascend : PrivateUse1 bitwise_and.Scalar = False, bitwise_and.Tensor = True
+                     __torch_function__ -> torch_fl/__init__.py:1411
+                     -> flag_gems/ops/bitwise_and.py:32 -> pointwise_dynamic.py:1607
+post-change Ascend : PrivateUse1 bitwise_and.Scalar = True , bitwise_and.Tensor = True
+                     bitwise_and.Scalar -> flagos_python, returns on flagos:0
+MetaX               : PrivateUse1 bitwise_and.Scalar = True , bitwise_and.Tensor = True
+                     returns on flagos:0
+```
+
+The mechanism in full: `aten::bitwise_and.Scalar` is `CompositeExplicitAutograd:
+bitwise_and` (`aten/src/ATen/native/native_functions.yaml`). With no
+`bitwise_and.Scalar` entry in the Ascend arm, the PrivateUse1 key holds nothing
+for it, ATen's composite runs, decomposes it to `bitwise_and.Tensor` -- which
+`ascend_register.inc` *does* claim and route to FlagGems -- and passes the Python
+bool through. FlagGems' un-schema'd `bitwise_and_func` derives `is_tensor =
+[True, True]` and rejects a non-tensor second argument. MetaX claims the Scalar
+overload, so it runs the scalar kernel (`is_tensor = [True, False]`) and never
+reaches the tensor one. Two controls confirm the diagnosis is not a FlagGems
+divergence: calling `flag_gems.bitwise_and_tensor(x, False)` directly raises the
+identical ValueError on MetaX as well, so FlagGems is byte-identical and the
+tensor path's scalar tolerance is simply latent; and on the *pre-change* build
+re-routing the Ascend conf's `bitwise_and.Scalar` to `flaggems` changed nothing,
+because with no PrivateUse1 claim ATen's composite ran regardless of the conf
+value. That second control is a statement about the **pre-change** build only:
+once the claim exists the conf value becomes the route (`csrc/aten/common.cc`:
+the value is the route, the `# ascend` annotation is read only under
+`FLAGOS_FORCE_BACKEND=vendor`), which is why this change leaves the value at
+`flaggems` and still moves the call off `.Tensor`.
+
+**Why this is the torch_fl-side defect.** The asymmetry is a *registration* gap,
+not a FlagGems one: `csrc/aten/register.cc`'s Ascend arm includes only
+`backends/ascend/generated/ascend_register.inc`, whose coverage set is exactly
+what `scripts/codegen/codegen_ascend.py` generates, and that generator had no
+registry entry for the three scalar overloads -- so their `m.impl` lines, which
+the shared `generated/register.inc` carries for every vendor, never reached the
+Ascend build. The enumeration, comparing the shared file's `FLAGOS_GEN_IMPLS`
+region against `ascend_register.inc`, finds the bitwise scalar overloads among
+the missing; most other missing `.Scalar` entries are `.out` variants, internal
+`_foreach_*` lists, or ops with no aclnn scalar kernel, and are deliberately left
+alone. The three bitwise ones are the reachable set.
+
+**The fix.** Three registry entries in `codegen_ascend.py`, each mapping to the
+existing `binary_scalar` category. Their *effect on the default build* is the
+`m.impl` line they add to `ascend_register.inc`: claiming the op on PrivateUse1
+is what stops ATen serving it compositely and decomposing to `.Tensor`. The
+`binary_scalar` body they also generate -- `aclnn<Name>(self, scalar, out)`
+through `AclScalarWrapper`, the same shape `mul.Scalar`/`div.Scalar` use -- is
+the vendor candidate behind the `# ascend` annotation, reachable under
+`FLAGOS_FORCE_BACKEND=vendor`, not the default route. The generator validates each
+derived symbol against `libopapi.so` before emitting (`if acl not in syms:
+skip`), so a name that did not exist would drop the op rather than emit a broken
+kernel; `aclnnBitwiseAndScalar` exists, and its header states BOOL support
+explicitly (both-BOOL lowers to `LogicalAnd`, the dtype the failing path uses).
+
+**Route delta.** Ascend `flaggems` 220 -> **223**, `ascend` 155 unchanged, `none`
+1662 -> **1659**; 2037 entries, 378 accelerated (18.6%), up from 375. Conf
+SHA-256 `eeee6b6eb15a48a918dd2429a448b6e6eb9e71bfdb2d348a7c68350526245138` (at
+`d2f0675`, the sibling `ones`/`max` routing change) ->
+`d02e4b54f801092299e091f49795ea83b3f70aae525cbad8a06d092c31122231`.
+The three rows move from `none` to `flaggems  # ascend`: the `# ascend`
+annotation is the generator recording that an aclnn kernel now backs the FlagGems
+route, and it is what `FLAGOS_FORCE_BACKEND=vendor` reaches. Both the .inc and the
+conf are generated output, byte-identical across two runs of their generators,
+with `gen_vendor_confs.py --check` reporting `all vendor confs up to date` (exit
+0). The snapshot update
+`tests/unit/test_conf_registration_consistency.py::test_conf_route_counts_are_stable`
+asks for is `{"flaggems": 223, "none": 1659, "ascend": 155}`, and
+`tests/integration/flaggems/flaggems_caps.py::EXPECTED_FLAGGEMS_ROUTES["ascend"]`
+220 -> 223 in the same change.
+
+**Regression gate.** `tests/unit/test_conf_registration_consistency.py` (52
+passed) is the conf/generator gate, and it fails if the conf is edited without
+its generator or the snapshot is not updated deliberately. The behavioural half
+is the repro above plus the paired dispatch arms below: red on the pre-change
+build (no `m.impl`, decomposes to `.Tensor`, raises), and green on the post-change
+build (`x & False` is claimed on PrivateUse1 and is served by
+`flag_gems.bitwise_and_scalar`).
+
+**Measured dispatch (post-change build, default conf value).** Both arms below
+were run on the same host (`bm-jn-zs-zone1-910C-64G-10-108`, container
+`lvyufeng-torch-fl`, interpreter `torch-fl-ascend-py311`) with
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` and `FLAGOS_LOG=dispatch`.
+
+Post-change build -- the branch's own generated artifacts, rebuilt in-container
+(`libtorch_fl.so` md5 `e678ca8b617429f34e3f20dda4c39112`, 5,273,128 B, mtime
+2026-10-16 01:47:41, loaded from the build tree root per `/proc/self/maps`):
+
+```text
+[flagos dispatch] bitwise_and.Scalar -> flagos_python
+[flagos dispatch] bitwise_or.Scalar -> flagos_python
+[flagos dispatch] bitwise_xor.Scalar -> flagos_python
+aten::bitwise_and.Scalar True
+aten::bitwise_or.Scalar True
+aten::bitwise_xor.Scalar True
+t & False = tensor([False, False], device='flagos:0')
+t | False = tensor([ True, False], device='flagos:0')
+t ^ True  = tensor([False,  True], device='flagos:0')
+```
+
+Pre-change build at the same base (`6573910`,
+`libtorch_fl.so` md5 `340a58b136805a36c8a4c51a2592003d`, 5,267,088 B, mtime
+2026-10-15 15:16:04), which is the control that makes the dispatch line
+meaningful:
+
+```text
+[flagos dispatch] bitwise_and.Tensor -> flagos_python     <-- decomposed to .Tensor
+aten::bitwise_and.Scalar False
+aten::bitwise_or.Scalar False
+aten::bitwise_xor.Scalar False
+t & False -> ValueError: Element at index 1 is incorrect. Expected True, but got False.
+             torch_fl/__init__.py:1411 -> flag_gems/ops/bitwise_and.py:32
+             -> flag_gems/utils/pointwise_dynamic.py:1607
+```
+
+`-> flagos_python` is the expected and correct outcome, and the pre-change arm is
+what proves the claim is doing the work: the only dispatch difference between the
+two builds is `.Scalar` (present, `True`) instead of `.Tensor`. The conf value
+routes the op to FlagGems; the PrivateUse1 claim stops the `.Tensor` decomposition;
+`flag_gems.bitwise_and_scalar` is a genuine scalar kernel and returns the CPU
+reference values above. The aclnn kernel is off the default route by design, per
+**Which kernel actually runs** above.
+
+**Evidence gaps.** Recorded rather than papered over:
+
+- The three aclnn kernel bodies are **not exercised on the default build** -- the
+  dispatch arm above shows the FlagGems route wins for all three. Their symbols
+  (`aclnnBitwise{And,Or,Xor}Scalar`) and BOOL lowering were verified against
+  `libopapi.so` and the CANN headers, and the bodies are generated by the same
+  `binary_scalar` template `mul.Scalar`/`div.Scalar` use, but no run selects them,
+  so the `# ascend` annotation path (`FLAGOS_FORCE_BACKEND=vendor`) is
+  **not revalidated on hardware**.
+- Only `bitwise_and.Scalar` is exercised by the BERT cohort. `bitwise_or.Scalar`
+  and `bitwise_xor.Scalar` are the same mechanism and the same code path; they are
+  measured above only through the direct three-op probe
+  (`t | False`, `t ^ True`), not through a failing cohort test, and their aclnn
+  symbols and BOOL lowering are confirmed present but never run.
+- **The BERT cohort has not been re-run on this build.** The nine tests this
+  entry names as the defect's symptom were identified by the FAILURES-section
+  discriminator of a *pre-fix* Ascend run (nine `ValueError: Element at index 1`
+  one-liners) and cross-checked against MetaX/Moore `report.jsonl` per-test
+  outcomes, where they pass -- but the post-change count is not measured here, so
+  the group's disappearance is **inferred from the mechanism, not observed**. What
+  is observed is the mechanism end to end: pre-change dispatch to `.Tensor` with
+  the ValueError, post-change dispatch to `.Scalar` returning the CPU reference.
+- The `flaggems` route count moving 220 -> 223 does not revalidate the other 223
+  Ascend `flaggems` routes.
+- The `flagos` device is the only accelerator this entry measures. It claims
+  nothing about `dcu`, `musa`, `gcu`, `kunlunxin`, `metax`, `ppu` or `tsingmicro`;
+  MetaX is named only as the passing comparison that located the asymmetry, and
+  its conf is neither revalidated nor affected.
+
 ### MUSA: float64 `mm` served by repairing the FlagGems tune space the device refuses (2026-09-27, MTT S5000)
 
 **One sentence.** The mthreads `mm` tune space declares two 64x64x64 tiles at
@@ -1232,6 +1707,42 @@ revalidated either; every number above is one MTT S5000 in the environment below
 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` and `MTHREADS_VISIBLE_DEVICES=0`. The FlagGems
 measurements are against the installed wheel, not against a checkout, so #6713
 being merged would change the addmm row here.
+
+### DCU: a complex factory request silently became float32 and `abs` failed; the converter now names complex and the runtime dtype escape carries the call to the vendor kernels (2026-10-16, Hygon BW1000)
+
+**One sentence.** On the shipped DCU wheel a factory that asked for `complex64`/`complex128` reached FlagGems with `dtype=None` -- the dtype converter had no complex arm -- so `torch.zeros(4, dtype=torch.complex64)` returned a `float32` tensor, and once the dtype was preserved the FlagGems HCU Triton backend (which has no complex pointer type) failed the same call with `KeyError: 'complex64'`; naming complex in the converter and adding DCU to the runtime dtype escape reroutes the complex call to the CUDA boxing kernels, which serve it.
+
+**Two defects met on the same call, and only one of them was in the issue's title.** The converter at `csrc/aten/backends/flagos/python_op_caller.cc` (`OptionalDtypeToPython`) returned Python `None` for any dtype it did not name, and a factory reads `None` as `torch.get_default_dtype()`. So the visible symptom was not an error:
+
+```text
+$ python -c 'import torch_fl, torch; \
+    print(torch.zeros(4, dtype=torch.complex64, device="flagos:0").dtype)'
+torch.float32
+```
+
+`zeros`, `ones` and `randn` all lost their dtype this way (the issue named only `zeros`). The second defect is the one the MetaX arm of `FlagGemsRejectsDtype` already records (`csrc/aten/common.cc`, PR #539, which carries its measurement as a code comment rather than a section of this report): FlagGems' Triton backend cannot lower a complex pointer, so preserving the dtype alone turns the silent `float32` into `KeyError: 'complex64'`.
+
+**The build is a boxing build, which is what makes the escape possible.** DCU ships with `FLAGOS_BUILD_BOXING=1` (`.github/scripts/hooks/set_env_dcu.sh`), so the CUDA boxing kernels are compiled in and `ResolveFn`'s vendor slot (`Backend::kCuda`) is populated. That is the same escape MetaX uses; without it the escape would return the FlagGems route unchanged and only the loud failure would remain.
+
+**Measured routes and results, before and after.** Forcing each op onto the `cuda` route by hand (`FLAGOS_OP_<op>=cuda`), which is what the escape does, established the fix shape; the `libtorch_fl.so` rebuilt from this branch confirms the escape reaches it:
+
+| call | shipped wheel | with the fix |
+|---|---|---|
+| `zeros(complex64/128)` | `float32` (silent) | `complex64`/`complex128`, `[flagos dispatch] zeros -> cuda` |
+| `ones(complex64/128)` | `float32` (silent) | `complex64`/`complex128`, `[flagos dispatch] ones -> cuda` |
+| `randn(complex64/128)` | `float32` (silent) | `complex64`/`complex128` |
+| `abs(complex64)` | `KeyError: 'complex64'` | `[5.0, 1.4142, 2.0]` = CPU reference, `abs -> cuda` |
+| `fill_.Scalar(complex)` | `KeyError` | correct, `fill_.Scalar -> cuda` |
+| `ones(float32)` (control) | `flagos_python` | `flagos_python` (unchanged) |
+| `zeros(float64)`, `ones(int64)`, `arange(int32)`, `ones(no dtype)` (controls) | — | unchanged |
+
+`ones` and `fill_` divert because their vendor kernels are compositional (`at::empty(...).fill_(1)` / `.zero_()`), and the inner in-place call is itself diverted -- `fill_` and `zero_` are on the FlagGems route and the DCU codegen has a `kCuda` kernel for each. The escape is dtype-scoped: `ones(float32)` still logs `flagos_python`.
+
+**Files.** `csrc/aten/backends/flagos/python_op_caller.cc` (the converter: complex arms added, and the `default` now `TORCH_CHECK`s instead of returning `None`, so a future unnamed dtype fails loudly rather than becoming `float32`); `csrc/aten/common.cc` (`FlagGemsRejectsDtype` gains a `FLAGOS_ACCEL_DCU` arm); `csrc/aten/common.h` (the declaration's shared doc). No conf, register list or codegen output changes -- the route table is untouched, and only the dtype escape it feeds moves.
+
+**Not revalidated.** MetaX was not re-measured for this change: its arm of `FlagGemsRejectsDtype` is byte-identical and its converter behaviour is shared, and no MetaX host was used here. Every other platform (CUDA, Ascend, Enflame GCU, PPU, TsingMicro) shares the converter but takes the `#else` arm of the escape, so a complex factory there goes from silent `float32` to a loud failure inside FlagGems; that behaviour change is reasoned from the code, not measured. No vendor conf, registration `.inc` or generated kernel changes, so no route in any conf moves and no other row of this report is re-measured.
+
+**Environment.** torch `2.10.0+das.opt1.dtk2604.2606151054.g98b1a8` (`torch.version.hip` `6.3.26113`, `torch.version.cuda` `None`), conf `backends_dcu.conf`, one Hygon BW1000, Python 3.10.20, with `TORCH_DEVICE_BACKEND_AUTOLOAD=0`. The measurements were taken on a `libtorch_fl.so` built from this branch's source and copied into the installed env (the original saved aside), not on the released wheel — the DCU wheel shipped today predates the converter and escape change, so it reproduces the two defects above and is the "shipped wheel" column. The regression tests are `tests/integration/ops/test_dcu_complex.py`.
 
 ### Ascend: `gelu`, `gelu_backward` and `sum.dim_IntList` move to aclnn, after one kernel miscounts and two cannot be built (2026-09-27, Ascend 910)
 
@@ -3449,6 +3960,42 @@ pinned in `tests/unit/test_gcu_qwenimage_rope.py`, which checks both spellings
 against a pinned copy of that expansion, against the `diffusers` copy actually
 installed, and against the complex path at a documented tolerance.
 
+**The expansion itself is memoised, because the model asks for the same angle
+tensors 240 times a forward and only ever holds 62 of them.** `diffusers` builds
+the rotation operands once per forward — `QwenEmbedRope.forward` calls
+`_get_device_freqs` inside an `lru_cache`, and `_compute_video_freqs` is cached
+too — and all 60 blocks then reuse them, so one warm forward makes **240 consumer
+calls over 62 distinct angle tensors**: the same `(4096, 64)` and `(18, 64)` pair
+once per block from the cached operands, plus one fresh text-stream slice per
+block (`pos_freqs_device[max_vid_index : ...]`), which is why the count is 62 and
+not 2. Building a table is `cos` and `sin` over `[S, D // 2]` plus two `stack`s,
+so the cache removes **178 of those 240 builds (74.2 %)**. `_rotation_table`
+holds the angle tensor by reference and keys on its identity plus its
+`_version`, which is what makes a hit exactly equal to the tensor the code would
+have built: the reference cannot be recycled by the allocator, and an in-place
+write invalidates the entry. The list is bounded at four entries, which loses
+none of the 178 — at 62 operands over 4 slots the reuse is total (`240 - 62`
+hits, what an unbounded cache gets), because every operand is still one of the
+four most recent when it is asked for again.
+
+**Measured in one process, alternating arms**, on the same S60 and the same
+1024x1024 forward as the table above, warm-up 1 then 3 rounds per arm, the two
+arms differing in nothing but whether the expansion is rebuilt:
+
+| Arm | rounds (s) | mean |
+|---|---|---|
+| memoised (shipped) | 2.416 / 2.407 / 2.412 | **2.412 s** |
+| rebuilt every call | 2.476 / 2.466 / 2.470 | 2.471 s |
+
+**59 ms per forward, 2.4 %**, or 0.059 s off the 7.1 s/it step this report
+records below. Small next to the 0.937 s this registration already took off, and
+it is reported as what it is: the remainder of the expansion is the 62 builds no
+cache can avoid, and the rest of the rotation is the multiply, which the memo does
+not touch. Exactness is not measured at the model output here but argued from the
+construction — a hit returns the very tensors the code would have built — and
+asserted where it can be asserted directly, in
+`tests/unit/test_gcu_qwenimage_rope.py`.
+
 **Route delta: no `backends_gcu.conf` route moves, and none could.** This change
 is a `diffusers` registration, not a torch_fl route: it edits no conf file and no
 generated registration, so the shipped conf is unchanged at **1605 `none` / 254
@@ -3482,6 +4029,22 @@ warm-up 1 and 3 timed forwards, minimum reported. `f48a1459` is the tip these we
 measured at; the branch was rebased onto upstream `main` after them, which rewrote
 every SHA on it and brought in `#353` — MetaX's `scaled_dot_product_attention`
 composite and its docs, on neither file hashed above.
+
+The memo above was added afterwards and has its own provenance: `torch_fl` sha256
+`3df8dda91223ba5062f3b5c1fe3a69d2ca44fd2681c4b03aeecac24add265930` and
+`tests/unit/test_gcu_qwenimage_rope.py` sha256
+`2ac09ddd1a1355be8d401b33244a70b7538e1fff38d0a65bd937ba15eb35addc` on
+`perf/gcu-qwenimage-rope-table-memo`, off probe `/tmp/probe_rope_cache.py` (the
+62-operand count, identity-keyed with the operands held alive so an address cannot
+be recycled into a false repeat) and `/tmp/probe_rope_memo_ab.py` (the two-arm
+timing, alternating in one process); both on the `flagos` leg through
+`/tmp/run_probe_attn_args.sh`. The units came from `pytest
+tests/unit/test_gcu_qwenimage_rope.py` — 23 passed — at the hashes above. **Not
+revalidated:** `tests/manual/flaggems_overload_survey.py` was not re-run, because
+this change adds, removes, disables and reroutes no operator and does not move a
+route; the conf reconciliation stands as recorded, and the survey data carries
+over unchanged.
+
 
 ### MetaX: `scaled_dot_product_attention` routed to FlagGems (2026-09-18, MetaX C550)
 
@@ -7328,15 +7891,19 @@ compiler sees — and every accelerated route is required to be in it.
 | Ascend 910 | 248 | 126 | 1662 | 374 / 2036 (18%) |
 | Enflame GCU S60 | 88 | 64 | 1884 | 152 / 2036 (7%) |
 | MTT S5000 (MUSA) | 122 | 36 | 1878 | 158 / 2036 (7%) |
-| TsingMicro TX8 | 53 | 0 | 0 | 51 / 2036 (2.5%) |
+| TsingMicro TX8 | 53 | 14 | 0 | 51 / 2036 (2.5%) |
 
 The TsingMicro row is not comparable to the other three: its `flaggems` column is not
 a route count and its registered ratio is not coverage. TsingMicro has no
-vendor-native kernel set, so
+accelerator kernel set, so
 [`backends_tsingmicro.conf`](../../torch_fl/configs/backends_tsingmicro.conf) names 53
-ops as `flaggems`/`flagos_python` and leaves every other op on the default, which is
-also `flaggems`; nothing is routed to a vendor backend or to `none`. Reachability is
-decided by registration instead:
+ops as `flaggems`/`flagos_python`, routes 14 metadata-only view ops to the
+`tsingmicro` slot (2026-10-16 — see "TsingMicro TX8110: the metadata-only view
+family moves from the dead CUDA boxing slot to the `tsingmicro` vendor slot"
+above; those 14 are stride arithmetic served by `at::native::` metadata helpers,
+so the column is a route count but not a kernel count), and leaves every other op
+on the default, which is also `flaggems`; nothing is routed to `none`.
+Reachability is decided by registration instead:
 [`csrc/aten/generated/register_flaggems_tsingmicro.inc`](../../csrc/aten/generated/register_flaggems_tsingmicro.inc)
 claims the 51 of those ops that have a `kFlagGems` Python kernel, and every other op
 is unregistered and boxes to CPU. See "TsingMicro device name, FlagGems import order,
@@ -9866,6 +10433,9 @@ the recorded result is unchanged.
 
 | Date | Hardware | Cohort | Change | Evidence |
 |---|---|---|---|---|
+| 2026-10-16 | Hygon DCU bw1000 (1 device), torch `2.10.0+das.opt1.dtk2604.2606151054.g98b1a8` (`torch.version.hip` 6.3.26113), Python 3.10.20. **Other platforms not revalidated** | The DCU complex factory surface (`zeros`, `ones`, `randn`, `fill_`, `abs`) — a runtime dtype escape, no conf route moved | **Names complex in the FlagGems dtype converter and adds a DCU arm to the runtime dtype escape, so a complex factory keeps its dtype and reaches a kernel that can serve it.** Two defects met on one call. `OptionalDtypeToPython` (`csrc/aten/backends/flagos/python_op_caller.cc`) had no complex case and returned Python `None`, which a factory reads as `torch.get_default_dtype()`, so `torch.zeros(4, dtype=torch.complex64, device="flagos:0")` returned `float32` — a silent wrong answer, wider than the issue's title (`ones` and `randn` the same way). The converter now names `ComplexFloat`/`ComplexDouble` and its `default` raises `TORCH_CHECK` instead of returning `None`, so the next unnamed dtype fails loudly. That alone is not enough: FlagGems' HCU Triton backend has no complex pointer type, so the preserved dtype turns the silent `float32` into `KeyError: 'complex64'`. `FlagGemsRejectsDtype` (`csrc/aten/common.cc`) therefore gains a `FLAGOS_ACCEL_DCU` arm, the shape MetaX already carries (PR #539), and `ResolveFn` reroutes the complex call to the DCU CUDA boxing kernels. DCU ships `FLAGOS_BUILD_BOXING=1` (`.github/scripts/hooks/set_env_dcu.sh:316`), so the vendor slot is populated and the diversion has somewhere to land; `ones`/`fill_` divert because their vendor kernels are compositional (`at::empty(...).fill_(1)` / `.zero_()`) and the inner in-place call is itself diverted. The escape is dtype-scoped: `ones(float32)` still logs `flagos_python`. No conf, registration `.inc` or generated kernel changes. | Measured on a `libtorch_fl.so` built from this branch (copied into the env, original set aside) on one BW1000 with `TORCH_DEVICE_BACKEND_AUTOLOAD=0`: `zeros`/`ones`/`randn` at `complex64` and `complex128` all return the requested dtype (was silent `float32`); `abs(complex64)` returns `[5.0, 1.4142, 2.0]`, equal to the CPU reference, and `abs(complex128)` returns `float64` (was `KeyError: 'complex64'`); `fill_(1+2j)` correct; controls unmoved — `zeros(float32)`/`zeros(float64)`/`ones(int64)`/`arange(int32)`/`ones(no dtype)` keep their dtypes and `complex64` `add` is correct. `FLAGOS_LOG=dispatch` on the patched build: `zeros -> cuda`, `ones -> cuda`, `fill_.Scalar -> cuda`, `zero_ -> cuda`, `abs -> cuda` for complex, and `ones -> flagos_python` for float32. New `tests/integration/ops/test_dcu_complex.py` (SHA-256 of the committed file verified on the host before the run) **9 passed in 57.23s** on hardware; `test_factory_ops.py` + `test_dtype_coverage.py` **221 passed, 1 xfailed**. The shipped DCU wheel predates both halves and reproduces the two defects, which is the before column. **Evidence gaps:** the `_flagos_nccl` comm extension fails to build on this branch (`/opt/dtk/include/rccl/rccl.h` uses `hipStream_t` without including `hip/hip_runtime.h`), so only the core `libtorch_fl.so` was rebuilt and swapped in — a full wheel rebuild needs that build-env issue resolved and is **not** done here. The broad `tests/integration/ops` sweep (`-k "not mps and not gcu and not kunlunxin and not ascend and not musa"`, whole directory) was still running against this build when this row was written and its result is **not** part of the evidence here; the regression result claimed is the new file and the two targeted files above. Every other platform is **not revalidated**: they share the converter (a complex factory there moves from silent `float32` to a loud FlagGems failure) and take the `#else` arm of the escape, and that is reasoned from the code, not measured. |
+| 2026-10-16 | Ascend 910C (CANN 9.0.0) | Ascend: `ones`, `ones_like`, `max`, `max.dim` leave the FlagGems route for the aclnn kernels already registered behind them | **Routes four ops off two broken FlagGems `_ascend` backend overrides onto the vendor kernels that already serve them.** `flag_gems/runtime/backend/_ascend/ops/ones.py:56` sizes its grid as `cdiv(N, next_power_of_2(ceil(sqrt(volume))))`, which is `cdiv(0, 0)` for any zero-element shape, so `torch.ones((2, 0), device="flagos")` and `torch.ones(0, device="flagos")` raise `ZeroDivisionError` where the generic `ops/ones.py` (hardcoded 1024) does not; `_ascend/ops/max.py:100` builds its block mask with Python `and` on non-scalar tensors, the deprecated form that does not produce the intended elementwise mask, yielding a 43.4% mismatch in the BERT cohort's `test_forward_with_logits_to_keep`. Both defects are FlagGems'; the torch_fl lever is the route — the four ops enter `NATIVE_TRITON_GAPS["ascend"]` so `backends_ascend.conf` sends them to `ascend`, where `codegen_ascend.py` already emits and registers `WrapperOnes`/`WrapperOnesLike`/`WrapperMax`/`WrapperMaxDim`. No new kernel, so the codegen-limitation approval path is not triggered. Route delta `flaggems` 224 -> **220**, `ascend` 151 -> **155**, `none` 1662 unchanged; every other platform's conf is byte-identical. | Conf SHA-256 `346a42d765744ea7e52554b29ad165761dc80fb215d239e4ae6ed075754f34e0` -> `eeee6b6eb15a48a918dd2429a448b6e6eb9e71bfdb2d348a7c68350526245138`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` reports `all vendor confs up to date`. Both defects reproduce standalone on the host's `torch-fl-ascend-py311` interpreter with the FlagGems route in force (verbatim tracebacks in the platform narrative above); `ones_like` on `(2, 0)` fails in the same kernel while `zeros`/`full` succeed. `tests/unit/test_conf_registration_consistency.py` (52 passed) gates the conf/generator pair, its census snapshot moving to `{"flaggems": 220, "none": 1662, "ascend": 155}` alongside `flaggems_caps.EXPECTED_FLAGGEMS_ROUTES["ascend"]` 224 -> 220. **The post-change conf is measured on hardware, per-op**: installing this PR's conf (`eeee6b6e…`) over the base build's own copy logs `ones -> ascend` (×2), `ones_like -> ascend`, `max -> ascend`, `max.dim -> ascend`, and the five probes that failed on the FlagGems route -- `ones((2,0))`, `ones(0)`, `ones_like(empty(2,0))`, `max(a)`, `max(a,dim=1)` -- all return correct values (full block in the platform narrative; the host conf was restored to `3e6979f6…` afterwards). The **BERT cohort has not been re-run** against it, so the end-to-end green is inferred rather than observed. The other 220 Ascend `flaggems` routes are **not revalidated**, and no non-Ascend platform is revalidated or affected, the two defects living only in the `_ascend` override. |
+| 2026-10-16 | Ascend 910C (CANN 9.0.0) | Ascend: `bitwise_{and,or,xor}.Scalar` gain a native aclnn claim (generated `ascend_register.inc` + `ascend_kernels.cc`) | **Claims the three scalar bitwise overloads on PrivateUse1, replacing a composite decomposition that handed FlagGems' tensor kernel a Python scalar it rejects.** `aten::bitwise_and.Scalar` is `CompositeExplicitAutograd`, and `csrc/aten/register.cc`'s Ascend arm includes only `backends/ascend/generated/ascend_register.inc`, so with no entry there the PrivateUse1 key held nothing: ATen's composite ran, decomposed to the registered `bitwise_and.Tensor` overload (routed `flaggems`), and `flag_gems.bitwise_and_tensor` -- whose un-schema'd `prepare_args` derives `is_tensor = [True, True]` -- raised `ValueError: Element at index 1 is incorrect. Expected True, but got False.`, failing nine BERT generation tests. MetaX claims the Scalar overload and passes the same tree. Three `binary_scalar` registry entries in `scripts/codegen/codegen_ascend.py` emit the PrivateUse1 claim (the fix's payload) plus an `aclnnBitwise{And,Or,Xor}Scalar` body through the existing `AclScalarWrapper` shape (`mul.Scalar`/`div.Scalar` precedent); the generator validates each symbol against `libopapi.so` and its header states BOOL support (both-BOOL lowers to `LogicalAnd`, the dtype the failing path uses). **On the default build the conf value stays `flaggems`**, so the winning backend is `flag_gems.bitwise_and_scalar` (correct for bool) and the aclnn kernel is the vendor candidate behind the `# ascend` annotation under `FLAGOS_FORCE_BACKEND=vendor`; the measured post-change dispatch line is `[flagos dispatch] bitwise_and.Scalar -> flagos_python`. No new kernel, so the codegen-limitation approval path is not triggered. Route delta `none` 1662 -> **1659**, `flaggems` 220 -> **223**, `ascend` 155 unchanged; 378 accelerated (18.6%). Every other platform's conf and every other platform's generated artifacts are byte-identical. | Conf SHA-256 `eeee6b6eb15a48a918dd2429a448b6e6eb9e71bfdb2d348a7c68350526245138` -> `d02e4b54f801092299e091f49795ea83b3f70aae525cbad8a06d092c31122231`; `gen_vendor_confs.py` run twice leaves it byte-identical and `--check` reports `all vendor confs up to date`. The generated artifacts move by exactly the change: `ascend_register.inc` +3 `m.impl` (373 -> 376 registered ops), `ascend_kernels.cc` +57 lines (the three kernel bodies). Both pre-flight checks are recorded rather than assumed: `aclnnBitwiseAndScalar` exists (`nm -D libopapi.so` shows it plus `Or`/`Xor`, each with `GetSymbolSize`) and the enumerated missing reachable set is exactly the three overloads, obtained from the `FLAGOS_GEN_IMPLS` region of the shared `generated/register.inc` diffed against `ascend_register.inc` -- not guessed. The pre-fix failure is the verbatim traceback in the platform narrative above; two controls rule out a FlagGems divergence: `flag_gems.bitwise_and_tensor(x, False)` raises the identical ValueError on MetaX, and on the *pre-change* build re-routing the Ascend conf's `bitwise_and.Scalar` to `flaggems` changed nothing, because with no PrivateUse1 claim ATen's composite ran regardless of the conf value -- a statement about the **pre-change** build only; once the claim exists the conf value is the route (`csrc/aten/common.cc`: the value is the route, the `# ascend` annotation is read only under `FLAGOS_FORCE_BACKEND=vendor`), which is why this change leaves the value at `flaggems` and still moves the call off `.Tensor`. `tests/unit/test_conf_registration_consistency.py` and `flaggems_caps.EXPECTED_FLAGGEMS_ROUTES["ascend"]` move together to 223. **The three claimed overloads are measured on hardware, both arms**: same host, same interpreter, `TORCH_DEVICE_BACKEND_AUTOLOAD=0 FLAGOS_LOG=dispatch`; pre-change build at base `6573910` (`libtorch_fl.so` md5 `340a58b136805a36c8a4c51a2592003d`) logs `bitwise_and.Tensor -> flagos_python` with `PrivateUse1 bitwise_and.Scalar = False` and raises the ValueError, post-change build (`libtorch_fl.so` md5 `e678ca8b617429f34e3f20dda4c39112`, 5,273,128 B) logs `bitwise_{and,or,xor}.Scalar -> flagos_python` with all three `= True` and returns the CPU-reference values -- so the claim is what moves the call off `.Tensor`, and `flag_gems.bitwise_and_scalar` (not the aclnn kernel) is the winning backend, as designed. The aclnn bodies themselves are **not exercised** by any run, which is the recorded evidence gap. The other 223 Ascend `flaggems` routes are **not revalidated**, and no non-Ascend platform is revalidated or affected. |
 | 2026-10-14 | None (CPU-only host) | CUDA-ABI platforms (cuda, metax, dcu, ppu, tsingmicro) | **Makes CUDA boxing opt-in on every CUDA-compatible accelerator, so the default wheel links no vendor torch and routes FlagGems-primary.** `FLAGOS_BUILD_BOXING` is off again for all five platforms (`cmake/flagos_platforms.json`): the default wheel compiles no CUDA boxing kernels and bundles no vendor libtorch. `csrc/aten/register.cc`'s shared `#else` arm now compiles the new `csrc/aten/generated/register_flaggems_<platform>.inc` when `FLAGOS_FLAGGEMS_PYTHON` is set and boxing is off, claiming only the ops the platform's conf routes to a FlagGems backend; every other op stays unregistered and reaches `cpu_fallback`. `-DFLAGOS_BUILD_BOXING=ON` / `FLAGOS_BUILD_BOXING=1` restores the previous behavior -- the generated `generated/register.inc` claims every op and the wheel bundles the vendor libtorch. `setup.py` returns early from `_bundle_cuda_assets()` and drops the pinned `nvidia-*-cu12` runtime deps when boxing is off. The compatibility manifest's `vendor_torch_libraries` now follows the build: a new per-platform `vendor_torch_gate` (`FLAGOS_BUILD_BOXING` for cuda/ppu/metax/dcu) keeps the declaration true only on a boxing build, so a default wheel declares no vendor libtorch and `--release` no longer demands `FLAGOS_VENDOR_TORCH_VERSION` for one it does not ship. `csrc/aten/sdp_choice_stub.cc`'s composite tail boxes onto the vendor CUDA kernels only on a boxing build and otherwise calls `at::native::scaled_dot_product_attention` on the flagos tensors. `csrc/CMakeLists.txt` adds `FLAGOS_BOXING_BUILD` and a `FLAGOS_ACCEL_<UPPER>` discriminator for the shared arm. **No conf route moved:** `flaggems`/`cuda` counts stay cuda 416/1618, dcu 454/1583, ppu 592/1445, metax 594 + 10 `flaggems_cpp`/1433, tsingmicro 51 + 2 `flagos_python` (totals 2034/2037/2037/2037/53 unchanged). The CI hooks (`set_env_cuda/metax/ppu/dcu`) opt their boxes into boxing so the existing CUDA-kernel and bundled-libtorch assertions stay valid. | New `scripts/codegen/codegen_boxing_flaggems_register.py --check` -> `[check] 5 register_flaggems_*.inc files are up to date` (cuda 417, dcu 454, metax 604, ppu 593, tsingmicro 52 `m.impl` lines); `scripts/codegen/gen_vendor_confs.py --check` -> `all vendor confs up to date`; targeted unit suite (`test_setup_build`, `test_env_registry`, `test_conf_registration_consistency`, `test_platform_capability_matrix`, `test_gen_vendor_confs`, `test_vendor_conf_single_writer`, `test_wheel_preflight`) -> 174 passed; `ruff check` -> "All checks passed!". Every hardware row is **not revalidated** -- no route changed and no build was produced on a target here. |
 | 2026-10-13 | Kunlunxin P800 (native backend) | Kunlunxin unified RNG cohort: 47 overloads rerouted from `none` to the native `kunlunxin` backend | **Rewires the RNG surface onto the flagos PrivateUse1 generator, so `torch.flagos.manual_seed` / `get_rng_state` / `set_rng_state` / `manual_seed_all` own the stream the draws consume.** The lane's operator step failed two `tests/integration/ops/test_rng_dispatch.py` cases (`TestRngSeedSource::test_rng_state_round_trip`, `TestRngMultiDevice::test_manual_seed_all_replays_each_device_independently`) because every RNG op was left at `none` and took `cpu_fallback`: `torch.manual_seed` reaches ATen's CPU fallback generator (so whole-tensor reproducibility checks passed), but the flagos PrivateUse1 generator is a different state object, so `torch.flagos.*` moved nothing the fallback read. `csrc/aten/backends/kunlunxin/rng.cc` is added — the "declined to the host" arm of the GCU file (`csrc/aten/backends/gcu/rng.cc`): the XPU op library exposes no RNG entry point, so each draw is taken on an `at::CPUGeneratorImpl` and copied back, while the seed is reserved through `c10::flagos::ReserveSeed`. It defines 47 `*KernelKunlunxin` kernels and 47 `REGISTER_IMPL_TO_DISPATCHER(..., Backend::kKunlunxin, ...)` lines. Route delta `kunlunxin` 10 -> **57**, `none` 2027 -> **1980**, `flaggems` 0 unchanged (no FlagGems route), zero `cuda` routes; total 2037. **This uses the GCU `HANDWRITTEN_OPS` precedent under the CLAUDE.md codegen rule:** the generator owns the `m.impl` registration (so route and registration move together and the consistency invariants hold) while the bodies live in the hand-written file, because the RNG surface's contract is seed provenance plus a host-side draw — a shape the one-per-op xdnn-wrapper `{kernels}` template cannot emit. No test case was modified except the platform registration of kunlunxin in `_supports_flagos_generator()` (identical test-case code across platforms is a fleet requirement). | Regeneration proofs: `codegen_kunlunxin.py --check` → `[check] 57 kernel(s) up to date` (10 generated + 47 handwritten, empty diff on a second run); `kunlunxin_kernels.cc` byte-unchanged; `gen_vendor_confs.py` twice → empty diff and `--check` exits 0. `tests/unit/test_conf_registration_consistency.py`'s census/route-count snapshot updated to `{"kunlunxin": 57, "none": 1980}`, and its `test_vendor_routes_are_registered` / `test_accelerated_routes_are_registered` / `test_registered_ops_are_never_left_at_none` invariants cover all 57 routes (parametrized over `["musa","gcu","ascend","kunlunxin"]`). The pre-fix failure is the lane's own integration-job log: `2 failed, 660 passed, 29 skipped, 834 deselected, 3 xpassed` with both failures in `test_rng_dispatch.py`. The 47 RNG routes and the ten conformance routes are **not measured on hardware** in this change — a `pytest tests/integration/ops/test_rng_dispatch.py -m main_ops` run on a P800 is the follow-up that closes the hardware-measurement gap. |
 | 2026-10-13 | Kunlunxin P800 (native backend) | Kunlunxin native backend dtype gates (the ten runtime-conformance ops: `add.Tensor`, `mul.Tensor`, `mm`, `bmm`, `neg`, `sum.dim_IntList`) | **Splits the native backend's single flat dtype gate into per-op gates measured against the vendor wrapper, so a dtype the vendor rejects takes the CPU round-trip instead of erroring inside the wrapper.** The lane's first run to reach the portable integration step failed ten `tests/integration/test_dtype_coverage.py` cases, every one of them a dtype the previous build sent straight to the vendor: the generated kernels gated on the flat `KunlunxinSupportsDtype`, whose dtype map admits float64 and int8 for every op, but `xdnn_pytorch_wrapper` validates the scalar types of each entry point at run time and rejects a per-op subset (`add.cpp:151`, `mul.cpp:189`, `neg.cpp:55`, `sum.cpp:81`, `matmul.cpp:106` raise "scalar type of ret : k<dtype> is unsupported", surfaced to the caller as `RuntimeError: <op> failed on the Kunlunxin XPU backend: Interrupted system call (4)`). Five new predicates in `csrc/aten/backends/kunlunxin/kunlunxin_common.h` now name each op's accepted set, each measured against the wrapper rather than inferred from the base map: `KunlunxinSupportsAddDtype` (base − float64 − int8), `KunlunxinSupportsMulDtype` (add − int16), `KunlunxinSupportsMatmulDtype` (exactly float16/float32), `KunlunxinSupportsUnaryDtype` (base − float64) and `KunlunxinSupportsReductionDtype` (float16/bfloat16/float32). The generator drives them through one `{supports}` placeholder and a `SUPPORTS` category→predicate map in `scripts/codegen/codegen_kunlunxin.py`, and `cat`, `_softmax`, `embedding` and `where.self` resolve to the base predicate through the same map (no change to their behaviour). `neg` on bool and the compact int/uint cases are unchanged. No test case was touched — the fleet requires identical test-case code across platforms; the gate is a per-op capability of the vendor wrapper, not a host accommodation. No operator reroutes: `backends_kunlunxin.conf` is byte-identical. | Regeneration is idempotent (`python scripts/codegen/codegen_kunlunxin.py --check` → `[check] 10 kernel(s) up to date`); the regenerated `kunlunxin_kernels.cc` changes exactly the six gate lines and `kunlunxin_register.inc` is byte-identical (the `m.impl` set did not move). The pre-fix failure is the lane's own integration-job log (`test_dtype_coverage.py` → `10 failed, 226 passed, 1 xfailed`). The runtime-conformance cohort this row names builds every operand via `_randn(...)` and is therefore **float32 only** (`tests/integration/runtime/runtime_probe.py`), so per-op gating cannot move it; a `pytest tests/integration/runtime` run on the P800 is the follow-up that closes the hardware-measurement gap — the new gates are **not revalidated** on hardware until the lane re-runs. |
@@ -9898,6 +10468,7 @@ the recorded result is unchanged.
 | 2026-09-20 | Hygon DCU bw1000 (8 devices) | The DCU full-coverage configuration (459 active routes, harness v6) and the Qwen-Image-2.1 6-step flow it serves | Routed `scaled_dot_product_attention` from `cuda` to `flaggems` in `backends_dcu.conf` — one line, taking the file to **459 `flaggems` / 1578 `cuda`** over the same **2037** entries (SHA-256 `8849ce31ca6e517b6e7f71057f90dfa917f1b76068501554f40b7806d5600369`, from `7b82cb492de80f3dc2dcb93deeba14764a986368460a63cae9d1deb90fee9163`) with the active route set moving from SHA-256 `ededd42387eef3b74473eef358515a1848c153b3d83896c13168676332c3f69c` to `b646c47b5d6643ed7a0ef753af24f402cf741d598ca3dca662946b89977288e6` — and widened the `attn_mask` clause of the shared hand-written override (`csrc/aten/sdp_choice_stub.cc`) from "no mask" to the one class Qwen-Image-2.1 passes: 4-D bool with `size(3) == key.size(2)` and `numel == key.size(2)`, which the size-1 axes pin to `(1,1,1,KV)`. The clause stayed a shape test — no reduction runs over the mask and no value in it is read on the host, so admitting a call costs no device sync — and a materialized float mask is still refused, because the kernel reads one as `scores + mask` and "all zeros" would be a value claim the route could only establish with a pass over it. The kernel cannot take the caller's row as it stands for two independent reasons, both in the backend's own copy at `flag_gems/runtime/backend/_hygon/ops/attention.py`: it forms the mask block pointer as `batch_id*stride(0) + head_id*stride(1) + offs_m*stride(2) + offs_n*stride(3)` (lines 251-259) guarded against the *scores* extents and not the mask's own, so a mask broadcast along any of those axes reads past its buffer — measured as `sum nan` / `max|err| 3.195073` against `0.001875` for no mask at all, and at the model's own shape a fatal kernel VMFault on the first call — and it folds a bool mask in as `attn_mask.to(query.dtype) * -1.0e6` (lines 816-817), the inverse of torch's convention, so `True` becomes the additive that *removes* the key. `RouteMask()` therefore builds the additive itself in fp32 — `0 where True`, `kRoutedMaskFill` (`-1.0e6`) where False, reshaped to `(1,1,1,KV)` and expanded to the call's `(B,H,Q,KV)` — and the contract that makes it safe is `stride(i) * (size(i) - 1) == 0` on each axis, **not** `stride(i) == 0`: an axis that stays at size 1 is only ever indexed at 0, which is what `expand` supplies and what a measured `(1,1,1,KV)` mask shows, leaving `(KV, 0, 0, 1)` at batch 1 (the batch stride surviving because that axis was never expanded) and `(0, 0, 0, 1)` above it. Three Python-side patches cut the per-op host cost that had this build *slower* than the vendor's with the route off: `pow.Tensor_Scalar` on this backend runs an fp64 libdevice `powf` per element for a runtime exponent, `mean_dim_comm` sends a last-dim reduction to one CTA per row, and `triton_key()` sha256s 900,284,304 bytes inside whichever kernel compiles first. Every route the additive needs (`zeros_like`, `full_like`, `where.self`) is a `flaggems` route in this conf, so nothing falls back to the vendor, and **no operator leaves FlagGems for CUDA boxing**. `DCU_COMPOSITE_FLAGGEMS` in `scripts/codegen/gen_vendor_confs.py` holds the route from every other platform's conf the way `METAX_COMPOSITE_FLAGGEMS` does, and `tests/unit/test_gen_vendor_confs.py` pins the containment in both directions. The full 459-overload DCU re-survey over this configuration's own route set ran to completion: **459 registered, 382 tested, 342 `basic_executable`, 297 `strict_support`** (74.5% / 64.7%) over 3213 cases (1850 `PASS`, 1062 `INVALID_CASE`, 147 `ERROR`, 140 `WRONG`, 14 `CRASH`), against the previous revision's 458/381/342/297 (74.7% / 64.8%) over 3206; the one route added is `scaled_dot_product_attention`, whose `FAILED` is the harness's synthetic `dropout_p` recorded in this entry, and the only other records that moved (`index_copy`, `index_copy_`) each flipped one profile between `PASS` and `WRONG` while staying `FAILED`, which the duplicate indices their synthesized `randint(0, 2, ...)` argument guarantees; the run was sharded across eight processes over disjoint `--ops` slices and merged with the harness's own `summarize()`. **Ascend, GCU, MUSA, MetaX, PPU and TsingMicro are not revalidated** — except for the two `backends_metax.conf` / `backends_dcu.conf` divergences this entry records, every other conf is byte-identical to the previous revision of this report and no measurement transfers to them. | Measured on the Qwen-Image-2.1 1024x1024 6-step flow (batch 1, seed 42, `true_cfg_scale=1.0`, injected initial latents) on a Hygon DCU bw1000 with DTK 6.3.26113 in CUDA-boxing mode, torch 2.10.0+cpu decoupled, `flag_gems` `5.4.0rc2.post1+g437ba3938` and Triton 3.6.0 (`hcu`), `torch.utils.benchmark.Timer.blocked_autorange` with two discarded warm-up calls, one process per arm: vendor DTK torch **6.998 s** (n=3) / **14.938 s** (n=2) at 1024x1024 / 1664x928, this build with the op boxed **7.899 s** (n=3) / **16.167 s** (n=4), this build with the route on and the patches inert **3.772 s** (n=6) / **5.713 s** (n=4), and this build shipped **3.197 s** (n=19) / **4.979 s** (n=13) — **2.19x** and **3.00x** against the vendor, where the route-off arm is the control that makes this the route's doing and not the build's. Per phase the denoise loop is where the builds separate, 1095.8 against 436.3 ms/step at 1024x1024 and 2389.2 against 699.0 at 1664x928 (**2.51x** / **3.42x**). Per op, all on one card: `pow_tensor_scalar(z, 2.0)` at fp32 `(1, 4122, 32, 128)` — 16.9M elements, 67.6 MB — **185.6 us host / 418.3 us device** against `flag_gems.mul(z, z)` at **20.1 / 104.8**, and on bf16 384.6/169.7 against 56.5/20.1; `mean_dim(z, -1, True)` at the same shape, 131904 rows of 128, **77.7 / 443.5** shipped against the tiled kernel's **47.8 / 59.8**, flat across M so it needs only `_MEAN_TILED_MAX_N = 1024` as a row-width bound; `triton_key()` measured alone with the venv's own interpreter **1.013 s** after a 0.196 s import, showing up in the model as a first denoise step of 3030.0 ms of enqueue against 254.0 ms on the second. The route's own cost is measured rather than assumed: all three ops the additive calls are `flaggems` routes in this same conf (`zeros_like`, `full_like`, `where.self`; `RouteMask` calls the out-of-place `where`, and the `zeros_like.out` / `full_like.out` spellings it does not call are `cuda`), so the conversion adds no boxed launch, and a `FLAGOS_LOG=dispatch` census of a masked call on the MetaX sibling of this route shows all three on `flagos_python` with no `fallback` line. The converted mask does not move the answer: on `q(1,2,1024,128) x kv(1,2,1040,128)` bf16 against the same call with no mask, an all-true row reads `max|d| 0.0001220703125` — one bf16 ulp just under the output's 0.287 peak, over 8 elements of 2.1M, with both arms landing on the same `0.000694` against an fp64 reference — while dropping half the row moves it `0.249023`, 2000x further, which is what says the additive is read rather than only built. The image moves no further than the build does: one 1024x1024 image per arm from the same latents, seed and schedule, vendor against route-off `48/255` max / `0.790` mean / 22.67% of pixels over 1/255, vendor against route-on `43/255` / `0.684` / 19.48%, route-off against route-on `45/255` / `0.587` / 15.56% — the shipped arm is the closest of the three to the vendor image at every threshold past 1/255 (1.66% of pixels over 4/255 against the boxed build's 4.21%), and peak allocation is the same 36.6 GiB in all three, since the score matrix the route avoids is traffic and not footprint. Re-surveyed because a route moved: `tests/manual/flaggems_overload_survey.py` v6 (`7b01c22c...`) scoped to the changed route reports `registered 1`, `tested 1`, verdict **`FAILED`**, `basic_executable 0`, `strict_support 0` over 7 cases (4 `WRONG`, 3 `INVALID_CASE`) — and the cause is the harness, not the route: its `default_for()` catch-all ends in `return 0.5` for a `float` argument whose name it does not recognise, and the SDPA schema's argument is named `dropout_p`, so both arms of every profile draw from their own dropout RNG and a deterministic reference reports all four executable profiles wrong; with the catch-all changed to `0.0`, which is the value that names `dropout_p`, the same seven profiles report **`STRICT`** with four `PASS` and the same three `INVALID_CASE` (1-D input, int64 and bool operands — calls ATen rejects before any device kernel is reached). None of the seven profiles is inside the route's envelope either way. Regression coverage: `tests/integration/ops/test_dcu_flaggems_sdpa.py` runs 15 call shapes through the shipped conf in a fresh interpreter, each differing from the model's own in exactly one clause, asserting the count that reached `flag_gems.scaled_dot_product_attention` against the clause that decides it (`routed=1` for `eligible`, `joint`, `mask_bcast_true`, `mask_false`; `routed=0` for `mask_full_true`, `mask_float_zeros`, `head_dim64`, `seq512`, `float32`, `float16`, `rank2`, `causal`, `scale`, `dropout`, `gqa`), the form of the mask each routed call carried, the `stride(i) * (size(i) - 1) == 0` condition on every mask the kernel was handed, and that the additive is informative — **19 passed in 79.51s**, and with `FLAGOS_OP_scaled_dot_product_attention=cuda` the same shapes reach the kernel 0 times, which pins the route to the conf key and not to the shape alone. Host-side, `tests/unit/test_flaggems_dcu_costs.py` (66 tests) covers the three patched callables and the rebinding helper without a device and `tests/unit/test_gen_vendor_confs.py` (37 tests) the two-platform containment pin — **103 passed in 24.92s** together. `ruff check` — "All checks passed!"; `ruff format --check` — 285 files already formatted; `gen_vendor_confs.py --check` — `all vendor confs up to date`. **Evidence gaps:** the mask conversion is measured on the class of shape the route admits and not on a prompt cohort; the three per-op figures are one shape and one dtype pair each rather than a sweep; the `pow` and `mean_dim` patches are silent no-ops if a FlagGems upgrade renames what they rebind, which is the same failure mode as the `NameError` this branch itself introduced and fixed; the survey harness cannot measure this op at all through `active_routes()`, which enumerates the ops a conf *file* spells `flaggems`, so the verdict above is the harness's synthetic `dropout_p`; and no vendor-side 1664x928 repeat was taken in the same session as the route-on arm. |
 | 2026-09-20 | Enflame GCU S60 (8 `flagos` devices) | The 171 `F.scaled_dot_product_attention` calls one Qwen-Image-2.1 forward makes, logged by shape, stride, mask dtype and mask innermost stride from a real run | Extended the GCU SDPA predicate to admit calls that carry a mask, and dropped the `q_len != kv_len` refusal that lived in the same clause. On 2.1 **every one of the transformer's 98 attention calls carries a mask** (`attn_mask` absent was the 2512-shaped predicate's first requirement), so the Reroute above served all 98 mask-free-only calls through ATen's math decomposition. The new clause is one uniform rule, `SupportedVendorMask`: the mask must be bool, **or** additive in the query's dtype (bf16); rank 1, 2 or 4; right-aligned on `(batch, q_head_num, q_seq_len, kv_seq_len)` with every dim either singleton or full; and its innermost axis must be of size 1 or stride 1. It is deliberately dtype-symmetric rather than bool-only, because **the `_fused_sdp_choice` stub sees the caller's mask while the leaf sees the composite's converted one**: two caller spellings that pass the shape test and fail only on the innermost stride (`(4096, 4122)` bool `.t()` at stride 4096, and `1x1x64x80` bool with an expanded innermost axis at stride 0) are declined by the rule, and an admitted conversion would have replaced that stride with 1 and sent them to the leaf, whose own refusal is a hard `RuntimeError` rather than a fallback. The conversion itself can never produce a spelling the leaf refuses — it always yields the caller's shape right-aligned on `(B, H, q, kv)`, size-1-or-full, innermost stride 1 — which was verified on 16 caller spellings: every admitted one correct on the leaf, every declined one correct on math, none raising. **No route moves and no generated artifact changes**: the predicate lives in the hand-written translation unit, not in the generated conf, so the shipped conf stays 1605 `none` / 254 `flaggems` / 178 `gcu` over 2037 routable ops, `254 = 247 + 7` and `178 = 185 - 7` unchanged, and the GCU FlagGems cohort is **not revalidated** here: no survey run was taken with this clause in the tree, and the reason one is not needed is that `backends_gcu.conf` is byte-identical (SHA-256 `28f4656c`...) to the file the existing S60-wide cohort below was measured against, so no route verdict it records can move -- the existing cohort stands as the last measurement rather than as a re-measurement. FlagGems is still not the route, and was measured again rather than assumed: **133.84 ms/call** mask-free at the 2512 shape (against the math path's 90.54 in that run) and it **aborts with `exit 134` on a masked call**, because Triton-GCU rejects the zero-valued strides `expand` produces for the broadcast mask. | **The census**, from one real 2.1 forward (`probe_q21_sdpa_wrap`, 171 calls in the process, 4 distinct geometries): **98 admitted to the fused lane, 73 left on math** — 65 x target-image `q=(1,32,4096,128) kv=(1,32,4122,128) mask=(1,1,1,4122)` bool strides `(4122,4122,4122,1)`, and 33 x prefix-segment `q=(1,32,26,128)` `mask=(1,1,26,26)` bool strides `(676,676,26,1)`; declined are 72 x text-encoder `q=(1,32,40,128)` `k/v=(1,8,40,128)` (GQA and `is_causal`, 0.0002 GiB, not where the time goes) and 1 x VAE decode `q=(1,1,4096,1152)` strides `(14155776,14155776,3456,1)`. The 65 target-image calls are the reason this mattered: on math each materialises an fp32 `(1,32,4096,4122)` score matrix, **2.0127 GiB per call and 130.828 GiB of allocation churn over one forward**, and the driver refuses it — `itopsMalloc required :2164260864` (**2.0156 GiB**) — so the leg could not complete a single denoise step on one card. **A/B at that shape** (`probe_gcu_attn_target`, `flagos:0`, 3 calls per row, peak from `torch.flagos.memory_stats()["peak_allocated_bytes"]`, which is flat where `torch.cuda`'s is nested): fused no-mask **5.46 ms / peak 0.031 GiB**; fused with an admitted bf16 mask **13.81 ms / 0.031 GiB**; math with the fp32 spelling of the *same* allow-mask **147.14 ms / 4.785 GiB** — **10.65x per call and 4.754 GiB off the peak**, the two mask rows differing only in dtype and therefore a controlled pair, since the predicate is the only thing that sends them apart. A masked call costs 2.5x the unmasked one on the same op; that gap is not attributed here and does not affect the route decision, both being far below math. **Accuracy**: the masked fused calls agree with an fp32 CPU reference to `2.092e-03` relative at the target-image shape and `5.376e-03` on the prefix group, the same order as the mask-free cells (`3.650e-03`), so the mask is read as an additive bias and not as something else; discriminating padded-plane cells read additive `4.302e-03` / `4.134e-03` where a boolean reading of the same buffer gives `4.4e-01`-`1.64e+00`. The 73 declines stay on math and stay correct. **One silent-wrongness finding, which is why the predicate demands bool or the query dtype**: an fp32 additive mask is accepted by the leaf with `SUCCESS` and read as bf16 bytes (relative `1.1908` for the no-mask row and `1.2072` for the additive row, where correct is ~`4e-3`); it is unreachable through `F.scaled_dot_product_attention`, which converts the mask to the query dtype first, and the leaf therefore carries the dtype clause as a guard rather than the composite. New `tests/integration/ops/test_gcu_sdpa_mask.py`: 13 tests, 13 passed, asserting both the route (a `TorchDispatchMode` census over `_scaled_dot_product_efficient_attention` against `_safe_softmax`/`bmm`) and the values, including the two stride declines, the grad-mode decline, the four maskless-drop cases, a per-head mask that has to be read on every head, and the finite-offset deviation below. `ruff check .` — "All checks passed!"; `ruff format --check .` — all files already formatted. **A second, later change in the same clause: an inert mask is dropped before the vendor op is asked.** Everything above prices a masked call at 2.5x the mask-free one and attributes the gap to the leaf's own cost; a sync-bracketed in-model probe then showed that the mask the composite builds from an all-allow caller mask is a `(1,32,4096,4122)` bf16 view at strides `(4128,0,0,1)` -- one stored row of 4122 zeros expanded over 540M logical elements -- and that the vendor op's maskless entry point (`topsatenScaledDotProductFlashAttention`) answers it in **5.2 ms/call against the masked entry point's 19.3**, i.e. 166.3 ms against 617.3 over the 32 target-image calls of one forward. `AdditiveMaskIsAllZero` therefore narrows every stride-0 axis of size > 1 down to index 0 (a view, not a copy), declines outright when nothing was narrowed, and evaluates `(narrowed != 0).any()` through the routed `ne` and `any` kernels before handing the mask on; a dense mask is declined and a bool mask is never treated as inert, since zero is the additive identity only for an additive mask. The gate itself costs **0.52 ms/call** at the target-image geometry and **0.88** at the prefix geometry (0.19 / 0.63 on the vendor leg, ~11 ms on the first call while the modules load), **~45 ms per forward** against the 451.0 ms those 32 calls were costing. **The equivalence is measured.** On a nine-geometry off-model grid (`q` 1..4096, `kv` 26..4122, the model's own `kv + 6` padded strides) masked and maskless are bitwise equal on **9 of 9**, and each geometry carries a `-1000.0` control that differs. In-model, replaying every masked call of one real forward maskless is bitwise equal at **32 of 32** calls and moves the whole-model output by relative L2 `0.000000e+00` (`100.00 %` of elements within one bf16 ulp), where the rejected *broadcast-narrowing* spelling -- cheaper still at 343.0 ms on the leaf -- is **0 of 32** bitwise at the target-image geometry (one bf16 ulp, amplified by 32 layers to max abs `3.125e-01`, relative L2 `7.102801e-03`, `26.25 %` within one ulp), so it is not in the tree. **Census A/B, one tree one op apart** (`/tmp/op-census-shipped.log` against `/tmp/op-census-maskless.log`, `--stage transformer-step`, same prompt and seed): forward **1971.8 -> 1550.9 ms**, exclusive total 2281.9 -> 1946.7, the 64 attention leaves **551.4 -> 200.8 ms**, dispatch counts identical at 4753 / 9506 and the census output bitwise the plain output's on both legs, so the whole **-420.9 ms (21.3 %)** is the leaf; the rope-matched pair (`QWEN_IMAGE_REAL_ROPE=1`, 5521 / 11042 on both legs) reads 1897.5 -> **1468.4 ms** with the leaf at 548.2 -> 200.6. Against the vendor leg at the same rope configuration and the same 64 calls the fused leaf is now **200.6 against 407.6 ms, 207 ms cheaper than torch_gcu's**, and the flagos forward remains **+254.3 ms** behind at 1468.4 against 1214.1: the residual is a per-op premium on ops both legs call the same number of times, **65 % of it in `aten.mul.Tensor` alone** (+162.7 ms over 549 calls on each leg), which is why the maskless drop is a step and not parity. Approval to change what the translation unit hands the vendor op was requested and given explicitly, and is recorded in `docs/vendors/gcu/scaled-dot-product-attention.md`. **A finite constant offset in the mask is not exact, and is recorded rather than declined**: softmax is shift-invariant, so a row shifted by a constant is a no-op in exact arithmetic, yet the op applies the additive row at reduced precision -- `max|d|` against an fp32 CPU reference on the regression test's geometry (2 heads, 64 queries, 80 keys, bf16) is `1.6e-2` at `-8`, `2.2e-2` at `-16`, `3.5e-2` at `-30`, `1.29e-1` at `-100` and `1.33` at `-1000`, while the two spellings 2.1 produces are exact: an all-zero mask is bitwise identical to no mask, and `-inf`, which is what the bool conversion builds, agrees to `0.000e+00`. No clause declines it -- a threshold on the shift's magnitude would be arbitrary and a uniformly shifted row is a degenerate input -- so the deviation is pinned by a test that fails if it goes away, rather than living on as a number past its measurement. **Evidence gaps:** there is no paired end-to-end run on 2.1 with this clause in the tree yet, so the per-call A/B above is the whole of the measured claim and the single-card fit it predicts is **not** confirmed by a completed leg; the census is one forward of one prompt and one seed rather than a cohort; the SDPA leaf's own masked-call cost was priced at the 2512-adjacent shape rather than inside the 2.1 graph; the device run uses card 0, with card 5 defective and excluded; and on this platform the composite's `attn_mask` conversion is not exercised by the 2.1 graph at all — every admitted mask is already rank-4 with an innermost stride of 1 when the stub sees it — so the conversion path is verified by the 16-row probe rather than by the model. |
 | 2026-09-20 | Enflame GCU S60 (8 `flagos` devices) | The complex64 `aten.mul.Tensor` calls of the Qwen-Image-2.1 rope path, disaggregated from a per-op census of one forward | `topsatenMul` computes a complex64 product on the device, but not at the kernel's cost: at `topsaten_common.h:97` a complex64 call takes a decomposed path and the promotion and argument marshalling run on the host, so a complex64 multiply of two `(1,4096,24,64)` operands measured **50.166 ms against 2.27 ms for the two real multiplies carrying the same arithmetic**. The generated `MulTensorKernelGcu` therefore takes `view_as_real` of both operands, builds `(ar*br - ai*bi) + i(ar*bi + ai*br)` from four real multiplies, and `view_as_complex`es the stack -- views over the stack's own buffer, every multiply a topsaten kernel -- **only** when the promoted result is `complex64` and both operands are contiguous after the cast, since `view_as_real` cannot be taken of a strided operand; a mixed real x complex64 pair takes the same branch because the test is on `at::result_type`, complex128 is left alone, and only `mul.Tensor` is listed (`div.Tensor` needs a shared real denominator, `add`/`sub` are not where the time goes, and `mul.out` / `mul._Tensor` would need a complex `copy_`). The change is in the generator, not in the generated file: `_binary_dtype_guard` now takes the complex body as a parameter and a module-level `COMPLEX_ARITHMETIC` dict supplies it, so `gcu_kernels.cc` is regenerated rather than hand-edited, and three includes (`ATen/ops/stack.h`, `ATen/ops/view_as_complex.h`, `ATen/ops/view_as_real.h`) were added to the `FILE_HEADER`. **No route moves**: `mul.Tensor` is `= gcu` in `backends_gcu.conf:1425` before and after, the appended conf line is a no-op, no new backend is introduced, and the generator produces an empty second diff. **Measured** by per-op census of one real forward (`/tmp/op-census-flagos.log` against `/tmp/op-census-shipped.log`, same prompt and seed, identical rope configuration and identical `4753` / `9506` dispatch and sync counts): `aten.mul.Tensor` **3405.2 -> 545.2 ms** at 357 calls (**9538.3 -> 1527.1 us/call**, 66.0 % -> 23.9 % of the census's exclusive self time) and the exclusive total **5161.7 -> 2281.9 ms**, so `-2860.0 ms` of a `-2879.8 ms` change is that one row; the forward reads 4801.7 -> 1971.8 ms. The same row is 65 % of the remaining flagos-versus-vendor per-op premium at an identical call count. **Bit-identical**: the rewritten product was checked against the complex product it replaced at `max|d| 0.000e+00` (`bitwise equal: True`) and against the host's own real-view product in `tests/integration/ops/test_mul_dispatch.py`. New `TestMulTensorComplex64` there: 9 tests, 9 passed -- values against CPU at four shapes plus a broadcast and a mixed real x complex64 pair, bit-identity against the spelled-out real-view product, the route read from the dispatch log in a subprocess (two `view_as_real` and one `view_as_complex` for a contiguous pair, none for a transposed one, with the multiply logged on the card in both), and a transposed operand's values proving the contiguity test stands the branch down. The route is read from the log because **the nested dispatches a routed GCU kernel makes are invisible to a Python `TorchDispatchMode`** -- it sees only the outermost `mul.Tensor`, measured with a contiguous pair whose log shows the two `view_as_real` calls that the mode does not -- so a mode-based assertion would pass whether or not the branch ran. **Evidence gaps:** the micro-measurement is one shape at one dtype rather than a cohort; the census pair is one forward of one prompt and one seed; and the rope path's 4-deep complex64 multiply is the only complex64 call this model makes, so `complex128` and the `div` / `add` / `sub` / `out=` / `_` spellings are deliberately out of scope and unmeasured. |
+| 2026-09-20 | Enflame GCU S60 (8 `flagos` devices) | The 240 Qwen-Image-2512 rotary applications per forward, counted by operand identity and then priced against the same code with the expansion left in | Memoised the angle expansion the rope registration above installs. `diffusers` builds the rotation operands once per forward behind an `lru_cache` and all 60 blocks reuse them, so one warm forward makes **240 consumer calls over 62 distinct angle tensors** — the same `(4096, 64)` and `(18, 64)` pair per block plus one fresh text-stream slice per block, which is why it is 62 and not 2 — and **178 of those 240 builds (74.2 %)** are of a table that already exists. `_rotation_table` holds the angle tensor by reference and keys on its identity plus its `_version`, so a hit returns the very tensors the code would have built and exactness is structural; the reference cannot be recycled by the allocator and an in-place write invalidates the entry. The list is bounded at four entries and loses none of the 178. No operator is added, removed, disabled or rerouted and no conf route moves: the shipped conf stays 1605 `none` / 254 `flaggems` / 178 `gcu` over 2037 routable ops. | Two arms alternating in **one process**, same S60, same 1024x1024 forward, warm-up 1 then 3 rounds each: memoised **2.416 / 2.407 / 2.412 s** (mean **2.412**), rebuilt every call **2.476 / 2.466 / 2.470 s** (mean **2.471**) — **59 ms per forward, 2.4 %**, or 0.059 s off the 7.1 s/it step. The operand census is identity-keyed with every operand held alive, so a freed tensor's address cannot be recycled into a false repeat. `ruff check torch_fl/accelerator/gcu/_gcu_compat.py tests/unit/test_gcu_qwenimage_rope.py` — "All checks passed!"; `ruff format --check` on the same two files — "2 files already formatted"; `pytest tests/unit/test_gcu_qwenimage_rope.py -q` — **23 passed** (19 before this change: four new cases cover reuse on a repeated operand, no reuse for a same-shape different-value operand, invalidation on an in-place write, and the bound). Evidence: [the rotation entry](#enflame-gcu-s60-forward-sdpa-on-the-vendor-flash-op-and-the-broadcast-materialisation-2026-09-20) above, `/tmp/probe_rope_cache.py` and `/tmp/probe_rope_memo_ab.py` through `/tmp/run_probe_attn_args.sh`. **Evidence gaps:** the two arms are compared in cost only — exactness is argued from the construction and asserted in the unit tests, not re-measured at the model output; the memo is priced on the `flagos` leg alone, since the vendor leg's rope is stock `diffusers` and has no equivalent to memoise; and `tests/manual/flaggems_overload_survey.py` was not re-run, because nothing added, removed, disabled or rerouted an operator, so the survey and its conf reconciliation carry over unchanged from the entry above. |
 | 2026-09-20 | Enflame GCU S60 (8 `flagos` devices) | The Qwen-Image-2512 transformer's 240 rotary-embedding applications per forward pass, priced at the call site and again as full model outputs | Registered the `flagos` device in `diffusers`' Qwen-Image rope table from `torch_fl`'s GCU branch, which turns the angle path the entry above measured through a manual switch into the default and replaces the expansion it used. `diffusers` keys the rotation on device type in two places that must agree — `ROPE_PER_DEVICE` selects the rotation at the attention call site, while `QwenEmbedRope._get_device_freqs` produces the operand and returns **complex** frequencies for every device but `neuron` — so both halves are installed together, the operand half delegating to the stock method for every other device and both guarded by a module flag so a second call is a no-op. The consumer is the same rotation as `apply_rotary_emb_qwen_neuron` but expands each angle with `stack`/`flatten` instead of `repeat_interleave(2, dim=-1)`, whose composite lowering (`unsqueeze(-1).expand(..., 2).reshape(...)`) materialises a stride-0 view through `StridedCopy` and reaches the drained copy path 480 times per forward — 2.249 ms per call while those calls are the ones paying the drain, against 25.596 us once they are not. Three legs, one process each, warm-up 1 and 3 timed forwards, transformer on `flagos`, 1024x1024: complex (old default) 5.411 s forward with 3818.7 ms of rope (70.6 %), neuron via `QWEN_IMAGE_REAL_ROPE=1` 3.392 s with 1448.2 ms (42.7 %), shipped 2.455 s with 546.8 ms (22.3 %). **2.956 s per forward (54.6 %) against the fallback it removes and 0.937 s (27.6 %) against the angle path it replaces**, of which the harness switch alone was worth 2.019 s. **On the leg that ships**, where a step is two forwards under true CFG, the same registration is worth **6.80 s per step, 57.6 % of the loop**: one session, three legs one environment variable apart, 8-step 1024x1024 `--stage full` at the harness's default seed -- `FLAGOS_DISABLE_QWENIMAGE_ROPE=1` **11.81 s/it** (3.10x), shipped **5.01 s/it** (**1.31x**), `torch_gcu` + `diffusers` **3.81 s/it** (1.00x), with the shipped leg reproducing at `5.00`. That is the configuration a user gets: the `8.48 s/it` / `2.23x` on the entry below and the `8.38 s/it` / `2.09x` in the rotation section above both ran the `QWEN_IMAGE_REAL_ROPE=1` harness switch instead, and are not the shipped state. The shipped and neuron legs are **bit-identical end to end** (`torch.equal` true on `(1, 4096, 64)` bf16, 0 of 262144 elements differing); the complex leg differs from both by `3.125e-02` at `absmax 5.3125`, two bf16 ulps from a different product ordering accumulated over 60 blocks. No conf file or generated registration is touched, so no route moves — the shipped conf stays 1605 `none` / 254 `flaggems` / 178 `gcu` over 2037 routable ops. `FLAGOS_DISABLE_QWENIMAGE_ROPE=1` leaves the table as `diffusers` ships it. Evidence: [the rotation entry](#enflame-gcu-s60-forward-sdpa-on-the-vendor-flash-op-and-the-broadcast-materialisation-2026-09-20) above, `tests/unit/test_gcu_qwenimage_rope.py` (19 tests: bit-for-bit against a pinned copy of the neuron expansion and against the installed `diffusers` copy, `allclose` against the complex path at a documented one-ulp tolerance, and the registration's idempotence, disable switch and operand/consumer split), `tests/unit/test_env_registry.py`, and `/tmp/probe_rope_shipped.py` with `/tmp/rope_out_{complex,neuron,shipped}.pt` as the saved evidence; `/tmp/run_rope_ab.sh` with `/tmp/rope_ab_{rope_on,rope_off,vendor}.log` for the 8-step shipped-leg reading and `/tmp/run_stage_decomp.sh` with `/tmp/decomp_{flagos,vendor}.log` for the discarded stage-split arm, the reference leg of both on `TOPS_VISIBLE_DEVICES=0,1,2` through its own interpreter. **Evidence gaps:** the shipped-leg A/B carries the harness's default inputs and seed rather than the paired latents the SDPA entry's 8-step runs use, so the two runs are comparable through the reference leg's reproduced `3.81 s/it` and not through identical inputs; `FLAGOS_DISABLE_QWENIMAGE_ROPE=1` returns before installing either half, so the opt-out leg prices the consumer and the operand producer together and not separately; and the stage-split arm's walls are recorded as a discarded result rather than as evidence about the decode. |
 | 2026-09-20 | Enflame GCU S60 (8 `flagos` devices) | The Qwen-Image-2512 transformer's own 60 `F.scaled_dot_product_attention` calls per forward pass, measured on the model's envelope rather than on a stand-in shape | Routed `_scaled_dot_product_efficient_attention` from `none` to `gcu` so the composite stops serving every attention call with the math decomposition. That decomposition runs on the device — there was no `cpu_fallback` line for it — but at the model's shape it is 90.71 ms per call against 1.39 ms for the vendor flash op, and it was the largest single term left in the transformer step after #351. `F.scaled_dot_product_attention` selects a backend by asking ATen's `_fused_sdp_choice` **DispatchStub**, which only a `REGISTER_PRIVATEUSE1_DISPATCH` registrar fills: registering the leaf, or an ATen op of the same name, leaves `is_device_supported(PrivateUse1)` false and the composite on the math branch. The stub's return value *is* the backend selection, so it also serves as the decline mechanism — a mask, `is_causal`, GQA, fp16, `q_len != kv_len` or any grad-mode call returns `math` and keeps today's behaviour with no host round trip and no CPU fallback, and the predicate behind the stub and the kernel's `TORCH_CHECK` is one function. FlagGems carries an SDPA route and it was measured rather than assumed: 133.84 ms per call against the math path's 90.54 ms, so it is not the route taken and `_scaled_dot_product_efficient_attention_backward` stays on FlagGems. The kernel is a hand-written translation unit, which CLAUDE.md allows only for a concrete codegen limitation and with explicit human approval (both met): `codegen_gcu.py` cannot express a `REGISTER_PRIVATEUSE1_DISPATCH` registrar into an ATen DispatchStub, nor a kernel body returning a 4-tuple. Everything else stays generated — the `m.impl` line and the `= gcu` route come from listing the op in `HANDWRITTEN_OPS`. The same commit stops the generated elementwise kernels materialising broadcasts with `expand().contiguous()`, which the vendor documents it does not need. Route delta: `gcu` 177 -> **178**, `none` 1606 -> **1605**, `flaggems` **254** unchanged, accelerated 431 -> **432** (21.2 %); `gcu_register.inc` 184 -> **185** `m.impl` lines, so the reconciliations read `254 = 247 + 7` and `178 = 185 - 7`. No route moves *from* FlagGems and the FlagGems route set is byte-identical, so the S60-wide survey below is a provenance re-run rather than a new cohort — and it reproduces the base cohort's **1778 verdicts with 0 differing cases** (`/tmp/gcu-overloads-post.json` `6d1120be…` against `/tmp/flaggems_gcu_survey.json` `1ee7ea4f…`). | Within-process A/B on one card, same 60 calls and operands, sentinel-planted output buffer read back per run (`sentinel-left 0` of 12 638 208 every run): math leaf **11.637 s** (60/60, 5442.9 ms, 90.71 ms/call) -> vendor leaf **7.240 s** with the pre/post drain (60/60, 331.3 ms, 5.52 ms/call) -> **7.356 s** with drains suppressed (83.1 ms, 1.39 ms/call), i.e. **4.397 s of 11.637 s = 37.8 %**, with the drain costing 248 ms/step (3.4 %). The two vendor runs are byte-identical in their outputs (`max|d| 3.125e-02`, `mean|d| 2.743e-03` against `|math|max 5.750e+00`). Against an independent float64 reference on the model's envelope the kernel reads `max|d| 1.555e-02`, `mean|d| 1.005e-03` against `|ref|max 5.315e+00`, and every declined case — fp16, `attn_mask`, `is_causal`, GQA, `q_len != kv_len`, grad enabled — reaches the leaf **0** times while staying correct on the math path; the direct `compute_log_sumexp=True` call returns `out (1,24,4114,128)`, `lse (1,24,4114,4114)` bf16, seed and offset `(0,)`, which is ATen's own convention for that slot and is delegated to the math op rather than re-derived. Shipped route in the real graph: warm-up 9.51 s, profiled **7.83 s**, summed **7.50 s/step over 64 ops**, leaf **170.813 ms / 60 calls**, `_fused_sdp_choice REACHED -> 2` before every batch. **End to end, paired, two builds of one tree:** 8-step 1024x1024 `--stage full`, seed 42, `QWEN_IMAGE_REAL_ROPE=1` on every leg, `TOPS_VISIBLE_DEVICES=0,1,2`, and the same latents and prompt embeds carried between the legs by `--save-latents`/`--save-inputs` then `--load-latents`/`--load-inputs` — math leaf **19.33 s/it**, vendor leaf **8.48 s/it** (8.81 on a repeat that produced a byte-identical image, `md5 d47974b1…`), `torch_gcu + diffusers` **3.81 s/it**. So the reroute is **2.28x** and **56.1 % off the denoising loop** (2.19x / 54.4 % against the slower repeat, which is 2.31x the vendor against the faster leg's 2.23x), and the loop delta is larger than the 37.8 % the per-call table projects because the projection priced the 60 leaf calls of one forward shape while the math decomposition also materialises intermediates the flash leaf never builds. The three output images: shipped against reverted `MAE 3.568/255`, `PSNR 30.10 dB`; shipped against `torch_gcu` `5.089/255`, `26.96 dB`; reverted against `torch_gcu` `5.102/255`, `26.91 dB` — the shipped leg is marginally the closer of the two to the reference, so the flash kernel is a real image-level change and not a step away from it. The route cannot be A/B'd at runtime and two attempts are recorded so they are not repeated: `FLAGOS_OP__scaled_dot_product_efficient_attention=none` is refused with *"routed to 'none' … but the op is registered on PrivateUse1"*, and `torch.nn.attention.sdpa_kernel([SDPBackend.MATH])` is a silent no-op — that leg returned a byte-identical image to the shipped leg while still logging 960 `-> gcu` dispatches, because `__torch_function__` selects the route before ATen's backend pin is consulted. `ruff check .` — "All checks passed!"; `ruff format --check .` — 272 files already formatted. Generator idempotency: two runs leave the three moving artifacts byte-identical (`md5sum -c` -> `OK`). Artifact SHA-256 before -> after: `backends_gcu.conf` `476825db…` -> `28f4656c…`; `gcu_kernels.cc` `57e6edc9…` -> `f3cb0ee8…`; `gcu_register.inc` `dc88d5bc…` -> `dcab7a4e…`; `gcu_flaggems_register.inc` unchanged at `be843180…`. **Evidence gaps:** the broadcast half is measured per call (`a * a` 0.212 ms, `a * 0-dim device` 0.322 ms, `a * 0-dim host` 0.416 ms, `.contiguous()` on a contiguous tensor 0.004 ms at `(4096, 2560)` bf16) and not end-to-end — deliberately and not by omission, since the paired run above carries it in **both** legs, which is what makes that run's 2.19x attributable to the SDPA reroute alone; partitioning it out would need a third build. The 8-step paired run is one prompt and one seed and not the 12-prompt cohort; the two `torch_fl` legs are the same tree built twice rather than a runtime switch, since no runtime switch exists; the residual-gap table's two columns are not a controlled comparison (different card sets, profiler on, and it inflates runtime calls — 7.24 s unprofiled against 7.83 s profiled); and the device run uses card 0, with card 5 defective and excluded. |
 | 2026-09-19 | MetaX C550 (8 devices) | MetaX `scaled_dot_product_attention` composite route | Widened the `attn_mask` clause of the MetaX `scaled_dot_product_attention` composite override (`csrc/aten/sdp_choice_stub.cc`) from "no mask" to the one class Qwen-Image-2.1 passes: 4-D bool with `size(3) == key.size(2)` and `numel == key.size(2)`, which pins the shape to `(1,1,1,KV)` once the size-1 axes are. The kernel cannot read a bool mask as-is — FlagGems converts one itself at `attention.py:928-929` with `attn_mask.to(query.dtype) * -1.0e6`, the inverse of torch's convention, and skips that for a float mask — so `RouteMask()` builds the additive itself in fp32, `where(mask, 0, -1e6)`, and reshapes to `(1,1,1,KV)` before expanding because the caller's tensor carries a real stride on both size-1 axes and `_attn_fwd` indexes the mask by stride with nothing bounding batch, head or query row. **No routing configuration changed**: the clause lives in the hand-written override, so `backends_metax.conf` still reads 592 `flaggems` / 12 `flaggems_cpp` / 1433 `cuda` over 2037 entries (SHA-256 `bb1dc5c4550339dcd44ac438b2981e703c882025e477221e86cac37d833f58f2`) and no other platform's conf or route moves. Nothing falls back to the vendor: `zeros_like`, `full_like` and `where.self` are `flaggems` routes in that conf, and a `FLAGOS_LOG=dispatch` census of both spellings the route serves shows all three on `flagos_python` with no `fallback` line in the log. Ascend, GCU, MUSA, DCU, PPU, CUDA and TsingMicro are **not revalidated**. | Qwen-Image-2.1, 1024x1024, 40 steps, batch 1, seed 42, `--warmup 1`, card 0 on every arm: flagos with this route **776.9 ms/step / 31.62 s/image** against vendor MACA torch's **1661.1 ms/step / 66.96 s/image** and the same wheel with the clause unemployed (`FLAGOS_OP_scaled_dot_product_attention=cuda`) at **1702.8 ms/step** — **2.13x** and **2.19x**; a second window at `--min-run-time 50` reproduces all three (773.1 / 1660.2 / 1687.5 ms). Paired-latents arms (`--load-latents`, 774.8 / 1661.0 / 1687.4 ms/step): route vs boxed **49.05 dB / MAE 0.43833**, cuda vs boxed **46.58 dB / 0.56115** (the bring-up figure, reproducing as a control), cuda vs route **46.47 dB / 0.55726** — so the route's own image cost is below the flagos-vs-vendor difference the wheel already carries. Op level in the pipeline at `q(1,4096,32,128)` / `kv(1,4122,32,128)` / `mask(1,1,1,4122)`: **11.808 ms/call over 96 calls** against the boxing arm's **40.239 ms/call**, at `max|d| 0.000e+00` / `rel 0.00e+00` and NaN `0/0/0/0` against a direct `flag_gems.scaled_dot_product_attention` over the same operands; the mask's logged stride is `(4122, 4122, 4122, 1)`. The additive costs, on this part at KV 4122, `zeros_like 0.024 + full_like 0.037 + where.self 0.105` ms plus `0.010` ms of views — about 0.18 ms per routed call. `pytest tests/integration/ops/test_metax_flaggems.py -k SdpaRoute -x -q`: **13 passed, 91 deselected in 41.19s**; whole file **104 passed in 795.16s, 0 failed** (exit 0). `flaggems_overload_survey.py` v6 (SHA-256 `7b01c22c…`) rerun against the changed route: `registered 1` / `tested 1` / **`FAILED`**, unchanged from the entry above — its cause is the harness's synthesized `dropout_p = 0.5` in a non-deterministic call, and every case it synthesizes is outside the new mask clause as well. Every figure is a measurement from the shipped conf on the built wheel; none is inferred from the routing table. |
