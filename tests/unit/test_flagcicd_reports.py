@@ -299,7 +299,8 @@ def test_workflow_transfers_optional_token_and_uploads_the_generated_report():
     )
     job = workflow["jobs"]["integration-tests"]
     assert (
-        "--add-host=flagcicd-inner.flagos.net:10.1.4.15" in job["container"]["options"]
+        job["container"]["options"]
+        == "${{ needs.configuration.outputs.container_options }}"
     )
     steps = {step.get("id", step.get("name")): step for step in job["steps"]}
     assert "!cancelled()" in steps["merge-report"]["if"]
@@ -312,6 +313,10 @@ def test_workflow_transfers_optional_token_and_uploads_the_generated_report():
     )
     upload = steps["Upload pytest report to FlagCICD"]
     assert upload["continue-on-error"] is True
+    assert (
+        upload["with"]["backend_url"]
+        == "https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/"
+    )
     assert upload["with"]["file_type"] == "pytest"
     assert (
         upload["with"]["report_path"]

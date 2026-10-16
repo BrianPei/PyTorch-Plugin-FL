@@ -91,7 +91,7 @@ jobs:
     container:
       image: ${{ needs.configuration.outputs.ci_image }}
       volumes: ${{ fromJson(needs.configuration.outputs.container_volumes) }}
-      options: ${{ needs.configuration.outputs.container_options }} --add-host=flagcicd-inner.flagos.net:10.1.4.15
+      options: ${{ needs.configuration.outputs.container_options }}
     defaults:
       run:
         shell: bash
@@ -264,7 +264,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
-          backend_url: 'http://flagcicd-inner.flagos.net:8000/metrics/'
+          backend_url: 'https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/'
           api_token: ${{ secrets.FLAGCICD_API_TOKEN }}
           report_path: '${{ github.workspace }}/pytest-${{ inputs.platform }}.json'
           file_type: pytest

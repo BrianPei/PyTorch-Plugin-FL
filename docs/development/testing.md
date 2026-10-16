@@ -408,11 +408,12 @@ upload with a warning; it does not prevent report generation or artifact retenti
 Fork PRs and the trusted fork diagnostic route retain artifacts but skip the
 credentialed upload in the job executing fork code.
 
-Each job container is created with
-`--add-host=flagcicd-inner.flagos.net:10.1.4.15`, so ARC replacement pods require no
-manual hosts-file edits. Its network must also reach port 8000 on that address.
-The uploader posts to `http://flagcicd-inner.flagos.net:8000/metrics/`, uses a
+The uploader posts to
+`https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/`, uses a
 platform-specific `job_name`, and treats transport/service errors as warnings.
+Job containers use their configured DNS and must be able to reach that HTTPS
+endpoint with normal TLS certificate validation. No FlagCICD-specific hosts-file
+mapping is injected into the containers.
 Validate the upload's HTTP response and the corresponding FlagCICD record: a
 green workflow alone does not prove ingestion. Backend parsing and dashboard
-interpretation of the merged report require an actual internal-service run.
+interpretation of the merged report require an actual authenticated upload.
