@@ -1063,6 +1063,51 @@ at::Tensor SubScalarKernelGcu(const at::Tensor& self, const at::Scalar& other, c
 
 REGISTER_IMPL_TO_DISPATCHER(SubScalarFn, sub_scalar_dispatcher, Backend::kGcu, SubScalarKernelGcu)
 
+at::Tensor RsubScalarKernelGcu(const at::Tensor& self, const at::Scalar& other, const at::Scalar& alpha) {
+  if (!gcu::TopsatenSupportsDtype(self.scalar_type()) ||
+      !gcu::TopsatenSupportsDtype(at::result_type(self, other))) {
+    return at::rsub(self.cpu(), other, alpha).to(self.device());
+  }
+  auto result_dtype = at::result_type(self, other);
+  auto self_c = (self.scalar_type() == result_dtype ? self : self.to(result_dtype))
+                    .contiguous();
+  auto other_t = gcu::ScalarToDeviceTensor(
+      other, self_c.sizes(), self_c.options());
+  auto out = at::empty(self_c.sizes(), self.options().dtype(result_dtype));
+  auto t_alpha = gcu::ToTopsatenScalar(alpha, result_dtype);
+
+  gcu::TopsatenTensorWrapper t_self(self_c);
+  gcu::TopsatenTensorWrapper t_other(other_t);
+  gcu::TopsatenTensorWrapper t_out(out);
+  EXEC_TOPSATEN_CMD(topsatenRsub, self, t_out.get(), t_other.get(), t_self.get(), t_alpha);
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(RsubScalarFn, rsub_scalar_dispatcher, Backend::kGcu, RsubScalarKernelGcu)
+
+at::Tensor RsubTensorKernelGcu(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
+  auto result_dtype = at::result_type(self, other);
+  if (!gcu::TopsatenSupportsDtype(self.scalar_type()) ||
+      !gcu::TopsatenSupportsDtype(result_dtype)) {
+    return at::rsub(self.cpu(), other.cpu(), alpha).to(self.device());
+  }
+  auto self_c = self.scalar_type() == result_dtype ? self : self.to(result_dtype);
+  auto other_c = other.to(self.device(), result_dtype);
+  auto out_shape = at::infer_size(self_c.sizes(), other_c.sizes());
+  auto self_b = gcu::BroadcastTo(self_c, out_shape);
+  auto other_b = gcu::BroadcastTo(other_c, out_shape);
+  auto out = at::empty(out_shape, self.options().dtype(result_dtype));
+  auto t_alpha = gcu::ToTopsatenScalar(alpha, result_dtype);
+
+  gcu::TopsatenTensorWrapper t_self(self_b);
+  gcu::TopsatenTensorWrapper t_other(other_b);
+  gcu::TopsatenTensorWrapper t_out(out);
+  EXEC_TOPSATEN_CMD(topsatenRsub, self, t_out.get(), t_other.get(), t_self.get(), t_alpha);
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(RsubTensorFn, rsub_tensor_dispatcher, Backend::kGcu, RsubTensorKernelGcu)
+
 at::Tensor EqScalarKernelGcu(const at::Tensor& self, const at::Scalar& other) {
   auto result_dtype = at::result_type(self, other);
   if (!gcu::TopsatenSupportsDtype(self.scalar_type()) ||
@@ -2187,7 +2232,12 @@ REGISTER_IMPL_TO_DISPATCHER(MaskedFillInplaceTensorFn, masked_fill_inplace_tenso
     const ::std::optional<at::Tensor>& weight,
     const ::std::optional<at::Tensor>& bias,
     double eps) {
-  if (!gcu::TopsatenSupportsDtype(input.scalar_type())) {
+  if (!gcu::TopsatenSupportsDtype(input.scalar_type()) ||
+      !input.is_privateuseone() ||
+      (weight.has_value() && weight->defined() &&
+       weight->device() != input.device()) ||
+      (bias.has_value() && bias->defined() &&
+       bias->device() != input.device())) {
     auto r = at::native_layer_norm(
         input.cpu(),
         normalized_shape,
@@ -2211,11 +2261,13 @@ REGISTER_IMPL_TO_DISPATCHER(MaskedFillInplaceTensorFn, masked_fill_inplace_tenso
   auto mean = at::empty(stat_shape, input_c.options());
   auto rstd = at::empty(stat_shape, input_c.options());
 
+  // Moved onto input's device: an unmoved CPU weight would reach topsaten
+  // through the raw-pointer wrapper as device memory (#526).
   auto w = weight.has_value() && weight->defined()
-      ? weight->contiguous()
+      ? weight->to(input_c.device()).contiguous()
       : at::ones(normalized_shape, input_c.options());
   auto b = bias.has_value() && bias->defined()
-      ? bias->contiguous()
+      ? bias->to(input_c.device()).contiguous()
       : at::zeros(normalized_shape, input_c.options());
 
   gcu::TopsatenSizeWrapper t_shape(normalized_shape);
@@ -2431,7 +2483,10 @@ at::Tensor ConvolutionOverrideableKernelGcu(
     at::IntArrayRef output_padding,
     int64_t groups) {
   if (!gcu::TopsatenSupportsDtype(input.scalar_type()) ||
-      !gcu::TopsatenSupportsDtype(weight.scalar_type()) || transposed) {
+      !gcu::TopsatenSupportsDtype(weight.scalar_type()) || transposed ||
+      !input.is_privateuseone() || !weight.is_privateuseone() ||
+      (bias.has_value() && bias->defined() &&
+       bias->device() != input.device())) {
     auto r = at::convolution(
         input.cpu(), weight.cpu(),
         bias.has_value() && bias->defined()
@@ -2450,7 +2505,7 @@ at::Tensor ConvolutionOverrideableKernelGcu(
   // topsaten has no "absent bias" sentinel usable from here, so a zero bias
   // reproduces the unbiased result.
   at::Tensor bias_c = bias.has_value() && bias->defined()
-      ? bias->contiguous()
+      ? bias->to(input_c.device()).contiguous()
       : at::zeros({weight_c.size(0)}, weight_c.options());
 
   gcu::TopsatenTensorWrapper t_out(out);
