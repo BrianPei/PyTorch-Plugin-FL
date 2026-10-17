@@ -50,8 +50,8 @@ wheel_artifact_name: wheel-kunlunxin
 integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
-# Scope mirrors the cuda/dcu six-part pattern (device + basic ops + general
-# factory + AMP + runtime smoke + vendor main_ops), skipping FlagGems main_ops
+# Scope covers device + basic ops + general factory + AMP + runtime smoke +
+# vendor main_ops + single-device RNG, skipping FlagGems main_ops
 # (4 broken routes), profiler parity (CUPTI vendor defect), and
 # inference/training (Qwen3 mount). The runtime smoke harness (flagos:1)
 # logs tensor metadata to avoid unsupported FP64 reductions in tensor repr.
@@ -87,9 +87,14 @@ integration_tests:
   - name: Run runtime smoke
     command: python tests/manual/kunlun_runtime_smoke.py
   - name: Run operator tests (vendor backend, main ops)
-    # main_ops dispatch tests on flagos:0, vendor (cuda boxing) backend. RNG
-    # dispatch is ignored -- pre-existing Kunlun RNG gap poisons the device
-    # context (see ci-vendor-kernel-poisons-device-context). Ordered last so a
-    # red op does not block the validated suites above; if mm/pow red or poison,
-    # the CI log pinpoints them for per-op deselect.
+    # Run non-RNG vendor dispatch before the RNG suite so an RNG failure cannot
+    # prevent the existing operator checks from completing.
     command: python -m pytest tests/integration/ops/ -m "main_ops and not flaggems_python and not flaggems_cpp" --ignore=tests/integration/ops/test_rng_dispatch.py -v -s --tb=short
+  # Run single-device RNG in its own process after the existing suites. Keep
+  # multi-device RNG excluded: the recorded P800 gap can abort the process.
+  - name: Run RNG tests (vendor backend, single device)
+    command: >-
+      python -m pytest tests/integration/ops/test_rng_dispatch.py
+      -m "main_ops and not flaggems_python and not flaggems_cpp"
+      --deselect=tests/integration/ops/test_rng_dispatch.py::TestRngMultiDevice
+      -v -s --tb=short -ra
