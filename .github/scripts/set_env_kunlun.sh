@@ -80,14 +80,8 @@ export XPU_ROOT="${XPU_ROOT:-/usr/local/xpu}"
 export XCUDART_ROOT="${XCUDART_ROOT:-/usr/local/xcudart}"
 # XPU_CUPTI_ENABLE_DEVICE is intentionally NOT set. Binding the profiler to
 # all 8 devices (0,1,...,7) causes CUPTI cuptiActivityEnable to fail with
-# error 17 (etiEventSamplingSetMode) in every dispatch subprocess, aborting
-# all of [6/6] main_ops. The runtime smoke harness no longer needs this env:
-# it warms up the device context in-process (is_available -> init -> randn
-# on device 0 and 1 via runpy) before its first empty, avoiding the XDNN
-# fp64 min probe (min.cpp:41) without profiler binding. Whether the dispatch
-# subprocesses (no init, first op is randn) also avoid the probe without
-# this env is being verified by this change.
-# export XPU_CUPTI_ENABLE_DEVICE="${XPU_CUPTI_ENABLE_DEVICE:-0,1,2,3,4,5,6,7}"
+# error 17 (etiEventSamplingSetMode) in dispatch subprocesses. The runtime
+# smoke logs tensor metadata instead of invoking FP64 reductions via repr.
 
 if [[ ! -f "$XPU_ROOT/include/cuda_runtime.h" ]]; then
   echo "::error::cuda_runtime.h not found at $XPU_ROOT/include"
