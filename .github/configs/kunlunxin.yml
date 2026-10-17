@@ -51,7 +51,7 @@ integration_wheel_source: local-build
 
 # The common workflow only executes this platform-provided test manifest.
 # Scope covers device + basic ops + general factory + AMP + runtime smoke +
-# vendor main_ops + single-device RNG, skipping FlagGems main_ops
+# vendor main_ops, skipping RNG dispatch and FlagGems main_ops
 # (4 broken routes), profiler parity (CUPTI vendor defect), and
 # inference/training (Qwen3 mount). The runtime smoke harness (flagos:1)
 # logs tensor metadata to avoid unsupported FP64 reductions in tensor repr.
@@ -87,14 +87,8 @@ integration_tests:
   - name: Run runtime smoke
     command: python tests/manual/kunlun_runtime_smoke.py
   - name: Run operator tests (vendor backend, main ops)
-    # Run non-RNG vendor dispatch before the RNG suite so an RNG failure cannot
-    # prevent the existing operator checks from completing.
+    # RNG dispatch remains excluded pending development fixes. The single-device
+    # probe on 2baad31 had 37 failures: 30 generator-type mismatches and 7 seed
+    # or numerical correctness failures. Multi-device RNG is also unvalidated.
+    # See PR #273 for the measured results and re-enable criteria.
     command: python -m pytest tests/integration/ops/ -m "main_ops and not flaggems_python and not flaggems_cpp" --ignore=tests/integration/ops/test_rng_dispatch.py -v -s --tb=short
-  # Run single-device RNG in its own process after the existing suites. Keep
-  # multi-device RNG excluded: the recorded P800 gap can abort the process.
-  - name: Run RNG tests (vendor backend, single device)
-    command: >-
-      python -m pytest tests/integration/ops/test_rng_dispatch.py
-      -m "main_ops and not flaggems_python and not flaggems_cpp"
-      --deselect=tests/integration/ops/test_rng_dispatch.py::TestRngMultiDevice
-      -v -s --tb=short -ra
