@@ -85,7 +85,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install platform-agnostic test dependencies
-        run: pip install pytest "transformers>=4.51" setuptools PyYAML
+        run: pip install pytest pytest-json-report==1.5.0 "transformers>=4.51" setuptools PyYAML
 
       - name: Check setup-script syntax
         run: |
@@ -107,6 +107,7 @@ jobs:
             tests/unit/test_ci_matrix.py \
             tests/unit/test_ci_commands.py \
             tests/unit/test_ci_resolution.py \
+            tests/unit/test_flagcicd_reports.py \
             tests/unit/test_ci_version_pins.py \
             tests/unit/test_cupti_runtime_cbid_table.py \
             tests/unit/test_dcu_core_decoupling.py \

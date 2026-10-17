@@ -61,6 +61,10 @@ on:
         required: false
         type: string
         default: ''
+    secrets:
+      FLAGCICD_API_TOKEN:
+        description: Optional token for publishing pytest results to FlagCICD
+        required: false
   # Kept from the per-platform pipelines: a single re-run of one platform, on
   # its own hardware, without dispatching the whole matrix in ci.yml. The
   # timeout and the test manifest come from the config either way.
@@ -194,12 +198,78 @@ jobs:
           # that arrangement.
           cp -a tests pyproject.toml "$TEST_ROOT/"
           printf 'INTEGRATION_WORKDIR=%s\n' "$TEST_ROOT" >> "$GITHUB_ENV"
+          REPORT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-pytest.XXXXXX")
+          printf 'FLAGCICD_REPORT_DIR=%s\n' "$REPORT_DIR" >> "$GITHUB_ENV"
+
+      - name: Install pytest JSON reporting
+        run: python -m pip install pytest-json-report==1.5.0
 
       - name: Run ${{ needs.configuration.outputs.display_name }} integration tests
+        id: integration-tests
         env:
           INTEGRATION_TESTS: ${{ needs.configuration.outputs.integration_tests }}
           INTEGRATION_ENVIRONMENT: ${{ needs.configuration.outputs.integration_environment }}
-        run: python .github/scripts/run_integration_tests.py
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/.github/scripts/pytest_reporting${PYTHONPATH:+:$PYTHONPATH}"
+          export PYTEST_PLUGINS="flagcicd_report${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
+          python .github/scripts/run_integration_tests.py
+
+      # Preserve failed sessions too; reporting never changes the test verdict.
+      - name: Merge pytest reports
+        id: merge-report
+        if: ${{ !cancelled() && steps.integration-tests.outcome != 'skipped' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          REPORT_PLATFORM: ${{ inputs.platform }}
+          TEST_OUTCOME: ${{ steps.integration-tests.outcome }}
+          SOURCE_REPOSITORY: ${{ inputs.checkout_repository || github.repository }}
+          SOURCE_REF: ${{ inputs.checkout_ref || github.sha }}
+        run: >-
+          python .github/scripts/merge_pytest_reports.py
+          --report-dir "$FLAGCICD_REPORT_DIR"
+          --output "$GITHUB_WORKSPACE/pytest-${REPORT_PLATFORM}.json"
+          --platform "$REPORT_PLATFORM" --outcome "$TEST_OUTCOME"
+          --source-repository "$SOURCE_REPOSITORY" --source-ref "$SOURCE_REF"
+
+      - name: Retain pytest reports
+        if: ${{ !cancelled() && steps.integration-tests.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          name: pytest-${{ inputs.platform }}-${{ github.run_attempt }}
+          path: |
+            ${{ github.workspace }}/pytest-${{ inputs.platform }}.json
+            ${{ env.FLAGCICD_REPORT_DIR }}/
+          if-no-files-found: warn
+
+      # A fork diagnostic run still retains reports, without giving its tested
+      # code an upload credential in the same job. Missing tokens are optional.
+      - name: Check FlagCICD upload availability
+        id: flagcicd-auth
+        if: ${{ !cancelled() && steps.merge-report.outcome == 'success' && (inputs.checkout_repository == '' || inputs.checkout_repository == github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        env:
+          FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
+        run: |
+          if [[ -n "$FLAGCICD_API_TOKEN" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::warning::FLAGCICD_API_TOKEN is unavailable; report retained as an artifact.'
+          fi
+
+      - name: Upload pytest report to FlagCICD
+        if: ${{ !cancelled() && steps.flagcicd-auth.outputs.available == 'true' }}
+        uses: flagos-ai/FlagOps/actions/post-pytest-report@v2
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          backend_url: 'https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/'
+          api_token: ${{ secrets.FLAGCICD_API_TOKEN }}
+          report_path: '${{ github.workspace }}/pytest-${{ inputs.platform }}.json'
+          file_type: pytest
+          job_name: integration-tests-${{ inputs.platform }}
+          fail_on_error: 'false'
 
       # Save outside post-job cleanup so the upload has its own deadline.
       # Keep downloaded dependencies even if a later build/test step fails:
