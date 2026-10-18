@@ -43,12 +43,13 @@ def _bash_major():
     return int(out) if out.isdigit() else 0
 
 
-def run_shell(body, **environment):
+def run_shell(body, *, cwd=None, **environment):
     env = os.environ.copy()
     env.update(PYTHONPATH="", PYTHONNOUSERSITE="1")
     env.update(environment)
     return subprocess.run(
         ["bash", "-c", "set -euo pipefail\n" + body],
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -74,7 +75,15 @@ def fake_build_tools(site, *, editable=True, frontend=True):
     "editable,frontend,usable",
     [(True, True, True), (False, True, False), (True, False, False)],
 )
-def test_build_tools_require_real_imports(tmp_path, editable, frontend, usable):
+@pytest.mark.parametrize("built_checkout", [False, True])
+def test_build_tools_require_real_imports(
+    tmp_path, monkeypatch, editable, frontend, usable, built_checkout
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    if built_checkout:
+        (checkout / "build").mkdir()
+    monkeypatch.chdir(checkout)
     root = tmp_path / "venv"
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(root)], check=True
@@ -84,6 +93,8 @@ def test_build_tools_require_real_imports(tmp_path, editable, frontend, usable):
     result = run_shell(
         shell_function("musa_validate_build_tools")
         + '\nmusa_validate_build_tools\necho "AUTOLOAD=$TORCH_DEVICE_BACKEND_AUTOLOAD"',
+        # Do not import the checkout's build/ directory as a namespace package.
+        cwd=tmp_path,
         VENV_PYTHON=str(root / "bin/python"),
         TORCH_DEVICE_BACKEND_AUTOLOAD="1",
     )
@@ -225,14 +236,34 @@ def test_venv_reuse_requires_isolation(tmp_path, condition, usable):
         ("missing_metadata", False),
     ],
 )
-def test_flaggems_reuse_requires_published_version(tmp_path, condition, reuse):
-    dist = tmp_path / "flag_gems-5.4.0.dist-info"
+@pytest.mark.parametrize("ambient_flaggems", [False, True])
+def test_flaggems_reuse_requires_published_version(
+    tmp_path, monkeypatch, condition, reuse, ambient_flaggems
+):
+    if ambient_flaggems:
+        ambient = tmp_path / "ambient-python"
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(ambient)], check=True
+        )
+        ambient_site = next((ambient / "lib").glob("python*/site-packages"))
+        (ambient_site / "flag_gems.py").touch()
+        ambient_dist = ambient_site / "flag_gems-5.3.0.dist-info"
+        ambient_dist.mkdir()
+        (ambient_dist / "METADATA").write_text("Name: flag_gems\nVersion: 5.3.0\n")
+        monkeypatch.setattr(sys, "executable", str(ambient / "bin/python"))
+    # Missing-module cases must not discover the runner's installed FlagGems.
+    root = tmp_path / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(root)], check=True
+    )
+    site = next((root / "lib").glob("python*/site-packages"))
+    dist = site / "flag_gems-5.4.0.dist-info"
     dist.mkdir()
     if condition != "missing_metadata":
         version = "5.3.0" if condition == "different_version" else "5.4.0"
         (dist / "METADATA").write_text(f"Name: flag_gems\nVersion: {version}\n")
     if condition != "missing_module":
-        (tmp_path / "flag_gems.py").touch()
+        (site / "flag_gems.py").touch()
 
     result = run_shell(
         "pip_retry() {\n"
@@ -244,12 +275,12 @@ def test_flaggems_reuse_requires_published_version(tmp_path, condition, reuse):
         + "\n"
         + shell_function("install_flag_gems", COMMON)
         + "\ninstall_flag_gems",
-        VENV_PYTHON=sys.executable,
-        PYTHONPATH=str(tmp_path),
+        cwd=tmp_path,
+        VENV_PYTHON=str(root / "bin/python"),
         FLAGGEMS_VERSION="5.4.0",
         FLAGGEMS_INDEX_URL="https://example.invalid/mthreads/simple",
         STUB_METADATA=str(dist / "METADATA"),
-        STUB_MODULE=str(tmp_path / "flag_gems.py"),
+        STUB_MODULE=str(site / "flag_gems.py"),
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert ("INSTALL_REQUESTED" not in result.stdout) == reuse
