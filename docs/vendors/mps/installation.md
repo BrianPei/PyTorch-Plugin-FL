@@ -2,10 +2,9 @@
 
 The MPS platform targets Apple Silicon through Metal. It ships the **device
 runtime floor** -- real device memory, real Metal streams and events,
-host/device copies and synchronization -- plus the first two stages of the
-MPSGraph operator layer, so a small set of aten ops runs on the GPU and
-everything else reaches `cpu_fallback`. See [Current status](#current-status)
-below for what that set is.
+host/device copies and synchronization -- plus the MPSGraph operator layer, so a
+set of aten ops runs on the GPU and everything else reaches `cpu_fallback`. See
+[Current status](#current-status) below for what that set is.
 
 ## Supported target
 
@@ -101,23 +100,33 @@ Stages 0-2 of
 landed: the 28-function C ABI plus the allocator, and the `unary`, `binary`,
 `binary_scalar` and `reduce` categories of the MPSGraph operator layer -- nine
 aten ops: `abs`; `add`/`sub`/`mul` over two tensors and over a tensor and a host
-scalar (with aten's `alpha`); and `sum.dim_IntList`/`mean.dim`. Those nine are
-claimed on the `PrivateUse1` `mps` slot by `csrc/aten/register.cc`, and
-`torch_fl/configs/backends_mps.conf` routes exactly them to `mps` and every
-other op to `none`, which is what sends the rest to `cpu_fallback`. The routes
+scalar (with aten's `alpha`); and `sum.dim_IntList`/`mean.dim`. Stage 3 has
+added the `gemm` category (`mm`, `bmm`), the `softmax` category (`_softmax`)
+and two elementwise unaries (`neg`, `pow.Tensor_Scalar`) for fourteen in all.
+Those fourteen are claimed on the `PrivateUse1` `mps` slot by
+`csrc/aten/register.cc`, and `torch_fl/configs/backends_mps.conf` routes exactly
+them to `mps` and every other op to `none`, which is what sends the rest to
+`cpu_fallback`. The routes
 are generated from `csrc/aten/backends/mps/generated/mps_register.inc`, so the
 conf cannot name an op the operator library does not register.
 `torch_fl/accelerator/mps/` holds `mps_stream.py`, the stream/event wrappers
 `torch.flagos.Stream` dispatches to.
 
-Results are correct on every op: the accelerated nine are compared against the
+Results are correct on every op: the accelerated fourteen are compared against the
 CPU reference in `tests/integration/ops/test_mps_unary.py`,
-`test_mps_binary.py` and `test_mps_reduce.py`, and a case their kernels decline
-takes the CPU round-trip rather than a wrong answer. Stage 3 (gemm/matmul, conv,
-softmax -- the lanes a small model needs) is the next increment. A platform
-whose GPU never runs a kernel is a "Runtime only" row, not operator support;
-nine ops is operator support for the unary, elementwise and reduction families
-and nothing more.
+`test_mps_binary.py`, `test_mps_reduce.py`, `test_mps_gemm.py`,
+`test_mps_softmax.py` and `test_mps_pow.py`, and a case their kernels decline
+takes the CPU round-trip rather than a wrong answer. The
+`gemm` kernels serve `nn.Linear` by keeping `weight.t()` in the graph rather
+than copying it: a transposed last two axes over dense memory is recognised and
+handed to MPSGraph's transpose node, which measured free next to the copy it
+replaces. `conv` is the last lane of stage 3. A platform whose GPU
+never runs a kernel is a "Runtime only" row, not operator support; fourteen ops
+is operator support for the unary, elementwise, reduction, matrix-product and
+softmax families and nothing more. Note that `softmax.int` is not among them and
+cannot be: it is `CompositeImplicitAutograd` on this PyTorch build, so the
+dispatcher decomposes it before any backend key is consulted. `_softmax` -- what
+`torch.softmax` and SDPA lower to -- is the spelling that runs.
 
 ## MPSGraph answers measured on an M5
 

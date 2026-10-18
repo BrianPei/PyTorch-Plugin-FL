@@ -207,6 +207,8 @@ def main():
         test_environment = command_environment.copy()
         for key, value in test.get("environment", {}).items():
             test_environment[key] = os.path.expandvars(value)
+        if test_environment.get("FLAGCICD_REPORT_DIR"):
+            test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
         allow_crash = teardown_crash_allowed(test_environment)
         returncode, output = run_command(test["command"], test_environment, workdir)
         ok, tolerated = classify_command_result(returncode, output, allow_crash)

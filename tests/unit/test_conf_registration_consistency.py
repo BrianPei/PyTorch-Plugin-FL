@@ -344,15 +344,25 @@ def test_mps_conf_is_a_generated_full_coverage_conf():
         "backends_mps.conf may only route ops to 'mps' or 'none'"
     )
     # One op per MPSGraph category the codegen emits (unary, binary,
-    # binary_scalar, reduce). A category whose entry silently dropped would leave
-    # its ops on cpu_fallback and be invisible in a count-only check.
+    # binary_scalar, reduce, gemm, softmax, pow_scalar). A category whose entry
+    # silently dropped would leave its ops on cpu_fallback and be invisible in a
+    # count-only check. Both mm and bmm are listed because the gemm category
+    # emits one kernel per op: a rank guard that reached one of them and not the
+    # other is exactly what a single representative case would miss. ``neg`` is
+    # the second op of the ``unary`` category -- the same template, so it is the
+    # category's registration that a representative would otherwise not cover.
     for op in (
         "abs",
+        "neg",
         "add.Tensor",
         "sub.Scalar",
         "mul.Tensor",
         "mean.dim",
         "sum.dim_IntList",
+        "_softmax",
+        "pow.Tensor_Scalar",
+        "mm",
+        "bmm",
     ):
         assert routes.get(op) == "mps", f"the {op} kernel must be routed to mps"
 
@@ -408,9 +418,19 @@ def test_conf_route_counts_are_stable():
     expected = {
         # mm and mm.out moved from the aclnn route to flaggems; see
         # NATIVE_TRITON_GAPS in scripts/codegen/gen_vendor_confs.py.
-        "ascend": {"flaggems": 223, "none": 1659, "ascend": 155},
+        #
+        # flip moved from the flaggems route to ascend for the same reason;
+        # the FlagTree 0.7.0 Ascend MLIR pipeline cannot lower the rank-2
+        # copy_func kernel the FlagGems `_ascend` flip override builds.
+        "ascend": {"flaggems": 221, "none": 1659, "ascend": 157},
         "bpu": {},
-        "cuda": {"flaggems": 416, "cuda": 1618},
+        # 24 ops moved from flaggems to cuda: the conf writer now excludes
+        # flaggems_recursive_fallback | flaggems_runtime_broken, which it could
+        # not see before the sets were moved above the emitter. On a boxing-off
+        # wheel -- the default -- GetFn(kCuda) degrades to the FlagGems Python
+        # path, so this is a no-op there; on a FLAGOS_BUILD_BOXING=ON wheel the
+        # ops now reach their boxing kernel instead of the FlagGems route.
+        "cuda": {"flaggems": 392, "cuda": 1642},
         "dcu": {"flaggems": 454, "cuda": 1583},
         # embedding and embedding.out gained a native topsaten kernel and now
         # route to gcu instead of falling through to none; see
@@ -419,7 +439,12 @@ def test_conf_route_counts_are_stable():
         # cat is the exception to the cat-flaggems reroute: the FlagGems route
         # does not compile on this vendor, so NATIVE_TRITON_GAPS["gcu"] keeps it
         # on the gcu kernel. See the entry in scripts/codegen/gen_vendor_confs.py.
-        "gcu": {"none": 1603, "gcu": 181, "flaggems": 253},
+        #
+        # rsub.Scalar / rsub.Tensor moved flaggems -> gcu: FlagGems' rsub Triton
+        # kernel is rejected by the Enflame front end (64-bit data type not
+        # supported on GCU300), so they are served by the native topsaten kernel
+        # instead. See NATIVE_TRITON_GAPS["gcu"].
+        "gcu": {"none": 1603, "gcu": 183, "flaggems": 251},
         # kunlunxin is a native vendor backend: every op routes to the vendor
         # XPU SDK (``kunlunxin``) or is left at ``none`` -- there is no ``cuda``
         # route.  The count is exactly what
@@ -445,11 +470,16 @@ def test_conf_route_counts_are_stable():
         # the native .inc, since a second m.impl in the same PrivateUse1 body is a
         # duplicate-registration error. See _derived_iluvatar_counts().
         "iluvatar": _derived_iluvatar_counts(),
-        # MPS is a native vendor backend at stage 2: the codegen'd
+        # MPS is a native vendor backend at stage 3: the codegen'd
         # mps_register.inc claims the MPSGraph kernels the ``unary``, ``binary``,
-        # ``binary_scalar`` and ``reduce`` categories generate (9 ops so far), so
-        # the conf routes those to ``mps`` and every other op to ``none``.
-        "mps": {"mps": 9, "none": 2028},
+        # ``binary_scalar``, ``reduce``, ``gemm``, ``softmax`` and ``pow_scalar``
+        # categories generate (14 ops so far -- stage 3 added ``mm``/``bmm`` and
+        # then ``_softmax``, ``neg`` and ``pow.Tensor_Scalar``), so the conf
+        # routes those to ``mps`` and every other op to ``none``. The
+        # ``softmax`` category is registered under ``_softmax`` alone because
+        # ``softmax.int`` is CompositeImplicitAutograd and never reaches a
+        # backend key; see scripts/codegen/codegen_mps.py.
+        "mps": {"mps": 14, "none": 2023},
         "tsingmicro": {"flaggems": 51, "flagos_python": 2, "tsingmicro": 14},
     }
     for platform, exp in expected.items():

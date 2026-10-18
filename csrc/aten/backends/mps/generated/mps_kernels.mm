@@ -7,10 +7,11 @@
 // MPSGraph against the runtime's shared MTLBuffers, schedules the graph on the
 // current flagos stream's command queue and returns the output it allocated; a
 // case the graph cannot answer exactly takes the CPU round-trip. The graph
-// itself is compiled once per (body, operand shapes and dtypes) and reused, so
-// the per-call cost is a schedule rather than a graph construction -- see the
-// plan cache in mps_common.mm. Dispatchers are declared in generated/ops.h
-// (shared with the CUDA codegen); here we only fill the Backend::kMps slot.
+// itself is compiled once per (body, operand shapes, dtypes and layouts) and
+// reused, so the per-call cost is a schedule rather than a graph construction;
+// the plan cache that does it is in mps_common.mm. Dispatchers are declared in
+// generated/ops.h (shared with the CUDA codegen); here we only fill the
+// Backend::kMps slot.
 //
 // Nothing below re-tags a tensor onto DispatchKey::MPS or CUDA: the tensors stay
 // on PrivateUse1 and the runtime's shared MTLBuffers are described to MPSGraph
@@ -27,11 +28,16 @@
 #include "../../../generated/ops.h"
 #include <ATen/ExpandUtils.h>
 #include <ATen/core/Tensor.h>
+#include <ATen/ops/_softmax.h>
 #include <ATen/ops/abs.h>
 #include <ATen/ops/add.h>
+#include <ATen/ops/bmm.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/mean.h>
+#include <ATen/ops/mm.h>
 #include <ATen/ops/mul.h>
+#include <ATen/ops/neg.h>
+#include <ATen/ops/pow.h>
 #include <ATen/ops/sub.h>
 #include <ATen/ops/sum.h>
 #include <c10/core/ScalarType.h>
@@ -370,5 +376,208 @@ at::Tensor MeanDimKernelMps(
 }
 
 REGISTER_IMPL_TO_DISPATCHER(MeanDimFn, mean_dim_dispatcher, Backend::kMps, MeanDimKernelMps)
+
+at::Tensor PrivSoftmaxKernelMps(
+    const at::Tensor& self,
+    int64_t dim,
+    bool half_to_float) {
+  at::ScalarType out_dtype = at::kFloat;
+  int64_t axis = 0;
+  if (!mps::MpsSoftmaxDim(self, dim, &axis) ||
+      !mps::MpsSupportsSoftmaxDtype(self.scalar_type(), half_to_float, &out_dtype)) {
+    return at::_softmax(self.cpu(), dim, half_to_float).to(self.device());
+  }
+  at::Tensor self_c = self.to(out_dtype).contiguous();
+  if (self_c.numel() == 0) {
+    return at::empty(self_c.sizes(), self_c.options());
+  }
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("_softmax", axis),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph softMaxWithTensor:args[0] axis:axis name:nil];
+      });
+  if (!ran) {
+    return at::_softmax(self.cpu(), dim, half_to_float).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(PrivSoftmaxFn, priv_softmax_dispatcher, Backend::kMps, PrivSoftmaxKernelMps)
+
+at::Tensor NegKernelMps(const at::Tensor& self) {
+  if (!mps::MpsSupportsUnaryDtype(self.scalar_type())) {
+    return at::neg(self.cpu()).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("neg"),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph negativeWithTensor:args[0] name:nil];
+      });
+  if (!ran) {
+    return at::neg(self.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(NegFn, neg_dispatcher, Backend::kMps, NegKernelMps)
+
+at::Tensor PowTensorScalarKernelMps(const at::Tensor& self, const at::Scalar& other) {
+  if (!mps::MpsSupportsPowDtype(self.scalar_type(), other)) {
+    return at::pow(self.cpu(), other).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("pow.Tensor_Scalar", other),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return mps::MpsPowByScalar(
+            graph, args[0], other, self_c.scalar_type());
+      });
+  if (!ran) {
+    return at::pow(self.cpu(), other).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(PowTensorScalarFn, pow_tensor_scalar_dispatcher, Backend::kMps, PowTensorScalarKernelMps)
+
+at::Tensor MmKernelMps(const at::Tensor& self, const at::Tensor& mat2) {
+  if (!mps::MpsSupportsGemmDtype(self.scalar_type(), mat2.scalar_type())) {
+    return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  if (self.dim() != 2 || mat2.dim() != 2 ||
+      self.size(-1) != mat2.size(-2)) {
+    return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  // Empty for mm, which has no batch dimension, and aten's equal-batch rule for
+  // bmm.
+  for (int64_t dim = 0; dim + 2 < self.dim(); ++dim) {
+    if (self.size(dim) != mat2.size(dim)) {
+      return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+    }
+  }
+  std::vector<int64_t> out_shape(self.sizes().vec());
+  out_shape.back() = mat2.size(-1);
+  at::Tensor out = at::empty(out_shape, self.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  if (self.numel() == 0 || mat2.numel() == 0) {
+    return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  const mps::MpsGemmOperand self_operand = mps::MpsGemmOperandOf(self);
+  const mps::MpsGemmOperand mat2_operand = mps::MpsGemmOperandOf(mat2);
+  const bool self_transposed = self_operand.transposed;
+  const bool mat2_transposed = mat2_operand.transposed;
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("mm", self_transposed, mat2_transposed),
+      {self_operand.buffer, mat2_operand.buffer},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        // The operands arrive at the shape their own buffers hold, so a
+        // transposed one is put back the way the operand presents itself before
+        // the product.
+        MPSGraphTensor* primary = args[0];
+        MPSGraphTensor* secondary = args[1];
+        if (self_transposed) {
+          const NSUInteger last = (NSUInteger)primary.shape.count;
+          primary = [graph transposeTensor:primary
+                                 dimension:last - 2
+                             withDimension:last - 1
+                                      name:nil];
+        }
+        if (mat2_transposed) {
+          const NSUInteger last = (NSUInteger)secondary.shape.count;
+          secondary = [graph transposeTensor:secondary
+                                   dimension:last - 2
+                               withDimension:last - 1
+                                        name:nil];
+        }
+        return [graph matrixMultiplicationWithPrimaryTensor:primary secondaryTensor:secondary name:nil];
+      });
+  if (!ran) {
+    return at::mm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(MmFn, mm_dispatcher, Backend::kMps, MmKernelMps)
+
+at::Tensor BmmKernelMps(const at::Tensor& self, const at::Tensor& mat2) {
+  if (!mps::MpsSupportsGemmDtype(self.scalar_type(), mat2.scalar_type())) {
+    return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  if (self.dim() != 3 || mat2.dim() != 3 ||
+      self.size(-1) != mat2.size(-2)) {
+    return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  // Empty for mm, which has no batch dimension, and aten's equal-batch rule for
+  // bmm.
+  for (int64_t dim = 0; dim + 2 < self.dim(); ++dim) {
+    if (self.size(dim) != mat2.size(dim)) {
+      return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+    }
+  }
+  std::vector<int64_t> out_shape(self.sizes().vec());
+  out_shape.back() = mat2.size(-1);
+  at::Tensor out = at::empty(out_shape, self.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  if (self.numel() == 0 || mat2.numel() == 0) {
+    return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  const mps::MpsGemmOperand self_operand = mps::MpsGemmOperandOf(self);
+  const mps::MpsGemmOperand mat2_operand = mps::MpsGemmOperandOf(mat2);
+  const bool self_transposed = self_operand.transposed;
+  const bool mat2_transposed = mat2_operand.transposed;
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("bmm", self_transposed, mat2_transposed),
+      {self_operand.buffer, mat2_operand.buffer},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        // The operands arrive at the shape their own buffers hold, so a
+        // transposed one is put back the way the operand presents itself before
+        // the product.
+        MPSGraphTensor* primary = args[0];
+        MPSGraphTensor* secondary = args[1];
+        if (self_transposed) {
+          const NSUInteger last = (NSUInteger)primary.shape.count;
+          primary = [graph transposeTensor:primary
+                                 dimension:last - 2
+                             withDimension:last - 1
+                                      name:nil];
+        }
+        if (mat2_transposed) {
+          const NSUInteger last = (NSUInteger)secondary.shape.count;
+          secondary = [graph transposeTensor:secondary
+                                   dimension:last - 2
+                               withDimension:last - 1
+                                        name:nil];
+        }
+        return [graph matrixMultiplicationWithPrimaryTensor:primary secondaryTensor:secondary name:nil];
+      });
+  if (!ran) {
+    return at::bmm(self.cpu(), mat2.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(BmmFn, bmm_dispatcher, Backend::kMps, BmmKernelMps)
 
 } // namespace at::native::flagos

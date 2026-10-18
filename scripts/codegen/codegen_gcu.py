@@ -130,6 +130,13 @@ OPS = {
     "div.Scalar": ("binary_scalar_as_tensor", None),
     "add.Scalar": ("binary_scalar_alpha_as_tensor", None),
     "sub.Scalar": ("binary_scalar_alpha_as_tensor", None),
+    # ---- rsub: the reflected form, with its own topsaten entry point --------
+    # See T_BINARY_RSUB_SCALAR. `rsub.Tensor` has no FlagGems route to close --
+    # `rsub.Scalar` is what a generation loop calls -- but the two share a
+    # signature and a kernel body, so claiming both keeps the family consistent
+    # and costs one more template instantiation.
+    "rsub.Scalar": ("binary_rsub_scalar", None),
+    "rsub.Tensor": ("binary_rsub", None),
     # ---- binary_scalar_cmp: Tensor + Scalar -> bool ----
     "eq.Scalar": ("binary_scalar_cmp", None),
     "ne.Scalar": ("binary_scalar_cmp", None),
@@ -902,6 +909,76 @@ at::Tensor {kernel}(const at::Tensor& self, const at::Scalar& other, const at::S
   gcu::TopsatenTensorWrapper t_other(other_t);
   gcu::TopsatenTensorWrapper t_out(out);
   EXEC_TOPSATEN_CMD({tops}, self, t_out.get(), t_self.get(), t_other.get(), t_alpha);
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kGcu, {kernel})
+"""
+)
+
+# `rsub` -- the reflected `other - self` -- is not merely another spelling of
+# `sub` for this vendor: `topsatenRsub` is its own entry point, and the operand
+# order it takes is the reflected one (output = rhs - lhs * alpha), so serving it
+# through T_BINARY_SCALAR_ALPHA would compute `self - other * alpha` instead.
+#
+# The angle that is easy to miss is the *sync* one. `rsub.Scalar` is an ATen
+# structured op with no composite decomposition registered, so it has to have a
+# kernel of its own -- there is nothing to fall through to. Without one, gapping
+# the FlagGems route leaves no route at all: the conf lands on `gcu` (see the
+# NATIVE_TRITON_GAPS entry), PrivateUse1 has no kernel behind it, and the call
+# raises `rsub.Scalar: backend not registered`. Measured exactly that with
+# `FLAGOS_OP_rsub__Scalar=gcu` before this kernel existed.
+#
+# The measured failure it fixes: FlagGems' `rsub` Triton kernel is rejected by
+# GCU300 for an integral operand ("64-bit data type not supported on GCU300!"
+# out of triton/backends/enflame/toolkit.py:146, from
+# flag_gems/ops/rsub.py:45), which is every step of a generation loop --
+# `1 - unfinished_sequences` over the int64 mask transformers builds at
+# generation/utils.py. Belt-and-braces with the gap: the gap reroutes, and this
+# kernel is what the rerouted call reaches.
+#
+# The scalar is staged as a device tensor rather than passed to the
+# `const topsatenScalar_t&` overload: T_BINARY_SCALAR_ALPHA, which uses that
+# overload, is the one template in this file with no call site -- the
+# tensor-staged variants are what the shipped scalar arithmetic routes to, so a
+# new op follows the measured-working form rather than the untested one.
+T_BINARY_RSUB_SCALAR = (
+    """\
+at::Tensor {kernel}(const at::Tensor& self, const at::Scalar& other, const at::Scalar& alpha) {{
+  if (!gcu::TopsatenSupportsDtype(self.scalar_type()) ||
+      !gcu::TopsatenSupportsDtype(at::result_type(self, other))) {{
+    return at::{at_op}(self.cpu(), other, alpha).to(self.device());
+  }}
+"""
+    + _SCALAR_AS_TENSOR_PROLOGUE
+    + """\
+  auto t_alpha = gcu::ToTopsatenScalar(alpha, result_dtype);
+
+  gcu::TopsatenTensorWrapper t_self(self_c);
+  gcu::TopsatenTensorWrapper t_other(other_t);
+  gcu::TopsatenTensorWrapper t_out(out);
+  EXEC_TOPSATEN_CMD({tops}, self, t_out.get(), t_other.get(), t_self.get(), t_alpha);
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kGcu, {kernel})
+"""
+)
+
+T_BINARY_RSUB = (
+    """\
+at::Tensor {kernel}(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {{
+"""
+    + _binary_dtype_guard(_binary_host_fallback("{at_op}", alpha=True))
+    + _BINARY_PROLOGUE
+    + """\
+  auto out = at::empty(out_shape, self.options().dtype(result_dtype));
+  auto t_alpha = gcu::ToTopsatenScalar(alpha, result_dtype);
+
+  gcu::TopsatenTensorWrapper t_self(self_b);
+  gcu::TopsatenTensorWrapper t_other(other_b);
+  gcu::TopsatenTensorWrapper t_out(out);
+  EXEC_TOPSATEN_CMD({tops}, self, t_out.get(), t_other.get(), t_self.get(), t_alpha);
   return out;
 }}
 
@@ -2391,7 +2468,12 @@ T_LAYER_NORM = """\
     const ::std::optional<at::Tensor>& weight,
     const ::std::optional<at::Tensor>& bias,
     double eps) {{
-  if (!gcu::TopsatenSupportsDtype(input.scalar_type())) {{
+  if (!gcu::TopsatenSupportsDtype(input.scalar_type()) ||
+      !input.is_privateuseone() ||
+      (weight.has_value() && weight->defined() &&
+       weight->device() != input.device()) ||
+      (bias.has_value() && bias->defined() &&
+       bias->device() != input.device())) {{
     auto r = at::{at_op}(
         input.cpu(),
         normalized_shape,
@@ -2415,11 +2497,13 @@ T_LAYER_NORM = """\
   auto mean = at::empty(stat_shape, input_c.options());
   auto rstd = at::empty(stat_shape, input_c.options());
 
+  // Moved onto input's device: an unmoved CPU weight would reach topsaten
+  // through the raw-pointer wrapper as device memory (#526).
   auto w = weight.has_value() && weight->defined()
-      ? weight->contiguous()
+      ? weight->to(input_c.device()).contiguous()
       : at::ones(normalized_shape, input_c.options());
   auto b = bias.has_value() && bias->defined()
-      ? bias->contiguous()
+      ? bias->to(input_c.device()).contiguous()
       : at::zeros(normalized_shape, input_c.options());
 
   gcu::TopsatenSizeWrapper t_shape(normalized_shape);
@@ -2588,7 +2672,10 @@ at::Tensor {kernel}(
     at::IntArrayRef output_padding,
     int64_t groups) {{
   if (!gcu::TopsatenSupportsDtype(input.scalar_type()) ||
-      !gcu::TopsatenSupportsDtype(weight.scalar_type()) || transposed) {{
+      !gcu::TopsatenSupportsDtype(weight.scalar_type()) || transposed ||
+      !input.is_privateuseone() || !weight.is_privateuseone() ||
+      (bias.has_value() && bias->defined() &&
+       bias->device() != input.device())) {{
     auto r = at::convolution(
         input.cpu(), weight.cpu(),
         bias.has_value() && bias->defined()
@@ -2607,7 +2694,7 @@ at::Tensor {kernel}(
   // topsaten has no "absent bias" sentinel usable from here, so a zero bias
   // reproduces the unbiased result.
   at::Tensor bias_c = bias.has_value() && bias->defined()
-      ? bias->contiguous()
+      ? bias->to(input_c.device()).contiguous()
       : at::zeros({{weight_c.size(0)}}, weight_c.options());
 
   gcu::TopsatenTensorWrapper t_out(out);
@@ -3394,6 +3481,8 @@ CATEGORIES = {
     "binary_scalar_alpha": T_BINARY_SCALAR_ALPHA,
     "binary_scalar_as_tensor": T_BINARY_SCALAR_AS_TENSOR,
     "binary_scalar_alpha_as_tensor": T_BINARY_SCALAR_ALPHA_AS_TENSOR,
+    "binary_rsub_scalar": T_BINARY_RSUB_SCALAR,
+    "binary_rsub": T_BINARY_RSUB,
     "binary_scalar_cmp": T_BINARY_SCALAR_CMP,
     "matmul": T_MATMUL,
     "matmul_out": T_MATMUL_OUT,

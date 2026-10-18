@@ -27,7 +27,7 @@ Operator tests (`tests/integration/ops/`) use markers to select backend-specific
 |--------|---------|-------------|
 | `main_ops` | Representative operator in the CI smoke subset | Applied to frequently-used ops (add, matmul, conv, etc.) for fast feedback |
 | `anyplatform` | Runs on any accelerator backend | Device-agnostic tests (operator registration, dispatch routing) |
-| `cuda` | Requires a CUDA boxing build (`FLAGOS_BUILD_BOXING=1`) or NVIDIA hardware | Tests asserting `-> cuda` backend routing |
+| `cuda` | Requires a CUDA boxing build (`FLAGOS_BUILD_BOXING=1`); the default FlagGems-primary wheel has no `cuda` route, so the CUDA lane skips these | Tests asserting `-> cuda` backend routing |
 | `metax` | Requires MetaX C++ (mxcc) backend | Tests asserting `-> metax` backend routing; skipped on MetaX (its lane builds the boxing wheel) |
 | `ascend` | Requires Ascend ACL backend | Tests asserting `-> ascend` backend routing |
 | `musa` | Requires Moore Threads MUSA backend | Tests asserting `-> musa` backend routing |
@@ -374,3 +374,49 @@ instead of being silently omitted. `build-wheel.yml` -- the one parameterized wh
 calls, remain for release/manual wheel builds only; they do not run integration tests.
 `wheel_artifact_name` is used by those build callers, while hardware CI builds and tests its wheel
 in the same job.
+
+## FlagCICD pytest reports
+
+Each selected hardware job collects native `pytest-json-report` JSON from its
+pytest processes and merges it into `pytest-<platform>.json` in the checkout.
+The upload action's `report_path` names this generated file; `file_type` is
+`pytest`. Both the service upload and artifact retention use a checkout-relative
+report path so job containers resolve the generated file inside their mounted
+workspace rather than using the runner host's checkout path from
+`${{ github.workspace }}`. This reports test executions and outcomes, not Python
+line/branch coverage or a percentage of supported operators. Repeated cases in
+different groups remain separate executions, annotated with group/session metadata.
+
+Collection is scoped to the hardware test step through `PYTEST_PLUGINS` and an
+absolute report directory. Every pytest invocation gets a unique file, including
+DCU's per-file unit runs. The collector removes its activation from each pytest
+process's child environment so intentionally failing subprocess fixtures do not
+pollute the platform result. It adds only its own helper directory to
+`PYTHONPATH`, retaining tests against the installed wheel in the isolated cwd.
+
+Completed reports survive a later group failure. Missing or truncated session
+reports are recorded under `flagcicd.incomplete_sessions`; no passing cases are
+invented for a killed process or an unexecuted group. The integration step's
+outcome remains authoritative, including failures in non-pytest checks and the
+existing opt-in teardown-crash policy. `flagcicd.complete` describes the started
+pytest sessions only, not whether every configured group ran. Failure before any
+pytest session produces no merged report. Cancelled jobs do not attempt uploads.
+
+Raw session files and the merged report are retained as
+`pytest-<platform>-<run_attempt>` workflow artifacts. Reporting and upload steps
+have bounded timeouts and do not turn failed tests into successful CI. The
+organization/repository secret `FLAGCICD_API_TOKEN` is passed explicitly from
+`ci.yml` to the reusable integration workflow. An absent token skips the service
+upload with a warning; it does not prevent report generation or artifact retention.
+Fork PRs and the trusted fork diagnostic route retain artifacts but skip the
+credentialed upload in the job executing fork code.
+
+The uploader posts to
+`https://flagcicd.flagos.net/flagcicd/api/v1/cicd/metrics/`, uses a
+platform-specific `job_name`, and treats transport/service errors as warnings.
+Job containers use their configured DNS and must be able to reach that HTTPS
+endpoint with normal TLS certificate validation. No FlagCICD-specific hosts-file
+mapping is injected into the containers.
+Validate the upload's HTTP response and the corresponding FlagCICD record: a
+green workflow alone does not prove ingestion. Backend parsing and dashboard
+interpretation of the merged report require an actual authenticated upload.
