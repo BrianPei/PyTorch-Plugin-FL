@@ -66,8 +66,9 @@ def test_iluvatar_rejects_runtime_only_assets_for_native_build(monkeypatch, tmp_
 
 
 def test_iluvatar_manifest_records_native_abi_separately_from_cpu_frontend(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, clean_kernel_env
 ):
+    """Describe Iluvatar defaults without inheriting another runner's switches."""
     monkeypatch.setenv("FLAGOS_ACCELERATOR", "iluvatar")
     namespace, _ = _load_setup(monkeypatch)
     root = tmp_path / "src"
