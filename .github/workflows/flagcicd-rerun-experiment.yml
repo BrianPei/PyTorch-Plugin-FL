@@ -1,0 +1,21 @@
+name: FlagCICD fork rerun experiment
+
+on:
+  push:
+    branches: [experiment/flagcicd-rerun-20261020]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  rerun-cancelled-task:
+    if: github.repository == 'BrianPei/PyTorch-Plugin-FL'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Rerun the cancelled acceptance task without cancelling it again
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_REPOSITORY: ${{ github.repository }}
+        run: gh api --method POST "repos/$ACCEPTANCE_REPOSITORY/actions/runs/39283575199/rerun"
