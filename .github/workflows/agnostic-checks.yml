@@ -143,3 +143,8 @@ jobs:
             tests/unit/test_release_publishing.py \
             tests/unit/test_wheel_preflight.py \
             -v --tb=short -p no:cacheprovider
+
+      # A trusted dispatch can test a source commit from before this entry existed.
+      - name: Run FlagCICD entry contract tests
+        if: hashFiles('tests/unit/test_flagcicd_entry.py') != ''
+        run: python -m pytest tests/unit/test_flagcicd_entry.py -v --tb=short -p no:cacheprovider
