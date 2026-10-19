@@ -539,6 +539,62 @@ def test_report_clis_retain_failed_execution_and_summary(tmp_path):
     assert actual["children"][0]["platform"] == {"name": "cuda"}
 
 
+@pytest.mark.parametrize(
+    "event_name,event,expected",
+    [
+        (
+            "workflow_dispatch",
+            {"inputs": {"task_id": "invalid-level", "parent_run_id": "parent"}},
+            {"task_id": "invalid-level", "parent_run_id": "parent"},
+        ),
+        (
+            "repository_dispatch",
+            {
+                "action": "flagcicd",
+                "client_payload": {"task_id": "invalid-platform", "parent_run_id": "p"},
+            },
+            {"task_id": "invalid-platform", "parent_run_id": "p"},
+        ),
+        (
+            "workflow_dispatch",
+            {"inputs": {"task_id": "unsafe\nvalue", "parent_run_id": "valid"}},
+            {"task_id": "", "parent_run_id": "valid"},
+        ),
+        ("workflow_dispatch", {"inputs": ["invalid"]}, {"task_id": ""}),
+    ],
+)
+def test_failed_plan_summary_keeps_only_safe_request_identity(
+    tmp_path, monkeypatch, event_name, event, expected
+):
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps(event))
+    output = tmp_path / "summary.json"
+    results = {name: {"result": "skipped"} for name in entry_jobs()}
+    results["plan"]["result"] = "failure"
+    for key, value in {
+        "FLAGCICD_PLAN": "",
+        "JOB_RESULTS": json.dumps(results),
+        "GITHUB_EVENT_NAME": event_name,
+        "GITHUB_EVENT_PATH": str(event_path),
+        "GITHUB_REPOSITORY": "example/fork",
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["report", "summary", "--directory", str(tmp_path), "--output", str(output)],
+    )
+    assert REPORTER.main() == 1
+    actual = json.loads(output.read_text())
+    assert actual["status"] == "infra_error"
+    assert actual["repository"] == "example/fork"
+    assert actual["run_id"] == "42"
+    assert actual["source_repository"] == actual["source_sha"] == ""
+    assert all(actual[key] == value for key, value in expected.items())
+
+
 @pytest.mark.parametrize("stage", ["setup", "build", "validate", "install"])
 def test_passing_pytest_cannot_hide_a_skipped_required_stage(tmp_path, stage):
     raw_reports(tmp_path)

@@ -20,6 +20,8 @@ import math
 import os
 from pathlib import Path
 
+from flagcicd_resolve import text as request_text
+
 
 SCHEMA = "flagcicd.report/v1"
 FAILURES = {"build_failed", "test_failed", "infra_error", "cancelled", "report_error"}
@@ -35,6 +37,32 @@ def identity(plan):
             for key in (*IDENTITY, "scope", "risk_level", "task_id", "parent_run_id")
         },
     }
+
+
+def failed_request_identity():
+    """Retain safe correlation IDs when no validated source plan is available."""
+    try:
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+            request = event.get("inputs")
+        elif (
+            os.environ.get("GITHUB_EVENT_NAME") == "repository_dispatch"
+            and event.get("action") == "flagcicd"
+        ):
+            request = event.get("client_payload")
+        else:
+            return {}
+    except (KeyError, OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(request, dict):
+        return {}
+    fields = {}
+    for key in ("task_id", "parent_run_id"):
+        try:
+            fields[key] = request_text(request.get(key, ""), key)
+        except ValueError:
+            continue
+    return fields
 
 
 def one_report(directory, filename):
@@ -285,6 +313,9 @@ def main():
     else:
         report = aggregate(plan, jobs, args.directory, attempt)
         report["run_id"] = os.environ["GITHUB_RUN_ID"]
+        if not plan:
+            report["repository"] = os.environ.get("GITHUB_REPOSITORY", "")
+            report.update(failed_request_identity())
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"FlagCICD {report['report_type']}: {report['status']}")
     return int(report["status"] != "passed")
