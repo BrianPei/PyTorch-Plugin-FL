@@ -6,12 +6,13 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   submit:
     if: github.repository == 'BrianPei/PyTorch-Plugin-FL'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Submit repository dispatch acceptance cases
         env:
@@ -24,18 +25,23 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          revision = 'afbbd0dd3e0f2835f30b9f1389e6f8fa4c8e0ba8'
+          revision = 'fc8e43663d4c9747da613e3739031241d9bd9eea'
           cases = [
               ('external-l0', {'test_level': 'L0', 'platforms': ['kunlunxin']}),
+              ('external-l1', {'test_level': 'L1', 'platforms': ['kunlunxin']}),
               ('invalid-level', {'test_level': 'L4', 'platforms': ['kunlunxin']}),
               ('invalid-platform-array', {'test_level': 'L0', 'platforms': ['cuda,ppu']}),
+              ('lint-failure', {
+                  'test_level': 'L1', 'platforms': ['kunlunxin'],
+                  'checkout_ref': 'experiment/flagcicd-lint-failure-20261020',
+              }),
           ]
           submitted = []
           for name, overrides in cases:
               payload = {
                   'checkout_ref': revision,
                   'base_ref': revision,
-                  'task_id': 'acceptance-' + name + '-20261020',
+                  'task_id': 'acceptance-' + name + '-20261020-v2',
                   'parent_run_id': os.environ['GITHUB_RUN_ID'],
                   **overrides,
               }
@@ -47,10 +53,16 @@ jobs:
                   input=json.dumps(envelope), text=True, check=True,
               )
               submitted.append({'case': name, 'request': envelope})
+          subprocess.run(
+              ['gh', 'api', '--method', 'POST',
+               'repos/' + os.environ['ACCEPTANCE_REPOSITORY'] + '/actions/jobs/118160759137/rerun'],
+              check=True,
+          )
+          submitted.append({'case': 'rerun-l1-summary', 'run_id': '39282549998'})
           Path('acceptance-submissions.json').write_text(json.dumps(submitted, indent=2) + '\n')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
-              summary.write('Submitted three repository_dispatch cases. Submission does not prove execution success.\n')
-              summary.write('Expected: external-l0 passes; invalid-level and invalid-platform-array fail with retained summaries.\n')
+              summary.write('Submitted five repository_dispatch cases and reran the original L1 completion job. Submission does not prove execution success.\n')
+              summary.write('Expected: L0/L1 pass; invalid requests fail with retained task identity; lint-failure reports test_failed; completion rerun retains its source identity.\n')
           PY
       - uses: actions/upload-artifact@v4
         with:
