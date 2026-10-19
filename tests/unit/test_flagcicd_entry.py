@@ -28,6 +28,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / ".github/scripts"
 
+import pathlib as acceptance_unused_import
+
 
 def load(name):
     sys.path.insert(0, str(SCRIPTS))
