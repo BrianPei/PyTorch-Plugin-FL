@@ -1,0 +1,71 @@
+name: FlagCICD fork cancellation experiment
+
+on:
+  push:
+    branches: [experiment/flagcicd-cancel-20261020]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  cancel-experiment:
+    if: github.repository == 'BrianPei/PyTorch-Plugin-FL'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Dispatch and cancel a device-free run after prerequisite checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_REPOSITORY: ${{ github.repository }}
+          ACCEPTANCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = 'repos/' + os.environ['ACCEPTANCE_REPOSITORY']
+          branch = os.environ['ACCEPTANCE_BRANCH']
+          revision = 'fc8e43663d4c9747da613e3739031241d9bd9eea'
+
+          def api(path, payload=None):
+              command = ['gh', 'api', root + path]
+              if payload is not None:
+                  command += ['--method', 'POST', '--input', '-']
+              result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                                      text=True, capture_output=True, check=True)
+              return json.loads(result.stdout) if result.stdout.strip() else None
+
+          api('/actions/workflows/flagcicd-entry.yml/dispatches', {
+              'ref': branch,
+              'inputs': {'checkout_ref': revision, 'base_ref': revision,
+                         'platforms': 'kunlunxin', 'test_level': 'L1',
+                         'task_id': 'acceptance-cancel-20261020',
+                         'parent_run_id': os.environ['GITHUB_RUN_ID']},
+          })
+          deadline = time.monotonic() + 300
+          target = None
+          while time.monotonic() < deadline:
+              if target is None:
+                  runs = api('/actions/runs?event=workflow_dispatch&branch=' + branch + '&per_page=10')['workflow_runs']
+                  target = next((run for run in runs if run['path'] == '.github/workflows/flagcicd-entry.yml'), None)
+              if target is not None:
+                  jobs = api('/actions/runs/' + str(target['id']) + '/jobs?per_page=100')['jobs']
+                  if any(job['name'].startswith('agnostic /') for job in jobs):
+                      api('/actions/runs/' + str(target['id']) + '/cancel', {})
+                      Path('cancel-request.json').write_text(json.dumps({'run_id': target['id'], 'source_sha': revision}) + '\n')
+                      with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                          summary.write('Cancellation requested for run ' + str(target['id']) + '. Inspect its retained report to validate the outcome.\n')
+                      break
+              time.sleep(5)
+          else:
+              raise RuntimeError('The cancellation target did not reach device-free tests within five minutes')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cancellation-request
+          path: cancel-request.json
+          retention-days: 7
