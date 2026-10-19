@@ -290,12 +290,6 @@ def _relink_vendor_libtorch() -> None:
     """
     accel = _build_accelerator()
 
-    if accel == "iluvatar":
-        from torch_fl.accelerator._iluvatar_libtorch import ensure_iluvatar_libtorch
-
-        ensure_iluvatar_libtorch()
-        return
-
     if accel == "metax":
         from torch_fl.accelerator.metax._metax_libtorch_link import (
             ensure_maca_libtorch_links,
@@ -1255,6 +1249,37 @@ def _patch_flaggems_codegen_config():
     # the two, so the build record is the only authoritative key.
     if _build_accelerator() == "iluvatar":
         _env.set_foreign("GEMS_VENDOR", "iluvatar")
+        # FlagGems' _iluvatar descriptor is a copy of its NVIDIA one, so it reads
+        # torch.cuda directly in two places the CPU wheel does not back: the
+        # philox generators behind every generator-less RNG op, and the device
+        # name every op compares its input against.
+        from torch_fl.accelerator.iluvatar._ilu_compat import (
+            _ensure_corex_headers_on_path,
+            install_ilu_cuda_shim,
+            install_ilu_rng_generators,
+            patch_iluvatar_flag_gems_device_name,
+            patch_triton_benchmark_allocator,
+        )
+
+        _ensure_corex_headers_on_path()
+        install_ilu_cuda_shim()
+        install_ilu_rng_generators()
+        # Triton's autotuner flushes the L2 with a buffer it allocates on
+        # "cuda", which this build does not have; without this every autotuned
+        # kernel (layernorm among them) fails before it is benchmarked.
+        try:
+            patch_triton_benchmark_allocator()
+        except Exception:
+            pass
+        try:
+            import flag_gems  # noqa: F401
+        except Exception:
+            pass
+        else:
+            try:
+                patch_iluvatar_flag_gems_device_name()
+            except Exception:
+                pass
         return
 
     # --- Generic NVIDIA CUDA branch (default) ---
@@ -2245,13 +2270,6 @@ def _phase_claim() -> None:
     # Immediately after `import torch`, and before anything relies on CUDA dispatch:
     # confirm the DTK device libraries actually bound to the official core.
     _validate_dcu_decoupled_runtime()
-
-    if _build_accelerator() == "iluvatar":
-        from torch_fl.accelerator._iluvatar_libtorch import (  # noqa: E402
-            restore_iluvatar_cuda_version,
-        )
-
-        restore_iluvatar_cuda_version()
 
     # A self-contained PPU build may front its bundled CUDA-enabled libtorch with
     # the official torch+cpu Python wheel. The actual runtime then supports CUDA

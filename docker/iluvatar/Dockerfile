@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Inspected on the BI-V150 host on 2026-10-16. Unlike runtime 2.3.0, this
-# development stack supplies IX/mapping_cublas.h, ixblasStatus_t and CUDA_R_16BF,
+# development stack supplies IX/mapping_cublas.h, ixblasStatus_t and IX_R_16BF,
 # which the current native Iluvatar backend compiles against.
 # Tag: flagos-dev/vllm-plugin-fl:v0.24.0-iluvatar-ci
 ARG BASE_IMAGE=harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl@sha256:e4272f02f80461edeb130fbce7e20ac213e6c0c69bfbc2fc06fc2a2fe62f3f22
@@ -11,25 +11,14 @@ FROM ${BASE_IMAGE}
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 ARG CPU_TORCH_INDEX_URL=https://mirror.sjtu.edu.cn/pytorch-wheels/cpu
 
-# Preserve only the native build/runtime assets outside Python. The official
-# CPU frontend does not inherit any of the base's Python packages.
-RUN mkdir -p /opt/torch-fl-iluvatar-libtorch/lib /opt/torch-fl-ci \
- && cp -a /usr/local/lib/python3.12/site-packages/torch/include \
-          /usr/local/lib/python3.12/site-packages/torch/share \
-          /opt/torch-fl-iluvatar-libtorch/ \
- && cp -a /usr/local/lib/python3.12/site-packages/torch/lib/*.so* \
-          /opt/torch-fl-iluvatar-libtorch/lib/ \
- && cp /usr/local/lib/python3.12/site-packages/torch/version.py \
-       /opt/torch-fl-iluvatar-libtorch/lib/vendor_version.py \
- && /usr/local/bin/python3.12 -c 'import importlib.metadata as m; print(m.version("torch"))' \
-       > /opt/torch-fl-ci/vendor-torch-version \
+# Isolate the official CPU torch core from the base vendor Python packages.
+RUN mkdir -p /opt/torch-fl-ci \
  && python3.12 -m venv /opt/torch-fl-iluvatar-venv
 ENV VIRTUAL_ENV=/opt/torch-fl-iluvatar-venv \
     PATH=/opt/torch-fl-iluvatar-venv/bin:${PATH} \
     PYTHONPATH= \
     PYTHONNOUSERSITE=1 \
     COREX_PATH=/usr/local/corex \
-    FLAGOS_VENDOR_TORCH_LIB=/opt/torch-fl-iluvatar-libtorch/lib \
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
     FLAGOS_ACCELERATOR=iluvatar \
     FLAGOS_BUILD_VENDOR=1 \
@@ -75,9 +64,9 @@ RUN python /opt/torch-fl-ci/verify.py \
 WORKDIR /workspace
 
 LABEL org.opencontainers.image.title="Torch-FL Iluvatar isolated CPU frontend" \
-      org.opencontainers.image.description="Official CPU torch venv and separate CoreX native assets" \
+      org.opencontainers.image.description="Official CPU torch core, isolated venv and CoreX SDK" \
       org.opencontainers.image.source="https://github.com/flagos-ai/PyTorch-Plugin-FL" \
-      org.opencontainers.image.version="manual-20261016-iluvatar-cpu-dev" \
+      org.opencontainers.image.version="iluvatar-cpu-runtime-dev" \
       org.opencontainers.image.base.name="harbor.baai.ac.cn/flagos-dev/vllm-plugin-fl@sha256:e4272f02f80461edeb130fbce7e20ac213e6c0c69bfbc2fc06fc2a2fe62f3f22" \
       io.flagos.sdk.version="4.5.0" \
       io.flagos.validation="isolated-cpu-frontend-sdk" \

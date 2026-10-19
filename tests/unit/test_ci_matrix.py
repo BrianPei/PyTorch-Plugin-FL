@@ -120,15 +120,24 @@ def test_shared_cuda_runtime_selects_all_consumers():
     assert _run(files="csrc/runtime/accelerator/cuda/device.cc")[1] == [
         "cuda",
         "dcu",
-        "iluvatar",
         "ppu",
     ]
     assert _run(files="csrc/runtime/allocator/backends/cuda_memory.h")[1] == [
         "cuda",
-        "iluvatar",
         "metax",
         "ppu",
     ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "csrc/runtime/accelerator/iluvatar/device.cc",
+        "csrc/runtime/allocator/backends/iluvatar_memory.h",
+    ],
+)
+def test_independent_iluvatar_runtime_selects_only_iluvatar(path):
+    assert _run(files=path)[1] == ["iluvatar"]
 
 
 @pytest.mark.parametrize("platform", PLATFORMS)

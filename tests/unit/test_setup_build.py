@@ -44,28 +44,25 @@ def _load_setup(monkeypatch):
     return namespace, kwargs
 
 
-def test_iluvatar_native_build_uses_separate_corex_assets(monkeypatch, tmp_path):
+def test_iluvatar_native_build_uses_active_cpu_torch(monkeypatch, tmp_path):
     monkeypatch.setenv("FLAGOS_ACCELERATOR", "iluvatar")
-    root = tmp_path / "corex-libtorch"
-    (root / "lib").mkdir(parents=True)
-    config = root / "share/cmake/Torch/TorchConfig.cmake"
-    config.parent.mkdir(parents=True)
-    config.write_text("# CoreX build config\n")
-    monkeypatch.setenv("FLAGOS_VENDOR_TORCH_LIB", str(root / "lib"))
+    # A legacy image variable must not redirect the native build to vendor torch.
+    monkeypatch.setenv("FLAGOS_VENDOR_TORCH_LIB", str(tmp_path / "vendor/lib"))
+    cpu_root = tmp_path / "venv/torch"
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            __file__=str(cpu_root / "__init__.py"),
+            _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True),
+        ),
+    )
     namespace, _ = _load_setup(monkeypatch)
-    # No torch import is needed to find the native SDK: Python can remain CPU-only.
-    assert namespace["get_pytorch_dir"]() == str(root)
+    assert namespace["get_pytorch_dir"]() == str(cpu_root)
+    assert namespace["_torch_cxx11_abi"]() == "1"
 
 
-def test_iluvatar_rejects_runtime_only_assets_for_native_build(monkeypatch, tmp_path):
-    monkeypatch.setenv("FLAGOS_ACCELERATOR", "iluvatar")
-    monkeypatch.setenv("FLAGOS_VENDOR_TORCH_LIB", str(tmp_path / "lib"))
-    namespace, _ = _load_setup(monkeypatch)
-    with pytest.raises(RuntimeError, match="build assets are incomplete"):
-        namespace["get_pytorch_dir"]()
-
-
-def test_iluvatar_manifest_records_native_abi_separately_from_cpu_frontend(
+def test_iluvatar_manifest_records_official_cpu_runtime(
     monkeypatch, tmp_path, clean_kernel_env
 ):
     """Describe Iluvatar defaults without inheriting another runner's switches."""
@@ -89,8 +86,9 @@ def test_iluvatar_manifest_records_native_abi_separately_from_cpu_frontend(
     namespace["_write_compatibility_manifest"]("2.10.0+corex4.5.0")
     manifest = json.loads((root / "torch_fl/compatibility.json").read_text())
     assert manifest["build"]["distributions"]["torch"] == "2.10.0+cpu"
-    assert manifest["build"]["torch_cxx11_abi"] is False
-    assert manifest["build"]["bundle_libdir"] == "lib_iluvatar"
+    assert manifest["build"]["torch_cxx11_abi"] is True
+    assert manifest["build"]["bundle_libdir"] == "lib"
+    assert manifest["build"]["vendor_torch_libraries"] is False
 
 
 @pytest.fixture

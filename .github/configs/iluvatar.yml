@@ -15,13 +15,11 @@ runner_labels:
 paths_watch:
   - torch_fl/accelerator/iluvatar/
   - torch_fl/configs/backends_iluvatar.conf
-  - torch_fl/accelerator/_iluvatar_libtorch.py
   - csrc/aten/backends/iluvatar/
-  - csrc/runtime/accelerator/cuda/
-  - csrc/runtime/allocator/backends/cuda_memory.h
+  - csrc/runtime/accelerator/iluvatar/
+  - csrc/runtime/allocator/backends/iluvatar_memory.h
   - scripts/codegen/codegen_iluvatar.py
   - scripts/codegen/codegen_iluvatar_flaggems.py
-  - scripts/vendor/bundle_iluvatar_libtorch.sh
   - .github/scripts/hooks/set_env_iluvatar.sh
   - .github/scripts/set_env_iluvatar.sh
   - .github/scripts/lib/iluvatar_packages.sh
@@ -73,12 +71,15 @@ wheel_artifact_name: wheel-iluvatar
 
 environment_check:
   torch_version_prefix: "2.10.0+cpu"
-  cuda_version: "10.2"
+  cuda_version: null
   torch_path_prefix: /opt/torch-fl-iluvatar-venv/
   require_package_files:
-    - lib_iluvatar/libc10.so
-    - lib_iluvatar/libtorch_cpu.so
-    - lib_iluvatar/libtorch_cuda.so
+    - lib/libtorch_fl.so
+    - lib/libtorch_bindings.so
+  forbid_package_files:
+    - lib_iluvatar
+    - lib/libtorch_cuda.so
+    - lib/libc10_cuda.so
   cuda_available: true
   cuda_devices:
     exactly: 2

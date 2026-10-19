@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate the isolated CPU frontend and, optionally, an installed wheel."""
+"""Validate the isolated CPU torch core and independent Iluvatar runtime."""
 
 import argparse
 import importlib.metadata
@@ -77,7 +77,7 @@ def verify():
         input=(
             "#include <cublas_v2.h>\n#include <cudnn.h>\n"
             "int main() { ixblasStatus_t s = IXBLAS_STATUS_SUCCESS; "
-            "cudaDataType_t d = CUDA_R_16BF; return int(s) + int(d); }\n"
+            "ixblasDataType_t d = IX_R_16BF; return int(s) + int(d); }\n"
         ),
         text=True,
         check=True,
@@ -99,27 +99,53 @@ def verify():
     print(json.dumps(report, indent=2))
 
 
+def assert_cpu_core(torch_root, package, mappings):
+    """Reject a vendor facade even if Python still reports torch+cpu."""
+    assert not (package / "lib_iluvatar").exists(), package
+    paths = {
+        Path(fields[5]).resolve()
+        for line in mappings.splitlines()
+        if len(fields := line.split(None, 5)) == 6 and fields[5].startswith("/")
+    }
+    core = torch_root / "lib"
+    for name in ("libc10.so", "libtorch_cpu.so", "libtorch_python.so"):
+        expected = (core / name).resolve()
+        assert expected in paths, f"{name} did not load from official CPU torch: {core}"
+        assert all(path == expected for path in paths if path.name == name), (
+            f"A second {name} was loaded outside official CPU torch"
+        )
+    assert not any(
+        path.name.startswith(("libtorch_cuda", "libc10_cuda")) for path in paths
+    ), "Vendor CUDA libtorch was loaded"
+
+
 def verify_runtime():
-    # Run in a fresh interpreter: selecting the vendor runtime must precede
-    # torch. The preceding CPU-only check cannot share its mapped core libs.
-    import torch_fl
+    # Import CPU torch first to prove the runtime needs no core replacement.
     import torch
+    import torch_fl
     import triton
     import triton.language as tl
 
     assert importlib.metadata.version("torch") == "2.10.0+cpu"
     assert torch.__version__ == "2.10.0+cpu", torch.__version__
-    assert not torch._C._GLIBCXX_USE_CXX11_ABI
-    assert torch.version.cuda == "10.2", torch.version.cuda
+    assert torch._C._GLIBCXX_USE_CXX11_ABI
+    assert torch.version.cuda is None, torch.version.cuda
     assert torch_fl.flagos.is_available()
     assert torch.cuda.is_available()
     package = Path(torch_fl.__file__).resolve().parent
+    torch_root = Path(torch.__file__).resolve().parent
     assert package.is_relative_to("/opt/torch-fl-iluvatar-venv"), package
-    bundle = package / "lib_iluvatar"
-    mappings = Path("/proc/self/maps").read_text()
-    for name in ("libc10.so", "libtorch_cpu.so", "libtorch_python.so"):
-        assert str(bundle / name) in mappings, f"{name} did not load from the wheel"
-    assert "/usr/local/lib/python3.12/site-packages/torch/lib/" not in mappings
+    assert torch_root.is_relative_to("/opt/torch-fl-iluvatar-venv"), torch_root
+    assert_cpu_core(torch_root, package, Path("/proc/self/maps").read_text())
+    for library in ("libtorch_fl.so", "libtorch_bindings.so"):
+        dynamic = subprocess.check_output(
+            ["readelf", "-d", str(package / "lib" / library)], text=True
+        )
+        assert "libtorch_cuda" not in dynamic and "libc10_cuda" not in dynamic, dynamic
+    capability = torch.cuda.get_device_capability()
+    assert capability == (7, 1), capability
+    target = triton.runtime.driver.active.get_current_target()
+    assert (target.backend, target.arch, target.warp_size) == ("corex", 71, 64), target
 
     @triton.jit
     def add_kernel(x, y, output, size: tl.constexpr, block: tl.constexpr):
@@ -133,7 +159,7 @@ def verify_runtime():
         )
 
     x_cpu = torch.arange(1025, dtype=torch.float32)
-    x = x_cpu.to("cuda")
+    x = x_cpu.to("flagos")
     output = torch.empty_like(x)
     add_kernel[(triton.cdiv(x.numel(), 256),)](x, x, output, x.numel(), 256)
     torch.cuda.synchronize()
@@ -148,7 +174,8 @@ def verify_runtime():
                 "devices": torch_fl.flagos.device_count(),
                 "triton_add": "passed",
                 "flagos_add": "passed",
-                "runtime_bundle": str(bundle),
+                "cpu_core": str(torch_root / "lib"),
+                "triton_target": str(target),
             },
             indent=2,
         )

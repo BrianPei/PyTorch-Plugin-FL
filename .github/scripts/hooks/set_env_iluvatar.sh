@@ -1,7 +1,7 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# Official CPU torch frontend; CoreX native assets are separate from Python.
+# Official CPU torch core with the independent CoreX C-ABI runtime.
 if [[ ! -x /opt/torch-fl-iluvatar-venv/bin/python || ! -f /opt/torch-fl-ci/verify.py ]]; then
   echo "::error::The Iluvatar CI image is required (/opt/torch-fl-iluvatar-venv and /opt/torch-fl-ci)" >&2
   exit 1
@@ -13,7 +13,10 @@ export PATH="/opt/torch-fl-iluvatar-venv/bin:/usr/local/corex/bin:$PATH"
 export PYTHONPATH=""
 export PYTHONNOUSERSITE=1
 export COREX_PATH=/usr/local/corex
-export FLAGOS_VENDOR_TORCH_LIB=/opt/torch-fl-iluvatar-libtorch/lib
+# Clear legacy image defaults in this shell and subsequent Actions steps.
+# The independent runtime must never select a vendor torch facade.
+export FLAGOS_VENDOR_TORCH_LIB=""
+export FLAGOS_VENDOR_TORCH_VERSION=""
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export FLAGOS_ACCELERATOR=iluvatar
 export FLAGOS_BUILD_VENDOR=1
@@ -31,7 +34,6 @@ FLAGGEMS_INDEX_URL="${TORCH_FL_FLAGGEMS_INDEX_URL:-$FLAGOS_WHEEL_ROOT_DEFAULT/fl
 # The pinned development image supplies CoreX 4.5.0 independently of the
 # host kernel driver's version. Record that SDK, not the host's driver 5.0.0.
 export FLAGOS_SDK_VERSION=4.5.0
-export FLAGOS_VENDOR_TORCH_VERSION="$(cat /opt/torch-fl-ci/vendor-torch-version)"
 
 for directory in "$COREX_PATH/lib64" "$COREX_PATH/lib"; do
   if [[ -d "$directory" ]]; then
@@ -71,8 +73,5 @@ export_ci_env PATH VIRTUAL_ENV PYTHONPATH PYTHONNOUSERSITE COREX_PATH \
   FLAGTREE_VERSION FLAGGEMS_VERSION PIP_CONSTRAINT FLAGOS_SDK_VERSION FLAGOS_VENDOR_TORCH_VERSION \
   FLAGOS_VENDOR_TORCH_LIB TORCH_DEVICE_BACKEND_AUTOLOAD CPATH LIBRARY_PATH LD_LIBRARY_PATH
 
-# Populate the binary bundle before either wheel staging pass. Core libraries
-# are copied, never linked into or written over the official torch install.
-bash "$REPO_ROOT/scripts/vendor/bundle_iluvatar_libtorch.sh"
+# Build against the active CPU torch headers, CMake config and C++ ABI.
 build_flagos_inplace
-bash "$REPO_ROOT/scripts/vendor/bundle_iluvatar_libtorch.sh"

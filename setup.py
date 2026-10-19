@@ -160,15 +160,6 @@ def make_relative_rpath_args(path):
 
 
 def get_pytorch_dir():
-    # The isolated Iluvatar interpreter uses official CPU torch, while native
-    # code links the matched old-ABI CoreX SDK assets staged outside Python.
-    if FLAGOS_ACCELERATOR == "iluvatar" and os.environ.get("FLAGOS_VENDOR_TORCH_LIB"):
-        root = os.path.dirname(os.path.realpath(os.environ["FLAGOS_VENDOR_TORCH_LIB"]))
-        if not os.path.isfile(
-            os.path.join(root, "share", "cmake", "Torch", "TorchConfig.cmake")
-        ):
-            raise RuntimeError(f"CoreX libtorch build assets are incomplete: {root}")
-        return root
     import torch
 
     return os.path.dirname(os.path.realpath(torch.__file__))
@@ -614,6 +605,22 @@ def _cmake_build_jobs() -> int:
     return multiprocessing.cpu_count()
 
 
+def _torch_cxx11_abi() -> str:
+    """The C++ ABI of the torch this build links, as "1" or "0".
+
+    Returns ``""`` when torch cannot be imported, so the CMake-side probe decides
+    instead of this failing the configure with an unrelated error. setup.py is a
+    script, not a module: the other torch reads below import it locally, and a
+    reference from here (or from ``build_deps``, which runs in the same scope)
+    would be a NameError rather than the module-global it looks like.
+    """
+    try:
+        import torch
+    except ImportError:
+        return ""
+    return "1" if torch._C._GLIBCXX_USE_CXX11_ABI else "0"
+
+
 def build_deps():
     build_dir = os.path.join(BASE_DIR, "build")
     os.makedirs(build_dir, exist_ok=True)
@@ -629,6 +636,16 @@ def build_deps():
         "-DPYTHON_EXECUTABLE=" + sys.executable,
         "-DPYTORCH_INSTALL_DIR=" + get_pytorch_dir(),
     ]
+
+    # The ABI derives from the torch this build links. Passing it removes the
+    # CMake-side probe (which would run the same query in a subprocess) from the
+    # picture entirely, so the compile flag and the value recorded in
+    # compatibility.json cannot disagree. Only iluvatar consults the flag today
+    # (the platform that can be built against more than one kind of torch), so
+    # an unreadable torch is left to CMake rather than made fatal here.
+    torch_cxx11_abi = _torch_cxx11_abi()
+    if torch_cxx11_abi:
+        cmake_args.append("-DFLAGOS_TORCH_CXX11_ABI=" + torch_cxx11_abi)
 
     cmake_args.append(f"-DFLAGOS_ACCELERATOR={FLAGOS_ACCELERATOR}")
 
@@ -776,11 +793,7 @@ def _write_compatibility_manifest(wheel_version: str) -> None:
         vendor_torch_libraries=entry["vendor_torch_libraries"]
         and (gate is None or kernels[gate]),
         requirements=_install_requires(),
-        # The Iluvatar CMake branch explicitly compiles against the old-ABI
-        # CoreX binary assets, independently of the CPU Python build frontend.
-        torch_abi=False
-        if FLAGOS_ACCELERATOR == "iluvatar"
-        else bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+        torch_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI),
         sdk_version=os.environ.get("FLAGOS_SDK_VERSION"),
         vendor_torch_version=os.environ.get("FLAGOS_VENDOR_TORCH_VERSION"),
     )
@@ -994,8 +1007,6 @@ class BuildExtWithCmake(_build_ext):
             patterns.extend(("lib_maca/*.so*", "lib_maca/vendor_version.py"))
         if FLAGOS_ACCELERATOR == "ppu":
             patterns.extend(("lib_ppu/*.so*", "lib_ppu/vendor_version.py"))
-        if FLAGOS_ACCELERATOR == "iluvatar":
-            patterns.extend(("lib_iluvatar/*.so*", "lib_iluvatar/vendor_version.py"))
         if FLAGOS_ACCELERATOR == "dcu":
             # cmake installs the core-ABI shim straight into lib_dcu during
             # build_ext. build_py has already cached its file list by then, so
@@ -1127,8 +1138,6 @@ def _get_setup_kwargs():
             "lib_dcu/vendor_version.py",
             "lib_ppu/*.so*",
             "lib_ppu/vendor_version.py",
-            "lib_iluvatar/*.so*",
-            "lib_iluvatar/vendor_version.py",
             "include/*.h",
             # The native comm bridge's source, so the standalone builder
             # (comm/_nccl_ext/build.py) can still rebuild the extension from an

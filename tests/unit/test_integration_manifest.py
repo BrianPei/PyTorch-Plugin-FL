@@ -76,6 +76,16 @@ _CONFIG_DIR = _REPO / ".github/configs"
 # composition exactly, so wiring a platform in or out is a visible edit here,
 # and the check cannot quietly become a description of a pipeline nobody runs.
 _KNOWN_GAPS = {
+    "iluvatar_runtime": (
+        "ascend",
+        "cuda",
+        "dcu",
+        "gcu",
+        "kunlunxin",
+        "metax",
+        "musa",
+        "ppu",
+    ),
     "rng": ("ppu",),
     "soft_lowp_matrix": (
         "ascend",

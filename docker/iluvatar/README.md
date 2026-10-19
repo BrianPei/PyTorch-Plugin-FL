@@ -1,67 +1,63 @@
 # Iluvatar CI image
 
-The published CPU-frontend baseline is
-`harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20261016-iluvatar-cpu-dev`.
-It supersedes the earlier `manual-20261016-iluvatar-dev` development experiment.
-The operator confirmed publication on 2026-10-17. The CI config pins
-`harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl@sha256:bc1b3c0beb22b301ec501896ea1c77903879526fb7303358669321d609458023`
-and uses the agreed runner label `ts-v150-cicd-pytorch`.
-The Dockerfile pins the CoreX development base by digest, preserving the SDK
-headers that the smaller runtime 2.3.0 image lacked.
+CI reuses the operator-published baseline
+`harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20261016-iluvatar-cpu-dev`,
+pinned by its manifest digest:
+`sha256:bc1b3c0beb22b301ec501896ea1c77903879526fb7303358669321d609458023`.
+The runner label is `ts-v150-cicd-pytorch`.
 
-## Python isolation and native assets
+## Official CPU core and isolation
 
-`/opt/torch-fl-iluvatar-venv` is a normal venv with
-`include-system-site-packages=false`. It installs official
-`torch==2.10.0+cpu`, clears inherited PYTHONPATH and disables user-site packages.
-Base-image vLLM and vendor Python packages are not on its import path.
+`/opt/torch-fl-iluvatar-venv` has `include-system-site-packages=false`, official
+`torch==2.10.0+cpu`, FlagTree `0.6.2a3+iluvatar3.6` (including Triton 3.6),
+FlagGems `5.4.0`, and build/test dependencies. Inherited PYTHONPATH is cleared
+and user-site packages are disabled. Base-image vLLM and vendor Python packages
+remain outside the venv. No torch_fl wheel is baked into the image.
 
-CoreX native headers, CMake files and shared libraries are staged separately
-under `/opt/torch-fl-iluvatar-libtorch`. These are build/runtime assets, not an
-installed vendor Python frontend. The pinned base's exact FlagTree distribution
-is copied into the clean venv by its wheel RECORD; no global site directory is
-added to sys.path. FlagGems and build/test dependencies are installed there.
-The exact installed versions are saved in `/opt/torch-fl-ci/installed.txt`.
+The runtime added by upstream PR #593 uses the CoreX C ABI with the official
+CPU torch headers, libraries and C++ ABI. It needs neither vendor libtorch nor
+a replacement torch core. After importing torch_fl, `torch.version.cuda` stays
+`None`; the compatibility shim exposes the device operations needed by
+FlagGems and Triton through `torch.cuda`.
 
-CI reuses the preinstalled FlagTree/Gems cohort when it matches the checkout's
-`.github/version-pins.env`. A changed pin replaces only that component inside
-the job container. FlagTree supplies Triton as a pair; stock Triton is not
-installed separately. The hook checks dependencies and runs the checkout's
-verifier after provisioning, so stale image pins do not block a new cohort.
-Keep the SDK, Python and CPU torch baseline fixed until a new image is validated.
+The published image predates #593 and contains unused assets under
+`/opt/torch-fl-iluvatar-libtorch`. The current hook clears its legacy
+`FLAGOS_VENDOR_TORCH_LIB` default, persists the empty value through GITHUB_ENV,
+and never copies those assets into a wheel. The checkout's verifier is used
+instead of the older copy baked into the image. These changes allow reuse of
+the existing digest without a Harbor push.
 
-CoreX 4.5.0's device libraries use the old C++ ABI and fail direct loading against
-the official CPU core. The plugin therefore bundles the matched binaries under
-`torch_fl/lib_iluvatar/`, using the existing private-facade mechanism also used
-by PPU/MetaX. The official CPU torch installation remains unchanged, but its
-process runs the bundled CoreX core after `import torch_fl`. This is not a claim
-that all loaded core libraries are official CPU binaries.
+CI compares the preinstalled FlagTree/Gems versions with checkout pins and
+job overrides. Matching versions are reused; a changed component is installed
+inside the disposable job container. FlagTree and its Triton provider are
+replaced together. The checkout's constraints protect CPU torch, and `pip check`
+rejects incompatible cohorts. SDK, Python and CPU torch baseline changes need
+a rebuilt and revalidated image.
 
-Import `torch_fl` before `torch` when selecting the CoreX core in a fresh
-interpreter. The image disables torch backend autoload because a torch-first
-entry point runs too late to select a different core. Neither torch_fl source
-nor its wheel is baked into the image: CI builds the revision under test.
+## Recipe for the next image refresh
 
-## Build and validate
+This directory keeps the image recipe, FlagTree RECORD-based copier and
+verification tool together so future image changes are reviewable. The current
+Dockerfile omits the obsolete vendor libtorch staging step; it is the recipe
+for the next refresh, not an exact reproduction of the already-published image.
+It retains the pinned CoreX 4.5 development SDK that supplies the required
+IX/ixblas and ixdnn headers.
 
 ```bash
 DOCKER_BUILDKIT=0 docker build -f docker/iluvatar/Dockerfile \
-  -t harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20261016-iluvatar-cpu-dev .
+  -t harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl:manual-20261020-iluvatar-cpu-runtime-dev .
 ```
 
-The default CPU-wheel mirror is the same SJTU mirror supported by the shared
+The default CPU-wheel mirror is the SJTU mirror also supported by the shared
 CI helper. Set `CPU_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu` to use
-the official index directly. Ordinary packages use `PIP_INDEX_URL`. Do not put
-proxy credentials in build arguments or the image environment.
+the official index directly. Ordinary packages use `PIP_INDEX_URL`.
 
-Build-time `verify.py` checks the untouched CPU frontend, venv isolation,
-FlagTree/Gems pins and SDK headers without requiring devices. After building
-and installing a wheel, `verify.py --device` starts a separate interpreter to
-check bundle selection, actual mapped core-library paths, cold Triton JIT and
-flagos tensor arithmetic. The CPU and CoreX checks cannot share an interpreter.
+Build-time `verify.py` checks CPU torch, ABI, isolation, package pins and SDK
+headers without devices. Once a wheel is installed, `verify.py --device` also
+checks the mapped CPU core libraries, native ELF dependencies, BI-V150 Triton
+target (corex, arch 71, warp 64), Triton JIT and flagos addition. The shared
+CI manifest runs this installed-wheel audit using `--runtime` before its tests.
 
-See [the bring-up guide](../../docs/vendors/iluvatar/installation.md) for the
-host device/control-node and driver-tool mounts, measured results and push
-steps. The active config is [`.github/configs/iluvatar.yml`](../../.github/configs/iluvatar.yml).
-Its first PR run must confirm runner access and the remaining shared hardware
-groups; the previously measured runtime failures remain visible.
+See [the bring-up guide](../../docs/vendors/iluvatar/installation.md) for host
+mounts and the outstanding hardware acceptance checks. The active configuration
+is [`.github/configs/iluvatar.yml`](../../.github/configs/iluvatar.yml).
