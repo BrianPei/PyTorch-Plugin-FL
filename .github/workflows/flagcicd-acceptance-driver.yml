@@ -1,0 +1,59 @@
+name: FlagCICD fork acceptance submissions
+
+on:
+  push:
+    branches: [experiment/flagcicd-acceptance-20261020]
+
+permissions:
+  contents: write
+
+jobs:
+  submit:
+    if: github.repository == 'BrianPei/PyTorch-Plugin-FL'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Submit repository dispatch acceptance cases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPTANCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          revision = 'afbbd0dd3e0f2835f30b9f1389e6f8fa4c8e0ba8'
+          cases = [
+              ('external-l0', {'test_level': 'L0', 'platforms': ['kunlunxin']}),
+              ('invalid-level', {'test_level': 'L4', 'platforms': ['kunlunxin']}),
+              ('invalid-platform-array', {'test_level': 'L0', 'platforms': ['cuda,ppu']}),
+          ]
+          submitted = []
+          for name, overrides in cases:
+              payload = {
+                  'checkout_ref': revision,
+                  'base_ref': revision,
+                  'task_id': 'acceptance-' + name + '-20261020',
+                  'parent_run_id': os.environ['GITHUB_RUN_ID'],
+                  **overrides,
+              }
+              envelope = {'event_type': 'flagcicd', 'client_payload': payload}
+              subprocess.run(
+                  ['gh', 'api', '--method', 'POST',
+                   'repos/' + os.environ['ACCEPTANCE_REPOSITORY'] + '/dispatches',
+                   '--input', '-'],
+                  input=json.dumps(envelope), text=True, check=True,
+              )
+              submitted.append({'case': name, 'request': envelope})
+          Path('acceptance-submissions.json').write_text(json.dumps(submitted, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Submitted three repository_dispatch cases. Submission does not prove execution success.\n')
+              summary.write('Expected: external-l0 passes; invalid-level and invalid-platform-array fail with retained summaries.\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-submissions
+          path: acceptance-submissions.json
+          retention-days: 7
