@@ -61,7 +61,7 @@ prepare_iluvatar_packages
 
 # Use the checkout's verifier and pins, not the older copy baked into Harbor.
 TORCH_FL_VERSION_PINS="$REPO_ROOT/.github/version-pins.env" \
-  "$VENV_PYTHON" "$REPO_ROOT/docker/iluvatar/verify.py"
+  "$VENV_PYTHON" "$REPO_ROOT/.github/scripts/verify_iluvatar.py"
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' /opt/torch-fl-iluvatar-venv/bin /usr/local/corex/bin >> "$GITHUB_PATH"

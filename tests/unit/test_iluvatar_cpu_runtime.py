@@ -11,7 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
-    "iluvatar_verify", ROOT / "docker/iluvatar/verify.py"
+    "iluvatar_verify", ROOT / ".github/scripts/verify_iluvatar.py"
 )
 verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)

@@ -36,9 +36,9 @@ assets. The hook clears `FLAGOS_VENDOR_TORCH_LIB` and vendor version metadata,
 including in subsequent workflow steps. Those assets are neither selected nor
 bundled. The old Iluvatar facade helper, bundler and setup.py ABI overrides have
 been removed in favor of the upstream CPU-core implementation. A new image push
-is not required to use the existing digest with this hook. The current
-[Dockerfile](../../../docker/iluvatar/Dockerfile) describes the next refresh and
-omits the obsolete staging step.
+is not required to use the existing digest with this hook. The checkout
+[verification script](../../../.github/scripts/verify_iluvatar.py) checks the
+isolated CPU environment and installed runtime used by CI.
 
 ## Host device access
 
@@ -59,7 +59,7 @@ query to fail; the real host tool is required. These mounts remain necessary
 with the independent runtime. The SDK header probe uses native
 `ixblasDataType_t` and `IX_R_16BF`, matching upstream's corrected type handling.
 
-## Image publication and runtime acceptance
+## CI image and runtime acceptance
 
 The operator published the baseline on 2026-10-17:
 
@@ -67,10 +67,9 @@ The operator published the baseline on 2026-10-17:
 harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl@sha256:bc1b3c0beb22b301ec501896ea1c77903879526fb7303358669321d609458023
 ```
 
-For a later image refresh, build a new tag using the recipe and validate it
-before publication. The operator runs `docker login harbor.baai.ac.cn`,
-`docker push <new-tag>` and records its registry manifest digest in `ci_image`.
-The local image ID is not the manifest digest. Credentials stay outside source.
+CI consumes this published image; image build recipes are maintained outside
+this repository. When adopting a validated replacement, update `ci_image` to
+its registry manifest digest.
 
 The previous vendor-core lane reached the runner, built a wheel and passed
 startup and multi-device groups. Its last completed run
@@ -80,12 +79,19 @@ tracked in [issue #570](https://github.com/flagos-ai/Torch-FL/issues/570): two
 float64 matmul cases and one incorrect keepdim mean reduction. These are
 historical vendor-core results, not validation of the new CPU-core lane.
 
-The adapted lane requires a new hardware run. Its added runtime audit imports
-CPU torch before torch_fl, confirms official mapped core-library paths and no
-CUDA libtorch linkage, checks the real BI-V150 target (corex, arch 71, warp 64),
-and runs Triton addition plus flagos arithmetic. This audit precedes all
-15 existing shared groups; no tests are deselected to hide #570. Upstream #593
-may change its symptoms, but only a hardware rerun can establish that.
+The adapted CPU-core lane was exercised in
+[run #1584](https://github.com/flagos-ai/Torch-FL/actions/runs/39284684295/job/118168010926)
+at revision `a92e8ead5df3148cee084cecbe750a98adda7ebe`. Build, wheel installation,
+the CPU-core runtime audit, startup and multi-device checks passed. The portable
+group still reported **3 failed, 233 passed, 1 xfailed**, reproducing the same
+three cases tracked in #570 after upstream #593.
+
+The runtime audit imports CPU torch before torch_fl, confirms official mapped
+core-library paths and no CUDA libtorch linkage, checks the real BI-V150 target
+(corex, arch 71, warp 64), and runs Triton addition plus flagos arithmetic. It
+runs after the shared environment check and before the remaining test groups.
+There are 16 selected groups including this audit; no tests are deselected to
+hide #570. Groups after the failing portable group were not reached.
 
 Full hardware acceptance remains pending successful execution of all selected
 groups and verification of #570's reproductions. The existing groups cover

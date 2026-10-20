@@ -17,7 +17,8 @@ import sys
 def read_pins():
     path = Path(
         os.environ.get(
-            "TORCH_FL_VERSION_PINS", Path(__file__).with_name("version-pins.env")
+            "TORCH_FL_VERSION_PINS",
+            Path(__file__).resolve().parents[1] / "version-pins.env",
         )
     )
     return dict(

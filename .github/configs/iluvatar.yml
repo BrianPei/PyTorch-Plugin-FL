@@ -23,7 +23,7 @@ paths_watch:
   - .github/scripts/hooks/set_env_iluvatar.sh
   - .github/scripts/set_env_iluvatar.sh
   - .github/scripts/lib/iluvatar_packages.sh
-  - docker/iluvatar/
+  - .github/scripts/verify_iluvatar.py
 
 container_volumes:
   - /usr/local/corex-4.5.0/lib64/libcuda.so.1:/usr/local/corex/lib64/libcuda.so.1:ro

@@ -96,7 +96,7 @@ steps:
   - id: iluvatar_runtime
     name: Check Iluvatar CPU core and runtime
     platforms: [iluvatar]
-    command: cd "$GITHUB_WORKSPACE" && python docker/iluvatar/verify.py --runtime
+    command: cd "$GITHUB_WORKSPACE" && python .github/scripts/verify_iluvatar.py --runtime
 
   # Issue #391: the multi-device contract files sit at the top level of
   # tests/integration/, where no manifest sweeps by default -- a file added there
