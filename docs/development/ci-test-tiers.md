@@ -44,7 +44,8 @@ Inherited pip configuration and extra indexes are disabled; build tools use
 public PyPI and CPU Torch uses its explicit index. Boxing and FlagGems C++ are
 disabled, matching the CUDA lane's Python-wrapper build. L1 checks metadata,
 the installed files against the wheel archive, the native library and the
-CPython extension filename without importing `torch_fl`. It does not claim
+CPython extension filename from a clean target directory without importing
+`torch_fl`. It does not claim
 driver availability, full runtime
 dependency installation, or accelerator execution; those checks belong to L2+.
 

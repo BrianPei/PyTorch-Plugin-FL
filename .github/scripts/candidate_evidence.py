@@ -47,12 +47,19 @@ def verify_installation(wheel_path):
             raise ValueError("candidate archive contains no torch_fl package")
         for name in members:
             installed = Path(distribution.locate_file(name))
-            if (
-                not installed.is_file()
-                or hashlib.sha256(installed.read_bytes()).digest()
-                != hashlib.sha256(wheel.read(name)).digest()
-            ):
-                raise ValueError(f"installed package differs from candidate: {name}")
+            candidate_bytes = wheel.read(name)
+            candidate_sha = hashlib.sha256(candidate_bytes).hexdigest()
+            installed_sha = (
+                hashlib.sha256(installed.read_bytes()).hexdigest()
+                if installed.is_file()
+                else "missing"
+            )
+            if installed_sha != candidate_sha:
+                raise ValueError(
+                    "installed package differs from candidate: "
+                    f"{name} (installed={installed} installed_sha256={installed_sha} "
+                    f"candidate_sha256={candidate_sha})"
+                )
 
 
 def verify(receipt, wheel, source_sha, platform, run_id):

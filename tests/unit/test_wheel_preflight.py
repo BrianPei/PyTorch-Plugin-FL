@@ -383,6 +383,21 @@ def test_l1_build_uses_isolated_pinned_cpu_torch():
     assert job["env"]["PIP_EXTRA_INDEX_URL"] == ""
 
 
+def test_l1_installs_candidate_into_clean_target():
+    workflow = yaml.safe_load(
+        (SOURCE_ROOT / ".github/workflows/wheel-checks.yml").read_text()
+    )
+    steps = workflow["jobs"]["wheel-checks"]["steps"]
+    install = next(step for step in steps if step.get("id") == "install")
+    source = install["run"]
+    assert 'INSTALL_ROOT="$RUNNER_TEMP/torch-fl-wheel-installed"' in source
+    assert 'rm -rf "$INSTALL_ROOT"' in source
+    assert (
+        'python -m pip install --no-deps --target "$INSTALL_ROOT" dist/*.whl' in source
+    )
+    assert 'printf \'PYTHONPATH=%s\\n\' "$INSTALL_ROOT" >> "$GITHUB_ENV"' in source
+
+
 @pytest.mark.parametrize("defect", [None, "foreign", "duplicate", "package"])
 def test_l1_environment_probe_rejects_foreign_torch(tmp_path, monkeypatch, defect):
     workflow = yaml.safe_load(

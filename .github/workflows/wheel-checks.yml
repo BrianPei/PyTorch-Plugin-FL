@@ -120,7 +120,16 @@ jobs:
 
       - name: Install wheel (no-deps)
         id: install
-        run: python -m pip install --force-reinstall --no-deps dist/*.whl
+        run: |
+          set -euo pipefail
+          # Keep the candidate separate from any image-provided or stale
+          # distribution. A force reinstall cannot remove files that an older
+          # wheel did not list in its RECORD.
+          INSTALL_ROOT="$RUNNER_TEMP/torch-fl-wheel-installed"
+          rm -rf "$INSTALL_ROOT"
+          python -m pip install --no-deps --target "$INSTALL_ROOT" dist/*.whl
+          printf 'TORCH_FL_INSTALL_ROOT=%s\n' "$INSTALL_ROOT" >> "$GITHUB_ENV"
+          printf 'PYTHONPATH=%s\n' "$INSTALL_ROOT" >> "$GITHUB_ENV"
 
       - name: Verify packaging content
         id: verify
