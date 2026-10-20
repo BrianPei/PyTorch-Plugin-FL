@@ -48,9 +48,9 @@ from manifest_composer import (
 )
 
 
-# The configured platforms this layer has to keep in step. Written out rather than
-# taken from the directory: a config that quietly disappeared would otherwise
-# take its platform out of every check below and leave the suite green.
+# The platforms this layer has to keep in step. Written out rather than taken
+# from the directory: a config that quietly disappeared would otherwise take its
+# platform out of every check below and leave the suite green.
 _PLATFORMS = (
     "ascend",
     "cuda",
@@ -59,6 +59,7 @@ _PLATFORMS = (
     "iluvatar",
     "kunlunxin",
     "metax",
+    "mps",
     "musa",
     "ppu",
 )
@@ -83,25 +84,53 @@ _KNOWN_GAPS = {
         "gcu",
         "kunlunxin",
         "metax",
+        "mps",
         "musa",
         "ppu",
     ),
-    "rng": ("ppu",),
+    "rng": ("mps", "ppu"),
     "soft_lowp_matrix": (
         "ascend",
         "cuda",
         "gcu",
         "iluvatar",
         "kunlunxin",
+        "mps",
         "musa",
         "ppu",
     ),
-    "amp_contract": ("kunlunxin", "ppu"),
-    "profiler_contract": ("gcu", "kunlunxin"),
-    "profiler_parity": ("ascend", "gcu", "kunlunxin", "metax", "musa", "ppu"),
-    "torch_compile": ("ascend", "dcu", "musa", "ppu"),
-    "inference": ("ascend", "dcu", "gcu", "iluvatar", "kunlunxin", "metax", "musa"),
-    "training": ("ascend", "dcu", "gcu", "iluvatar", "kunlunxin", "metax", "musa"),
+    "amp_contract": ("kunlunxin", "mps", "ppu"),
+    "profiler_contract": ("gcu", "kunlunxin", "mps"),
+    "profiler_parity": (
+        "ascend",
+        "gcu",
+        "kunlunxin",
+        "metax",
+        "mps",
+        "musa",
+        "ppu",
+    ),
+    "torch_compile": ("ascend", "dcu", "mps", "musa", "ppu"),
+    "inference": (
+        "ascend",
+        "dcu",
+        "gcu",
+        "iluvatar",
+        "kunlunxin",
+        "metax",
+        "mps",
+        "musa",
+    ),
+    "training": (
+        "ascend",
+        "dcu",
+        "gcu",
+        "iluvatar",
+        "kunlunxin",
+        "metax",
+        "mps",
+        "musa",
+    ),
     "native_comm_bridge": (
         "ascend",
         "cuda",
@@ -109,6 +138,7 @@ _KNOWN_GAPS = {
         "iluvatar",
         "kunlunxin",
         "metax",
+        "mps",
         "musa",
         "ppu",
     ),
@@ -120,6 +150,7 @@ _KNOWN_GAPS = {
         "iluvatar",
         "kunlunxin",
         "metax",
+        "mps",
         "ppu",
     ),
     "musa_runtime": (
@@ -130,6 +161,7 @@ _KNOWN_GAPS = {
         "iluvatar",
         "kunlunxin",
         "metax",
+        "mps",
         "ppu",
     ),
     "musa_flaggems_hybrid": (
@@ -140,8 +172,10 @@ _KNOWN_GAPS = {
         "iluvatar",
         "kunlunxin",
         "metax",
+        "mps",
         "ppu",
     ),
+    "vendor_ops": ("mps",),
     "unit_tests_per_file": (
         "ascend",
         "cuda",
@@ -149,6 +183,7 @@ _KNOWN_GAPS = {
         "iluvatar",
         "kunlunxin",
         "metax",
+        "mps",
         "musa",
         "ppu",
     ),

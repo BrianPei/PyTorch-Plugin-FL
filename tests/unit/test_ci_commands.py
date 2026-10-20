@@ -47,6 +47,7 @@ PLATFORMS = [
     "iluvatar",
     "kunlunxin",
     "metax",
+    "mps",
     "musa",
     "ppu",
 ]
@@ -143,6 +144,7 @@ class FakeGitHub:
     [
         ("/ci run", PLATFORMS),
         ("/ci run all", PLATFORMS),
+        ("/ci run mps", ["mps"]),
         ("/ci run musa ascend musa", ["ascend", "musa"]),
         ("/ci run cuda,gcu", ["cuda", "gcu"]),
         ("/ci run ascend\n/ci run cuda", ["ascend"]),

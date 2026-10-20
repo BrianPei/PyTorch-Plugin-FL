@@ -17,8 +17,8 @@ test groups come from the shared integration manifest.
 | Manual dispatch | `platforms=all` or a comma-separated platform list |
 
 Routing labels take precedence over file filtering. Adding or removing labels
-reruns PR CI. Supported platform names are `ascend`, `cuda`, `dcu`, `gcu`, `iluvatar`,
-`kunlunxin`, `metax`, `musa` and `ppu`.
+reruns PR CI. Supported platform names are `ascend`, `cuda`, `dcu`, `gcu`,
+`iluvatar`, `kunlunxin`, `metax`, `mps`, `musa` and `ppu`.
 
 Each `.github/configs/<platform>.yml` declares `paths_watch`: exact file names,
 directory prefixes ending in `/`, or shell-style globs. Its own configuration
