@@ -36,11 +36,16 @@ The L1 CUDA packaging build uses a separate Python 3.12 venv and the CPU PyTorch
 pin from `.github/version-pins.env`; the container's preinstalled vendor Torch
 is not a build dependency. The runner is pinned to Ubuntu 22.04 to match the
 NGC 24.10 container: `setup-python` can reuse the host tool cache, whose Python
-binaries must be compatible with the container's glibc. Boxing and FlagGems C++
-are disabled, matching the CUDA lane's Python-wrapper build. L1 checks metadata,
-the installed files against
-the wheel archive, the native library and the CPython extension filename without
-importing `torch_fl`. It does not claim driver availability, full runtime
+binaries must be compatible with the container's glibc. The job clears inherited
+loader, linker and CMake search paths before `setup-python` adds its interpreter
+library path; a venv alone does not isolate native libraries. The environment
+probe verifies that loaded Torch core libraries come from the CPU installation.
+Inherited pip configuration and extra indexes are disabled; build tools use
+public PyPI and CPU Torch uses its explicit index. Boxing and FlagGems C++ are
+disabled, matching the CUDA lane's Python-wrapper build. L1 checks metadata,
+the installed files against the wheel archive, the native library and the
+CPython extension filename without importing `torch_fl`. It does not claim
+driver availability, full runtime
 dependency installation, or accelerator execution; those checks belong to L2+.
 
 Hardware job budgets are 60 minutes for PR profiles, six hours for nightly and

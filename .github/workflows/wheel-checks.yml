@@ -50,6 +50,16 @@ jobs:
     env:
       PYTHONNOUSERSITE: '1'
       PYTHONPATH: ''
+      # A venv isolates Python packages, not the ELF loader or CMake. Do not
+      # inherit NGC's Python 3.10 Torch libraries into the Python 3.12 build.
+      # setup-python adds its own interpreter library path after these defaults.
+      LD_LIBRARY_PATH: ''
+      LIBRARY_PATH: ''
+      CMAKE_PREFIX_PATH: ''
+      # This packaging lane uses public PyPI and the explicit CPU Torch index.
+      PIP_CONFIG_FILE: /dev/null
+      PIP_INDEX_URL: https://pypi.org/simple
+      PIP_EXTRA_INDEX_URL: ''
       FLAGOS_BUILD_FLAGGEMS_CPP: '0'
       FLAGOS_BUILD_BOXING: '0'
       FLAGOS_BUILD_JOBS: '2'
@@ -81,10 +91,20 @@ jobs:
             "torch==$CPU_TORCH_VERSION_DEFAULT"
           "$VENV_PYTHON" - "$CPU_TORCH_VERSION_DEFAULT" <<'PY'
           import sys
+          from pathlib import Path
           import torch
           assert sys.prefix != sys.base_prefix, 'Build Python must be isolated'
+          assert Path(torch.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), torch.__file__
           assert torch.__version__.split('+', 1)[0] == sys.argv[1], torch.__version__
           assert torch.version.cuda is None, 'Build against CPU PyTorch'
+          torch_lib = Path(torch.__file__).resolve().parent / 'lib'
+          mappings = Path('/proc/self/maps').read_text().splitlines()
+          loaded = {Path(fields[5]).resolve() for line in mappings
+                    if len(fields := line.split(None, 5)) == 6 and fields[5].startswith('/')}
+          for name in ('libc10.so', 'libtorch_cpu.so', 'libtorch_python.so'):
+              expected = (torch_lib / name).resolve()
+              assert expected in loaded, f'{name} must load from {torch_lib}'
+              assert all(path == expected for path in loaded if path.name == name), f'Foreign {name} loaded'
           print(f'Build Python: {sys.executable}; PyTorch: {torch.__version__}')
           PY
           printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"

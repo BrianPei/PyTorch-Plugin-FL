@@ -376,6 +376,61 @@ def test_l1_build_uses_isolated_pinned_cpu_torch():
     assert '"$VENV_ROOT/bin" >> "$GITHUB_PATH"' in prepare["run"]
     assert job["env"]["FLAGOS_BUILD_FLAGGEMS_CPP"] == "0"
     assert job["env"]["FLAGOS_BUILD_BOXING"] == "0"
+    for name in ("LD_LIBRARY_PATH", "LIBRARY_PATH", "CMAKE_PREFIX_PATH"):
+        assert job["env"][name] == ""
+    assert job["env"]["PIP_CONFIG_FILE"] == "/dev/null"
+    assert job["env"]["PIP_INDEX_URL"] == "https://pypi.org/simple"
+    assert job["env"]["PIP_EXTRA_INDEX_URL"] == ""
+
+
+@pytest.mark.parametrize("defect", [None, "foreign", "duplicate", "package"])
+def test_l1_environment_probe_rejects_foreign_torch(tmp_path, monkeypatch, defect):
+    workflow = yaml.safe_load(
+        (SOURCE_ROOT / ".github/workflows/wheel-checks.yml").read_text()
+    )
+    prepare = next(
+        step["run"]
+        for step in workflow["jobs"]["wheel-checks"]["steps"]
+        if step.get("name") == "Install build dependencies"
+    )
+    probe = prepare.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    venv = tmp_path / "venv"
+    package = venv / "lib/python3.12/site-packages/torch"
+    vendor = tmp_path / "image/lib/python3.10/site-packages/torch"
+    core_names = ("libc10.so", "libtorch_cpu.so", "libtorch_python.so")
+    libraries = [package / "lib" / name for name in core_names]
+    if defect == "foreign":
+        libraries[-1] = vendor / "lib/libtorch_python.so"
+    elif defect == "duplicate":
+        libraries.append(vendor / "lib/libtorch_cpu.so")
+    mappings = "\n".join(
+        f"1000-2000 r-xp 00000000 00:00 1 {path.resolve()}" for path in libraries
+    )
+    original_read_text = Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == Path("/proc/self/maps"):
+            return mappings
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(sys, "argv", ["-", "2.10.0"])
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(
+            __file__=str((vendor if defect == "package" else package) / "__init__.py"),
+            __version__="2.10.0+cpu",
+            version=types.SimpleNamespace(cuda=None),
+        ),
+    )
+    if defect is None:
+        exec(compile(probe, "<L1 environment probe>", "exec"), {})
+    else:
+        with pytest.raises(AssertionError):
+            exec(compile(probe, "<L1 environment probe>", "exec"), {})
 
 
 @pytest.mark.parametrize("defect", [None, "native", "extension", "tampered"])
