@@ -17,6 +17,7 @@
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,17 +111,28 @@ def test_unavailable_diff_risk_comes_from_the_contract():
     assert PLANNER.infer_level(None, contract)[:2] == ("L2", "R1")
 
 
-def test_plan_fetches_the_comparison_commit_for_fork_checkouts():
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/flagcicd-entry.yml").read_text()
-    )
+@pytest.mark.parametrize(
+    "name,job,base_output",
+    [
+        ("flagcicd-entry.yml", "plan", "${{ steps.resolve.outputs.base_sha }}"),
+        (
+            "ci.yml",
+            "discover-platforms",
+            "${{ needs.resolve-checkout.outputs.base_sha }}",
+        ),
+    ],
+)
+def test_plan_fetches_the_comparison_commit_for_fork_checkouts(name, job, base_output):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
     fetch = [
         step
-        for step in workflow["jobs"]["plan"]["steps"]
+        for step in workflow["jobs"][job]["steps"]
         if "git -C source fetch" in step.get("run", "")
     ]
     assert len(fetch) == 1
-    assert fetch[0]["env"]["BASE_SHA"] == "${{ steps.resolve.outputs.base_sha }}"
+    assert fetch[0]["env"]["BASE_SHA"] == base_output
+    assert fetch[0]["continue-on-error"] is True
+    assert fetch[0]["timeout-minutes"] == 3
     # A shallow base has no parents, so merge-base cannot find the fork point.
     assert "--depth" not in fetch[0]["run"]
     assert "${{ github.repository }}" in fetch[0]["run"]
@@ -504,7 +516,10 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
     assert workflow["jobs"]["complete"]["if"] == "always()"
 
 
-def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
+@pytest.mark.parametrize("missing_base", [False, True])
+def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(
+    tmp_path, missing_base
+):
     checkout = tmp_path / "source"
     shutil.copytree(ROOT / ".github/configs", checkout / ".github/configs")
     shutil.copytree(ROOT / ".flagcicd", checkout / ".flagcicd")
@@ -530,7 +545,12 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
         "base",
     )
     sha = git("rev-parse", "HEAD")
-    source = request(source_sha=sha, base_sha=sha, requested_level="L1")
+    source = request(
+        source_sha=sha,
+        base_sha="f" * 40 if missing_base else sha,
+        requested_level="L1",
+        profile="auto",
+    )
     input_file = tmp_path / "request.json"
     input_file.write_text(json.dumps(source))
     output = tmp_path / "plan.json"
@@ -558,8 +578,11 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
     )
     assert process.returncode == 0, process.stderr
     actual = json.loads(output.read_text())
-    assert actual["test_level"] == "L1"
-    assert actual["expected_platforms"] == []
+    assert actual["test_level"] == ("L3" if missing_base else "L1")
+    assert actual["diff_status"] == ("unavailable" if missing_base else "available")
+    assert actual["expected_platforms"] == (
+        PLANNER._load_platforms(ROOT / ".github/configs") if missing_base else []
+    )
     assert actual["task_id"] == source["task_id"]
     lines = dict(line.split("=", 1) for line in github_output.read_text().splitlines())
     context = json.loads(lines["context"])
@@ -568,7 +591,8 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
     assert all(actual[key] == value for key, value in context.items())
 
 
-def test_report_clis_retain_failed_execution_and_summary(tmp_path):
+@pytest.mark.parametrize("record_only", [False, True])
+def test_report_clis_retain_failed_execution_and_summary(tmp_path, record_only):
     raw = tmp_path / "raw"
     raw.mkdir()
     output = tmp_path / "flagcicd-platform-cuda.json"
@@ -590,12 +614,13 @@ def test_report_clis_retain_failed_execution_and_summary(tmp_path):
             str(raw),
             "--output",
             str(output),
+            *(["--record-only"] if record_only else []),
         ],
         env=env,
         capture_output=True,
         text=True,
     )
-    assert process.returncode == 1, process.stderr
+    assert process.returncode == (0 if record_only else 1), process.stderr
     assert json.loads(output.read_text())["status"] == "build_failed"
     results = entry_jobs()
     results["platforms"]["result"] = "failure"
@@ -871,3 +896,380 @@ def test_malformed_performance_evidence_retains_failure_report(tmp_path):
     report = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
     assert report["status"] == "report_error"
     assert any("invalid performance evidence" in error for error in report["errors"])
+
+
+def test_automatic_pr_preserves_merge_target_and_compares_head(monkeypatch):
+    def unexpected_api(path):
+        pytest.fail(f"automatic PR resolution should use its immutable event: {path}")
+
+    monkeypatch.setattr(RESOLVER, "api", unexpected_api)
+    result = RESOLVER.resolve(
+        {
+            "pull_request": {
+                "head": {"sha": SHA},
+                "base": {"sha": "b" * 40},
+                "labels": [{"name": "platform:ppu"}],
+            }
+        },
+        "pull_request",
+        "flagos-ai/Torch-FL",
+        "c" * 40,
+        entry="ci",
+        control_sha="d" * 40,
+    )
+    assert result["source_sha"] == "c" * 40
+    assert result["diff_sha"] == SHA
+    assert result["target_kind"] == "merge"
+    assert result["control_sha"] == "d" * 40
+    planned = PLANNER.build_plan(result, CONTRACT, ROOT, ["README.md"])
+    assert planned["expected_platforms"] == ["ppu"]
+    assert planned["test_level"] == "L2"
+
+
+@pytest.mark.parametrize(
+    "event_name,event,profile",
+    [
+        ("push", {}, "pr"),
+        ("schedule", {"schedule": "0 18 * * 0-5"}, "nightly"),
+        ("schedule", {"schedule": "0 18 * * 6"}, "weekly"),
+    ],
+)
+def test_automatic_schedules_use_full_shared_plan(
+    monkeypatch, event_name, event, profile
+):
+    monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
+    monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
+    normalized = RESOLVER.resolve(event, event_name, "owner/repo", SHA, entry="ci")
+    actual = PLANNER.build_plan(normalized, CONTRACT, ROOT, ["README.md"])
+    assert actual["profile"] == profile
+    assert actual["expected_platforms"] == PLANNER._load_platforms(
+        ROOT / ".github/configs"
+    )
+
+
+def test_ci_manual_all_still_runs_hardware_for_a_documentation_diff(monkeypatch):
+    monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
+    monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
+    normalized = RESOLVER.resolve(
+        {"inputs": {}}, "workflow_dispatch", "owner/repo", SHA, entry="ci"
+    )
+    actual = PLANNER.build_plan(normalized, CONTRACT, ROOT, ["README.md"])
+    assert actual["test_level"] == "L2"
+    assert actual["expected_platforms"] == PLANNER._load_platforms(
+        ROOT / ".github/configs"
+    )
+
+
+@pytest.mark.parametrize(
+    "changed", [["README.md"], ["csrc/runtime/accelerator/cuda/stream.cpp"], None]
+)
+def test_equivalent_manual_requests_get_the_same_plan(monkeypatch, changed):
+    monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
+    monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
+    common = {"platforms": "cuda,ppu", "test_level": "L2", "selection": "all"}
+    automatic = RESOLVER.resolve(
+        {"inputs": common}, "workflow_dispatch", "owner/repo", SHA, entry="ci"
+    )
+    external = RESOLVER.resolve(
+        {"action": "flagcicd", "client_payload": common},
+        "repository_dispatch",
+        "owner/repo",
+        SHA,
+    )
+    assert automatic == external
+    assert PLANNER.build_plan(automatic, CONTRACT, ROOT, changed) == PLANNER.build_plan(
+        external, CONTRACT, ROOT, changed
+    )
+
+
+def test_automatic_documentation_keeps_shared_checks_without_hardware():
+    normalized = RESOLVER.resolve(
+        {"pull_request": {"head": {"sha": SHA}, "base": {"sha": "b" * 40}}},
+        "pull_request",
+        "owner/repo",
+        "c" * 40,
+        entry="ci",
+    )
+    actual = PLANNER.build_plan(normalized, CONTRACT, ROOT, ["README.md"])
+    assert actual["test_level"] == "L1"
+    assert actual["expected_platforms"] == []
+
+
+@pytest.mark.parametrize(
+    "labels,expected",
+    [
+        (["platform:cuda", "platform:ppu"], ["cuda", "ppu"]),
+        (["platform:unknown"], None),
+        (["platform:all"], None),
+    ],
+)
+def test_shared_planner_preserves_legacy_label_routing(labels, expected):
+    actual = PLANNER.build_plan(
+        request(profile="auto", requested_level="L1", pr_labels=labels),
+        CONTRACT,
+        ROOT,
+        ["README.md"],
+    )
+    assert actual["expected_platforms"] == (
+        expected or PLANNER._load_platforms(ROOT / ".github/configs")
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"profile": "nightly"},
+        {"control_sha": "d" * 40},
+        {"target_kind": "merge"},
+        {"diff_sha": "e" * 40},
+    ],
+)
+def test_execution_policy_and_control_changes_invalidate_report_reuse(overrides):
+    baseline = request(profile="pr-risk", platforms="cuda")
+    old = PLANNER.build_plan(baseline, CONTRACT, ROOT, ["setup.py"])
+    new = PLANNER.build_plan({**baseline, **overrides}, CONTRACT, ROOT, ["setup.py"])
+    assert new["config_hash"] != old["config_hash"]
+
+
+def test_same_config_cannot_hide_a_report_with_a_different_profile(tmp_path):
+    expected = {**plan(), "profile": "nightly", "control_sha": "d" * 40}
+    path = save_report(tmp_path)
+    report = json.loads(path.read_text())
+    report.update(profile="pr-risk", control_sha="d" * 40)
+    path.write_text(json.dumps(report))
+    summary = REPORTER.aggregate(expected, entry_jobs(), tmp_path, 1)
+    assert summary["status"] == "report_error"
+
+
+@pytest.mark.parametrize("counts", [{"total": 0}, {"total": 2, "skipped": 2}])
+def test_no_passing_pytest_case_cannot_accept_hardware(tmp_path, counts):
+    raw_reports(tmp_path)
+    path = tmp_path / "pytest/pytest-cuda.json"
+    report = json.loads(path.read_text())
+    report["summary"] = counts
+    path.write_text(json.dumps(report))
+    result = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    assert result["status"] == "report_error"
+    assert any("at least one passing test" in error for error in result["errors"])
+
+
+def test_hardware_floor_does_not_expand_an_explicit_platform_set():
+    actual = PLANNER.build_plan(
+        request(platforms="cuda", selection="affected", requested_level="L2"),
+        CONTRACT,
+        ROOT,
+        ["README.md"],
+    )
+    assert actual["expected_platforms"] == ["cuda"]
+
+
+def test_record_only_cannot_bypass_a_summary_gate(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "flagcicd_report.py"),
+            "summary",
+            "--record-only",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "summary.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "summary always gates" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "before,expected", [("b" * 40, "b" * 40), ("0" * 40, SHA), ("", SHA)]
+)
+def test_automatic_event_identity_does_not_follow_a_moving_branch(
+    monkeypatch, before, expected
+):
+    def unexpected_api(path):
+        pytest.fail(f"push resolution must use immutable event data: {path}")
+
+    monkeypatch.setattr(RESOLVER, "api", unexpected_api)
+    actual = RESOLVER.resolve({"before": before}, "push", "owner/repo", SHA, entry="ci")
+    assert actual["source_sha"] == SHA
+    assert actual["base_sha"] == expected
+
+
+@pytest.mark.parametrize("platforms", ["all", " all ", "\tall\t"])
+def test_legacy_external_all_is_consistently_change_aware(monkeypatch, platforms):
+    monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
+    monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
+    normalized = RESOLVER.resolve(
+        {"inputs": {"platforms": platforms}},
+        "workflow_dispatch",
+        "owner/repo",
+        SHA,
+    )
+    assert normalized["selection"] == "affected"
+
+
+@pytest.mark.parametrize("defect", ["missing", "empty", "malformed_stages"])
+def test_record_only_keeps_report_defects_rerunnable(tmp_path, defect):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    results = jobs()
+    if defect != "missing":
+        raw_reports(raw)
+    if defect == "empty":
+        path = raw / "pytest/pytest-cuda.json"
+        payload = json.loads(path.read_text())
+        payload["summary"] = {"total": 0}
+        path.write_text(json.dumps(payload))
+    if defect == "malformed_stages":
+        results["integration-tests"]["outputs"]["stages"] = "[]"
+    output = tmp_path / "flagcicd-platform-cuda.json"
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "flagcicd_report.py"),
+            "platform",
+            "--record-only",
+            "--platform",
+            "cuda",
+            "--directory",
+            str(raw),
+            "--output",
+            str(output),
+        ],
+        env={
+            **os.environ,
+            "FLAGCICD_PLAN": json.dumps(plan()),
+            "JOB_RESULTS": json.dumps(results),
+            "GITHUB_RUN_ATTEMPT": "1",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert process.returncode == 1, process.stderr
+    actual = json.loads(output.read_text())
+    assert actual["status"] != "passed"
+    assert actual["errors"]
+    if defect == "malformed_stages":
+        assert any("invalid stage evidence" in error for error in actual["errors"])
+
+
+@pytest.mark.parametrize(
+    "scenario,expected",
+    [
+        ("pass", "passed"),
+        ("fail", "test_failed"),
+        ("skip", "report_error"),
+        ("crash", "test_failed"),
+        ("missing_group", "report_error"),
+        ("wrong_order", "report_error"),
+    ],
+)
+def test_real_runner_evidence_satisfies_only_its_planned_execution(
+    tmp_path, scenario, expected
+):
+    """Exercise orchestration with real pytest and synthetic device metadata."""
+    source = tmp_path / "source"
+    shutil.copytree(ROOT / ".flagcicd", source / ".flagcicd")
+    configs = source / ".github/configs"
+    configs.mkdir(parents=True)
+    shutil.copyfile(ROOT / ".github/configs/cuda.yml", configs / "cuda.yml")
+    manifest = {
+        "steps": [
+            {
+                "id": case_id,
+                "name": name,
+                "command": f"{shlex.quote(sys.executable)} -m pytest test_fixture.py -q",
+            }
+            for case_id, name in [
+                ("vendor_ops", "Fixture vendor"),
+                ("factory_ops", "Fixture factory"),
+            ]
+        ]
+    }
+    (source / ".github/integration-manifest.yml").write_text(
+        yaml.safe_dump(manifest, sort_keys=False)
+    )
+    planned = PLANNER.build_plan(
+        request(platforms="cuda", profile="pr"), CONTRACT, source, ["fixture.py"]
+    )
+    planned.update(run_id="42", run_attempt="1")
+    groups = PLANNER.compose(
+        manifest,
+        yaml.safe_load((configs / "cuda.yml").read_text()),
+        "cuda",
+        ["cuda"],
+        "pr",
+        PLANNER.policy(source),
+    )
+    if scenario == "missing_group":
+        groups.pop()
+    elif scenario == "wrong_order":
+        groups.reverse()
+    workdir = tmp_path / "wheel-only"
+    workdir.mkdir()
+    body = {
+        "fail": "def test_fixture(): assert False\n",
+        "skip": "import pytest\ndef test_fixture(): pytest.skip('fixture skip')\n",
+        "crash": "import os\ndef test_fixture(): os._exit(3)\n",
+    }.get(scenario, "def test_fixture(): pass\n")
+    (workdir / "test_fixture.py").write_text(body)
+    raw = tmp_path / "raw"
+    reports = raw / "pytest"
+    reports.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PYTEST_ADDOPTS": "",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONPATH": str(SCRIPTS / "pytest_reporting"),
+        "PYTEST_PLUGINS": "pytest_jsonreport.plugin,flagcicd_report",
+        "FLAGCICD_REPORT_DIR": str(reports),
+        "INTEGRATION_TESTS": json.dumps(groups),
+        "INTEGRATION_ENVIRONMENT": "{}",
+        "INTEGRATION_WORKDIR": str(workdir),
+    }
+    execution = subprocess.run(
+        [sys.executable, str(SCRIPTS / "run_integration_tests.py")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    outcome = "success" if execution.returncode == 0 else "failure"
+    merged = load("merge_pytest_reports").merge_reports(
+        reports, "cuda", outcome, planned["source_repository"], SHA
+    )
+    (reports / "pytest-cuda.json").write_text(json.dumps(merged))
+    (reports / "hardware-cuda.json").write_text(
+        json.dumps(
+            {
+                "machine_model": "synthetic-orchestration-fixture",
+                "sdk_version": "fixture-sdk",
+                "accelerator_count": 1,
+            }
+        )
+    )
+    platform = REPORTER.platform_report(
+        planned, "cuda", jobs(outcome, tests=outcome), raw, 1
+    )
+    assert platform["status"] == expected, execution.stdout + execution.stderr
+    directory = tmp_path / "outcomes"
+    directory.mkdir()
+    (directory / "flagcicd-platform-cuda.json").write_text(json.dumps(platform))
+    results = entry_jobs()
+    results["platforms"]["result"] = "success" if expected == "passed" else "failure"
+    summary = REPORTER.aggregate(planned, results, directory, 1)
+    assert summary["status"] == expected
+    ci_jobs = {"resolve-checkout": {"result": "success"}}
+    aliases = {
+        "plan": "discover-platforms",
+        "agnostic": "agnostic-checks",
+        "codegen": "codegen-checks",
+        "platforms": "platform-pipeline",
+    }
+    ci_jobs.update({aliases.get(name, name): value for name, value in results.items()})
+    assert (
+        REPORTER.aggregate(planned, REPORTER.entry_jobs(ci_jobs, "ci"), directory, 1)
+        == summary
+    )

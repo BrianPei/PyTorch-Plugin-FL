@@ -23,6 +23,15 @@ the matrix using the diff. The plan records selected case IDs, levels,
 categories, immutable source and a policy/configuration hash. Platform reports
 must match the planned case sequence.
 
+The automatic CI and external entry share request resolution, planning and
+aggregation. Event adapters preserve existing selection defaults and record
+`selection=affected/all` separately from the platform list. Automatic PRs keep
+their L1 shared-check minimum, and manual CI requests keep a hardware minimum.
+The plan distinguishes the tested source (`source_sha`), comparison head
+(`diff_sha`), head/merge target kind and immutable control-code version.
+Profile and control identity are included in both the fingerprint and report
+matching, including when successful platform results survive a failed-job rerun.
+
 L0 validates configuration, lint and the explicit test file inventory. L1 runs
 the existing agnostic, codegen and hardware-free wheel checks. Hardware jobs
 depend on all of them. L2 cases precede L3 cases, and L3 precedes L4; the runner

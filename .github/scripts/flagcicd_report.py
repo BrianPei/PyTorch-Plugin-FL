@@ -27,6 +27,7 @@ SCHEMA = "flagcicd.report/v1"
 FAILURES = {"build_failed", "test_failed", "infra_error", "cancelled", "report_error"}
 IDENTITY = ("source_repository", "source_sha", "run_id", "test_level", "config_hash")
 REQUIRED_STAGES = ("setup", "build", "validate", "install", "tests")
+CONTEXT = ("profile", "control_sha", "target_kind", "base_sha", "diff_sha", "selection")
 
 
 def identity(plan):
@@ -36,7 +37,30 @@ def identity(plan):
             key: plan[key]
             for key in (*IDENTITY, "scope", "risk_level", "task_id", "parent_run_id")
         },
+        **{key: plan.get(key, "") for key in CONTEXT},
     }
+
+
+def entry_jobs(jobs, entry):
+    """Map entry-specific job IDs onto the shared verdict contract."""
+    if entry == "external":
+        return jobs
+    aliases = {
+        "plan": "discover-platforms",
+        "preflight": "preflight",
+        "lint": "lint",
+        "agnostic": "agnostic-checks",
+        "codegen": "codegen-checks",
+        "wheel-checks": "wheel-checks",
+        "platforms": "platform-pipeline",
+    }
+    mapped = {
+        name: jobs.get(alias, {"result": "missing"}) for name, alias in aliases.items()
+    }
+    resolution = jobs.get("resolve-checkout", {"result": "missing"})
+    if resolution["result"] != "success":
+        mapped["plan"] = resolution
+    return mapped
 
 
 def failed_request_identity():
@@ -79,9 +103,15 @@ def platform_report(plan, platform, jobs, raw, attempt):
     if platform not in plan["expected_platforms"]:
         raise ValueError("platform is not expected by the plan")
     job = jobs["integration-tests"]
-    stages = json.loads(job.get("outputs", {}).get("stages") or "{}")
     result = job["result"]
     errors = []
+    try:
+        stages = json.loads(job.get("outputs", {}).get("stages") or "{}")
+        if not isinstance(stages, dict):
+            raise ValueError("stage evidence must be an object")
+    except (ValueError, TypeError) as error:
+        stages = {}
+        errors.append(f"invalid stage evidence: {error}")
 
     # Record hardware identity for L2+ runs
     hardware_identity = {}
@@ -166,6 +196,8 @@ def platform_report(plan, platform, jobs, raw, attempt):
             raise ValueError(
                 "pytest failure counts contradict the successful job result"
             )
+        if status == "passed" and counts.get("passed", 0) < 1:
+            raise ValueError("hardware execution requires at least one passing test")
         metrics["tests"] = counts
     except (OSError, ValueError, TypeError, KeyError) as error:
         errors.append(str(error))
@@ -258,7 +290,9 @@ def aggregate(plan, jobs, directory, attempt):
             report_attempt = report["run_attempt"]
             if type(report_attempt) is not int or not 1 <= report_attempt <= attempt:
                 raise ValueError("invalid report attempt")
-            matches = all(report[key] == plan[key] for key in IDENTITY)
+            matches = all(report[key] == plan[key] for key in IDENTITY) and all(
+                report.get(key, "") == plan.get(key, "") for key in CONTEXT
+            )
             if not matches:
                 if report_attempt < attempt and report["run_id"] == plan["run_id"]:
                     ignored.append(
@@ -342,6 +376,7 @@ def aggregate(plan, jobs, directory, attempt):
             key: plan.get(key, "")
             for key in (*IDENTITY, "scope", "risk_level", "task_id", "parent_run_id")
         },
+        **{key: plan.get(key, "") for key in CONTEXT},
         "run_attempt": attempt,
         "status": status,
         "expected_platforms": plan["expected_platforms"],
@@ -359,7 +394,13 @@ def main():
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--platform", default="")
+    parser.add_argument("--entry", choices=("external", "ci"), default="external")
+    parser.add_argument("--record-only", action="store_true")
     args = parser.parse_args()
+    if args.record_only and args.mode != "platform":
+        parser.error(
+            "only platform reports may use --record-only; summary always gates"
+        )
     raw_plan = os.environ.get("FLAGCICD_PLAN", "")
     plan = json.loads(raw_plan) if raw_plan else None
     jobs = json.loads(os.environ["JOB_RESULTS"])
@@ -367,13 +408,21 @@ def main():
     if args.mode == "platform":
         report = platform_report(plan, args.platform, jobs, args.directory, attempt)
     else:
-        report = aggregate(plan, jobs, args.directory, attempt)
+        report = aggregate(plan, entry_jobs(jobs, args.entry), args.directory, attempt)
+        report["entry_jobs"] = {name: job["result"] for name, job in jobs.items()}
         report["run_id"] = os.environ["GITHUB_RUN_ID"]
         if not plan:
             report["repository"] = os.environ.get("GITHUB_REPOSITORY", "")
             report.update(failed_request_identity())
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"FlagCICD {report['report_type']}: {report['status']}")
+    # A failed hardware job already supplies a root failure for bounded retries.
+    # Report defects after successful hardware must fail here so rerun-failed can
+    # regenerate the evidence rather than repeatedly rerunning only the summary.
+    if args.record_only and any(
+        job.get("result") in ("failure", "cancelled") for job in jobs.values()
+    ):
+        return 0
     return int(report["status"] != "passed")
 
 

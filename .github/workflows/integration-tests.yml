@@ -489,7 +489,7 @@ jobs:
           JOB_RESULTS: ${{ toJSON(needs) }}
           REPORT_PLATFORM: ${{ inputs.platform }}
         run: >-
-          python3 .github/scripts/flagcicd_report.py platform
+          python3 .github/scripts/flagcicd_report.py platform --record-only
           --platform "$REPORT_PLATFORM" --directory raw
           --output "flagcicd-platform-${REPORT_PLATFORM}.json"
       - name: Retain platform outcome

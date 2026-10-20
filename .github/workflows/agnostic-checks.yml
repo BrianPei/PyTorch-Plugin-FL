@@ -17,7 +17,7 @@
 # This job runs the checks that need no accelerator, no vendor image, and no
 # built wheel, so they fail in seconds on ubuntu-latest instead of after a
 # multi-minute hardware job. ci.yml gates every platform pipeline on this job
-# (through discover-platforms), which is what stops a repository-wide breakage
+# (as a direct prerequisite), which is what stops a repository-wide breakage
 # -- a stale generated conf, a shell syntax error in a setup script -- from
 # surfacing as a red hardware job on an unrelated platform (e.g. a PPU conf
 # drift failing the DCU pipeline's trailing unit group).

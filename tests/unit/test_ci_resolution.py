@@ -24,7 +24,14 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-RUN = WORKFLOW["jobs"]["resolve-checkout"]["steps"][0]["run"]
+RUN = next(
+    step["run"]
+    for step in WORKFLOW["jobs"]["resolve-checkout"]["steps"]
+    if step.get("id") == "resolve"
+).replace(
+    ".github/scripts/flagcicd_resolve.py",
+    str(ROOT / ".github/scripts/flagcicd_resolve.py"),
+)
 SHA = "a" * 40
 
 
@@ -32,21 +39,35 @@ def _resolve(tmp_path, number="", pr=None):
     binary = tmp_path / "bin"
     binary.mkdir()
     gh = binary / "gh"
-    gh.write_text("#!/usr/bin/env python3\nimport os\nprint(os.environ['FAKE_PR'])\n")
+    gh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os,sys\n"
+        "path=sys.argv[-1]\n"
+        "if '/pulls/' in path: data=json.loads(os.environ['FAKE_PR'])\n"
+        "elif '/commits/' in path: data={'sha':os.environ['EVENT_SHA']}\n"
+        "else: data={'default_branch':'main'}\n"
+        "print(json.dumps(data))\n"
+    )
     gh.chmod(0o755)
     output = tmp_path / "output"
     output.touch()
+    if pr is not None:
+        pr = {"base": {"sha": "c" * 40}, **pr}
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps({"inputs": {"pr_number": number}}))
     env = {
         **os.environ,
         "PATH": f"{binary}:{os.environ['PATH']}",
-        "EVENT_REPOSITORY": "flagos-ai/Torch-FL",
-        "EVENT_REF": SHA,
-        "PR_NUMBER": number,
+        "GITHUB_REPOSITORY": "flagos-ai/Torch-FL",
+        "GITHUB_SHA": SHA,
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_EVENT_PATH": str(event_path),
+        "EVENT_SHA": SHA,
         "GITHUB_OUTPUT": str(output),
         "FAKE_PR": json.dumps(pr or {}),
     }
     process = subprocess.run(
-        ["bash", "-e", "-c", RUN], env=env, capture_output=True, text=True
+        ["bash", "-e", "-c", RUN], env=env, cwd=tmp_path, capture_output=True, text=True
     )
     return process, output.read_text()
 
@@ -54,7 +75,10 @@ def _resolve(tmp_path, number="", pr=None):
 def test_normal_run_pins_the_event_commit(tmp_path):
     process, output = _resolve(tmp_path)
     assert process.returncode == 0, process.stderr
-    assert output == f"repository=flagos-ai/Torch-FL\nref={SHA}\n"
+    fields = dict(line.split("=", 1) for line in output.splitlines())
+    assert fields["repository"] == "flagos-ai/Torch-FL"
+    assert fields["ref"] == SHA
+    assert json.loads(fields["request"])["selection"] == "all"
 
 
 def test_fork_run_resolves_both_repository_and_immutable_head(tmp_path):
@@ -64,7 +88,12 @@ def test_fork_run_resolves_both_repository_and_immutable_head(tmp_path):
     }
     process, output = _resolve(tmp_path, "42", pr)
     assert process.returncode == 0, process.stderr
-    assert output == f"repository=contributor/fork\nref={'b' * 40}\n"
+    fields = dict(line.split("=", 1) for line in output.splitlines())
+    assert fields["repository"] == "contributor/fork"
+    assert fields["ref"] == "b" * 40
+    request = json.loads(fields["request"])
+    assert request["target_kind"] == "head"
+    assert request["base_sha"] == "c" * 40
 
 
 @pytest.mark.parametrize("number", ["0", "-1", "01", "42; echo unsafe", "$(whoami)"])

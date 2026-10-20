@@ -28,6 +28,7 @@ from ci.generate_matrix import (
     _load_platforms,
     _platforms_from_dispatch,
     _platforms_from_files,
+    _platforms_from_labels,
 )
 from compose_integration_manifest import compose
 from test_tiers import policy, risk_profile
@@ -83,12 +84,25 @@ def build_plan(request, contract, source, changed):
             "platforms must be all, a comma-separated list, or a JSON array"
         )
     selected = _platforms_from_dispatch(selection, known)
-    if selection.strip() == "all" and changed is not None:
-        selected = _platforms_from_files(changed, known, configs)
+    candidates = selected
+    mode = request.get("selection", "affected" if selection.strip() == "all" else "all")
+    if mode not in ("affected", "all"):
+        raise ValueError("selection must be affected or all")
+    labels = request.get("pr_labels", [])
+    if not isinstance(labels, list) or not all(isinstance(lb, str) for lb in labels):
+        raise ValueError("PR labels must be an array of strings")
+    routed = _platforms_from_labels(labels, known)
+    if routed is not None:
+        selected = routed
+    elif mode == "affected" and changed is not None:
+        affected = _platforms_from_files(changed, known, configs)
+        selected = [platform for platform in selected if platform in affected]
     inferred, risk, matched, diff_status = infer_level(changed, contract)
     level = max(
         (inferred, "L0" if requested == "auto" else requested), key=LEVELS.__getitem__
     )
+    if routed is not None:
+        level = max((level, "L2"), key=LEVELS.__getitem__)
     profile = request.get("profile", "pr")
     tiers = policy(source)
     if profile == "auto":
@@ -107,7 +121,7 @@ def build_plan(request, contract, source, changed):
         raise ValueError(f"test level {level} is not supported")
     # An explicit hardware request must not become an empty, passing matrix.
     if level in ("L2", "L3") and not selected:
-        selected = known
+        selected = candidates
     if profile in ("nightly", "weekly") and selection.strip() == "all":
         selected = known
     manifest_path = source / ".github/integration-manifest.yml"
@@ -127,15 +141,37 @@ def build_plan(request, contract, source, changed):
         fingerprint.update(platform.encode())
         fingerprint.update(path.read_bytes())
     fingerprint.update(json.dumps(contract, sort_keys=True).encode())
+    expected_cases = {
+        p: [g["id"] for g in sorted(groups, key=lambda g: g["level"])]
+        for p, groups in selections.items()
+    }
+    # Reruns may only reuse reports for the same execution policy and control code.
+    fingerprint.update(
+        json.dumps(
+            {
+                "profile": profile,
+                "test_level": level,
+                "selection": mode,
+                "expected_cases": expected_cases,
+                **{
+                    key: request.get(key, "")
+                    for key in ("control_sha", "target_kind", "base_sha", "diff_sha")
+                },
+            },
+            sort_keys=True,
+        ).encode()
+    )
     return {
         "schema_version": "flagcicd.plan/v1",
         **request,
+        **{
+            key: request.get(key, "")
+            for key in ("control_sha", "target_kind", "diff_sha")
+        },
+        "selection": mode,
         "profile": profile,
         "cases": selections,
-        "expected_cases": {
-            p: [g["id"] for g in sorted(groups, key=lambda g: g["level"])]
-            for p, groups in selections.items()
-        },
+        "expected_cases": expected_cases,
         "test_level": level,
         "scope": contract["levels"][level]["scope"],
         "risk_level": risk,
@@ -173,6 +209,10 @@ def report_context(plan):
         {
             **{key: plan[key] for key in fields},
             "profile": plan.get("profile", "pr"),
+            **{
+                key: plan.get(key, "")
+                for key in ("control_sha", "target_kind", "diff_sha", "selection")
+            },
             "expected_cases": plan.get("expected_cases", {}),
         },
         separators=(",", ":"),
@@ -195,7 +235,9 @@ def main():
     previous = Path.cwd()
     try:
         os.chdir(args.source)
-        changed = _changed_files("main", request["base_sha"], request["source_sha"])
+        changed = _changed_files(
+            "main", request["base_sha"], request.get("diff_sha", request["source_sha"])
+        )
     finally:
         os.chdir(previous)
     plan = build_plan(request, contract, args.source, changed)

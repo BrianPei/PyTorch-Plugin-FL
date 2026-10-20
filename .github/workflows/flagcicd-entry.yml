@@ -102,6 +102,7 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          CONTROL_SHA: ${{ github.workflow_sha }}
         run: python control/.github/scripts/flagcicd_resolve.py --output request.json
       - name: Checkout source data
         uses: actions/checkout@v4
@@ -116,6 +117,8 @@ jobs:
       # `git diff base...head` then fails with "no merge base" and silently
       # degrades the plan to an unavailable diff.
       - name: Fetch comparison commit
+        continue-on-error: true
+        timeout-minutes: 3
         env:
           BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
         run: >-
