@@ -17,6 +17,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -445,9 +446,30 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
 
 
 def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
-    sha = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-    ).strip()
+    checkout = tmp_path / "source"
+    shutil.copytree(ROOT / ".github/configs", checkout / ".github/configs")
+    shutil.copyfile(
+        ROOT / ".github/integration-manifest.yml",
+        checkout / ".github/integration-manifest.yml",
+    )
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(checkout), *args], text=True
+        ).strip()
+
+    git("init", "-q")
+    git("add", ".")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "base",
+    )
+    sha = git("rev-parse", "HEAD")
     source = request(source_sha=sha, base_sha=sha, requested_level="L1")
     input_file = tmp_path / "request.json"
     input_file.write_text(json.dumps(source))
@@ -466,7 +488,7 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
             "--request",
             str(input_file),
             "--source",
-            str(ROOT),
+            str(checkout),
             "--output",
             str(output),
         ],
