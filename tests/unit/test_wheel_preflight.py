@@ -356,6 +356,9 @@ def test_l1_build_uses_isolated_pinned_cpu_torch():
         (SOURCE_ROOT / ".github/workflows/wheel-checks.yml").read_text()
     )
     job = workflow["jobs"]["wheel-checks"]
+    # NGC 24.10 is Ubuntu 22.04; a newer host's cached Python cannot run here.
+    assert job["container"]["image"] == "nvcr.io/nvidia/pytorch:24.10-py3"
+    assert job["runs-on"] == "ubuntu-22.04"
     steps = job["steps"]
     prepare = next(
         step for step in steps if step.get("name") == "Install build dependencies"
