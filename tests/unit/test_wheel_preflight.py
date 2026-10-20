@@ -392,6 +392,7 @@ def test_l1_installs_candidate_into_clean_target():
     source = install["run"]
     assert 'INSTALL_ROOT="$RUNNER_TEMP/torch-fl-wheel-installed"' in source
     assert 'rm -rf "$INSTALL_ROOT"' in source
+    assert "rm -rf torch_fl.egg-info" in source
     assert (
         'python -m pip install --no-deps --target "$INSTALL_ROOT" dist/*.whl' in source
     )

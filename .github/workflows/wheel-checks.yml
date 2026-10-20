@@ -127,6 +127,10 @@ jobs:
           # wheel did not list in its RECORD.
           INSTALL_ROOT="$RUNNER_TEMP/torch-fl-wheel-installed"
           rm -rf "$INSTALL_ROOT"
+          # `build` leaves torch_fl.egg-info in the checkout. If it remains,
+          # importlib.metadata can select that source distribution instead of
+          # the wheel installed into INSTALL_ROOT.
+          rm -rf torch_fl.egg-info
           python -m pip install --no-deps --target "$INSTALL_ROOT" dist/*.whl
           printf 'TORCH_FL_INSTALL_ROOT=%s\n' "$INSTALL_ROOT" >> "$GITHUB_ENV"
           printf 'PYTHONPATH=%s\n' "$INSTALL_ROOT" >> "$GITHUB_ENV"
