@@ -17,9 +17,16 @@ levels:
     scope: installed_wheel_integration
     checks: [L1, build, wheel-validation, install, integration-tests]
   L3:
-    support: unsupported
+    support: supported
+    readiness: requires_hardware_validation
+    scope: installed_wheel_compatibility_and_runtime
+    checks: [L2, compatibility, resource-lifecycle, distributed-contracts]
   L4:
-    support: unsupported
+    support: supported
+    readiness: requires_platform_models_and_approved_performance_references
+    scope: candidate_release_acceptance
+    entry_workflow: .github/workflows/release.yml
+    checks: [L0, L1, candidate-L2, candidate-L3, models, endurance, complete-evidence]
 
 risk_rules:
   version: v1

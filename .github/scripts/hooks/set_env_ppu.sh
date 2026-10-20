@@ -383,6 +383,8 @@ export LIBRARY_PATH="$CUDA_HOME/lib64:$PPU_SDK/lib:$PPU_SDK/lib64${CLEAN_LIBRARY
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$PPU_SDK/lib:$PPU_SDK/lib64${VENDOR_NVIDIA_LIBS:+:$VENDOR_NVIDIA_LIBS}:$CPU_TORCH_ROOT/lib${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
 
 cd "$REPO_ROOT"
+# Candidate acceptance checks the installed archive, not source build outputs.
+if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" != "1" ]]; then
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   # Prebuild so package_data sees libtorch_fl.so and the bundled PPU assets
   # before the common workflow invokes python -m build.
@@ -464,6 +466,8 @@ print(f"flag_gems: {flag_gems.__version__} -> {flag_gems.__file__}")
 print(f"flag_gems vendor: {vendor}")
 PY
 fi
+fi
+# End source-only checks; environment exports also apply to candidates.
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"

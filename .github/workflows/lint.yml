@@ -44,10 +44,23 @@ jobs:
           python-version: "3.12"
 
       - name: Install ruff
-        run: pip install ruff==0.15.12
+        run: pip install ruff==0.15.12 PyYAML==6.0.2
 
       - name: Ruff check
         run: ruff check --output-format=github . scripts/tools/torch-fl-preflight
 
       - name: Ruff format check
         run: ruff format --check . scripts/tools/torch-fl-preflight
+
+      - name: Check test inventory completeness
+        run: python3 .github/scripts/test_tiers.py --inventory
+
+      - name: Retain classified test inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-inventory-${{ github.run_attempt }}
+          path: |
+            .flagcicd/test-inventory.json
+            .flagcicd/test-tiers.json
+          if-no-files-found: error
+          retention-days: 14

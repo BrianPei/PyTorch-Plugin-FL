@@ -17,6 +17,8 @@ import json
 import os
 import re
 import signal
+import threading
+import time
 import shlex
 import subprocess
 import sys
@@ -202,6 +204,7 @@ def run_command(command, test_environment, workdir):
     feeds the teardown-crash check.
     """
     required_mpirun(command, test_environment)
+    timed_out = threading.Event()
     process = subprocess.Popen(
         ["bash", "-c", f"set -euo pipefail\n{command}"],
         stdout=subprocess.PIPE,
@@ -209,7 +212,20 @@ def run_command(command, test_environment, workdir):
         text=True,
         env=test_environment,
         cwd=workdir,
+        start_new_session=True,
     )
+
+    def expire():
+        timed_out.set()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    timer = threading.Timer(
+        float(test_environment.get("FLAGCICD_CASE_TIMEOUT", "1800")), expire
+    )
+    timer.start()
     assert process.stdout is not None
     try:
         lines = []
@@ -221,10 +237,12 @@ def run_command(command, test_environment, workdir):
     except KeyboardInterrupt:
         # A cancelled runner must not leave a pytest process writing to the
         # report directory or to a retry's workspace.
-        process.kill()
+        os.killpg(process.pid, signal.SIGKILL)
         process.wait()
         raise
-    return returncode, "".join(lines)
+    finally:
+        timer.cancel()
+    return (124 if timed_out.is_set() else returncode), "".join(lines)
 
 
 def main():
@@ -239,7 +257,36 @@ def main():
     workdir = os.environ.get("INTEGRATION_WORKDIR")
     if workdir and not os.path.isdir(workdir):
         raise SystemExit(f"INTEGRATION_WORKDIR does not exist: {workdir}")
+    ledger_path = (
+        Path(os.environ["FLAGCICD_REPORT_DIR"]) / "groups.json"
+        if os.environ.get("FLAGCICD_REPORT_DIR")
+        else None
+    )
+    ledger = {
+        "expected": [test["name"] for test in tests],
+        "groups": [],
+        "complete": False,
+    }
+
+    def save():
+        if ledger_path:
+            ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            ledger_path.write_text(json.dumps(ledger, indent=2) + "\n")
+
+    save()
     for index, test in enumerate(tests, start=1):
+        record = {
+            "name": test["name"],
+            "id": test.get("id", test["name"]),
+            "level": test.get("level", "L2"),
+            "category": test.get("category", "functional"),
+            "command": test["command"],
+            "requires_pytest": "pytest" in test["command"]
+            or "run_unit_tests.py" in test["command"],
+            "status": "running",
+        }
+        ledger["groups"].append(record)
+        save()
         print(
             f"===== [{index}/{len(tests)}] {test['name']} =====",
             flush=True,
@@ -249,9 +296,20 @@ def main():
             test_environment[key] = os.path.expandvars(value)
         if test_environment.get("FLAGCICD_REPORT_DIR"):
             test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
-        allow_crash = teardown_crash_allowed(test_environment)
+        test_environment["FLAGCICD_CASE_TIMEOUT"] = str(
+            test.get("timeout_seconds", 1800)
+        )
+        allow_crash = (
+            teardown_crash_allowed(test_environment) if not test.get("level") else False
+        )
         returncode, output = run_command(test["command"], test_environment, workdir)
         ok, tolerated = classify_command_result(returncode, output, allow_crash)
+        record.update(
+            returncode=returncode,
+            status="passed" if ok else ("timeout" if returncode == 124 else "failed"),
+            finished=time.time(),
+        )
+        save()
         if tolerated:
             print(
                 f"Integration test '{test['name']}' passed "
@@ -268,6 +326,8 @@ def main():
                 flush=True,
             )
             raise SystemExit(returncode)
+    ledger["complete"] = True
+    save()
     return 0
 
 

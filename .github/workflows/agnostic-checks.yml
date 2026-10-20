@@ -150,3 +150,6 @@ jobs:
       - name: Run FlagCICD entry contract tests
         if: hashFiles('tests/unit/test_flagcicd_entry.py') != ''
         run: python -m pytest tests/unit/test_flagcicd_entry.py -v --tb=short -p no:cacheprovider
+
+      - name: Check tier policy and inventory regressions
+        run: python -m pytest tests/unit/test_test_tiers.py -v --tb=short -p no:cacheprovider

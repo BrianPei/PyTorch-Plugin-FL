@@ -86,13 +86,20 @@ def platform_report(plan, platform, jobs, raw, attempt):
     # Record hardware identity for L2+ runs
     hardware_identity = {}
     if plan["test_level"] not in ("L0", "L1"):
-        hardware_path = raw / "pytest" / f"hardware-{platform}.json"
         try:
-            hardware_identity = json.loads(hardware_path.read_text())
-            if not all(k in hardware_identity for k in ("machine_model", "sdk_version", "accelerator_count")):
-                errors.append(f"hardware identity file missing required fields: {hardware_path}")
-        except OSError:
-            errors.append(f"L2+ run missing hardware identity file: {hardware_path}")
+            hardware_identity = one_report(raw / "pytest", f"hardware-{platform}.json")
+            if not all(
+                k in hardware_identity
+                for k in ("machine_model", "sdk_version", "accelerator_count")
+            ):
+                raise ValueError("hardware identity is missing required fields")
+            if (
+                type(hardware_identity["accelerator_count"]) is not int
+                or hardware_identity["accelerator_count"] < 1
+            ):
+                raise ValueError("hardware execution requires at least one accelerator")
+        except (OSError, ValueError, TypeError) as error:
+            errors.append(f"invalid L2+ hardware identity: {error}")
 
     if jobs["configuration"]["result"] == "cancelled" or result == "cancelled":
         status = "cancelled"
@@ -111,7 +118,16 @@ def platform_report(plan, platform, jobs, raw, attempt):
     else:
         status = "infra_error"
         errors.append("the platform did not successfully complete all required stages")
+    if errors and status == "passed":
+        status = "report_error"
     metrics = {"coverage": {"available": False}}
+    if list((raw / "pytest").rglob("performance.json")):
+        try:
+            metrics["performance"] = one_report(raw / "pytest", "performance.json")
+        except (OSError, ValueError, TypeError) as error:
+            errors.append(f"invalid performance evidence: {error}")
+            if status == "passed":
+                status = "report_error"
     try:
         pytest = one_report(raw / "pytest", f"pytest-{platform}.json")
         metadata = pytest["flagcicd"]
@@ -125,6 +141,17 @@ def platform_report(plan, platform, jobs, raw, attempt):
             )
         if metadata["complete"] is not True:
             raise ValueError("pytest report is incomplete")
+        expected_cases = plan.get("expected_cases", {}).get(platform)
+        if expected_cases is not None:
+            execution = metadata.get("execution") or {}
+            observed_cases = [group["id"] for group in execution.get("groups", [])]
+            if (
+                execution.get("complete") is not True
+                or observed_cases != expected_cases
+            ):
+                raise ValueError(
+                    "executed case groups do not match the trusted test plan"
+                )
         counts = pytest["summary"]
         if not isinstance(counts, dict) or not all(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
@@ -203,11 +230,19 @@ def aggregate(plan, jobs, directory, attempt):
         plan = {"expected_platforms": []}
     level = plan.get("test_level", "L0")
     expected_jobs = {"plan", "lint", "preflight"}
-    if level in ("L1", "L2"):
-        expected_jobs.update(("agnostic", "codegen"))
-    if level == "L2":
+    if level in ("L1", "L2", "L3", "L4"):
+        expected_jobs.update(("agnostic", "codegen", "wheel-checks"))
+    if level in ("L2", "L3", "L4"):
         expected_jobs.add("platforms")
-    for name in ("plan", "lint", "preflight", "agnostic", "codegen", "platforms"):
+    for name in (
+        "plan",
+        "lint",
+        "preflight",
+        "agnostic",
+        "codegen",
+        "wheel-checks",
+        "platforms",
+    ):
         result = jobs.get(name, {}).get("result", "missing")
         expected = "success" if name in expected_jobs else "skipped"
         if result != expected:
@@ -264,7 +299,15 @@ def aggregate(plan, jobs, directory, attempt):
     ):
         if candidate in statuses:
             status = candidate
-    for name in ("plan", "preflight", "lint", "agnostic", "codegen", "platforms"):
+    for name in (
+        "plan",
+        "preflight",
+        "lint",
+        "agnostic",
+        "codegen",
+        "wheel-checks",
+        "platforms",
+    ):
         if name not in expected_jobs:
             continue
         result = jobs.get(name, {}).get("result", "missing")

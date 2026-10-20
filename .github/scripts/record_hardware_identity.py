@@ -28,7 +28,6 @@ Called after wheel install in integration-tests.yml; travels with pytest artifac
 import argparse
 import json
 import platform
-import sys
 from pathlib import Path
 
 
@@ -46,6 +45,7 @@ def get_sdk_version():
     """Read SDK version from installed wheel's compatibility.json."""
     try:
         import torch_fl
+
         compat_path = Path(torch_fl.__file__).parent / "compatibility.json"
         if compat_path.exists():
             compat = json.loads(compat_path.read_text())
@@ -59,6 +59,7 @@ def get_accelerator_count():
     """Get accelerator count from torch_fl.flagos.device_count()."""
     try:
         import torch_fl.flagos
+
         return torch_fl.flagos.device_count()
     except (ImportError, AttributeError):
         return 0

@@ -30,9 +30,10 @@ from ci.generate_matrix import (
     _platforms_from_files,
 )
 from compose_integration_manifest import compose
+from test_tiers import policy, risk_profile
 
 
-LEVELS = {"L0": 0, "L1": 1, "L2": 2}
+LEVELS = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
 
 
 def infer_level(changed, contract):
@@ -88,24 +89,53 @@ def build_plan(request, contract, source, changed):
     level = max(
         (inferred, "L0" if requested == "auto" else requested), key=LEVELS.__getitem__
     )
+    profile = request.get("profile", "pr")
+    tiers = policy(source)
+    if profile == "auto":
+        profile = risk_profile(changed)
+        if level == "L3":
+            profile = "pr-risk"
+    elif profile not in tiers["profiles"] or profile == "release":
+        raise ValueError("unsupported profile; release acceptance needs a candidate")
+    if request.get("profile") not in (None, "auto") or profile == "pr-risk":
+        level = max(
+            (level, tiers["profiles"][profile]["level"]), key=LEVELS.__getitem__
+        )
+    if level == "L3" and profile == "pr":
+        profile = "pr-risk"
     if contract["levels"][level]["support"] != "supported":
         raise ValueError(f"test level {level} is not supported")
     # An explicit hardware request must not become an empty, passing matrix.
-    if level == "L2" and not selected:
+    if level in ("L2", "L3") and not selected:
+        selected = known
+    if profile in ("nightly", "weekly") and selection.strip() == "all":
         selected = known
     manifest_path = source / ".github/integration-manifest.yml"
     manifest = yaml.safe_load(manifest_path.read_text())
     fingerprint = hashlib.sha256(manifest_path.read_bytes())
+    selections = {}
+    fingerprint.update(json.dumps(tiers, sort_keys=True).encode())
+    for name in ("test-inventory.json", "performance-baselines.json"):
+        fingerprint.update((source / ".flagcicd" / name).read_bytes())
     for platform in selected or known:
         path = configs / f"{platform}.yml"
         config = yaml.safe_load(path.read_text())
-        compose(manifest, config, platform, known)
+        groups = compose(manifest, config, platform, known, profile, tiers)
+        selections[platform] = [
+            {key: group[key] for key in ("id", "level", "category")} for group in groups
+        ]
         fingerprint.update(platform.encode())
         fingerprint.update(path.read_bytes())
     fingerprint.update(json.dumps(contract, sort_keys=True).encode())
     return {
         "schema_version": "flagcicd.plan/v1",
         **request,
+        "profile": profile,
+        "cases": selections,
+        "expected_cases": {
+            p: [g["id"] for g in sorted(groups, key=lambda g: g["level"])]
+            for p, groups in selections.items()
+        },
         "test_level": level,
         "scope": contract["levels"][level]["scope"],
         "risk_level": risk,
@@ -116,7 +146,7 @@ def build_plan(request, contract, source, changed):
         "config_hash": fingerprint.hexdigest(),
         "platforms": selected,
         "validated_platforms": selected or known,
-        "expected_platforms": selected if level == "L2" else [],
+        "expected_platforms": selected if level in ("L2", "L3") else [],
     }
 
 
@@ -139,7 +169,14 @@ def report_context(plan):
         "task_id",
         "parent_run_id",
     )
-    encoded = json.dumps({key: plan[key] for key in fields}, separators=(",", ":"))
+    encoded = json.dumps(
+        {
+            **{key: plan[key] for key in fields},
+            "profile": plan.get("profile", "pr"),
+            "expected_cases": plan.get("expected_cases", {}),
+        },
+        separators=(",", ":"),
+    )
     if len(encoded.encode("utf-8")) > 16384:
         raise ValueError("report context exceeds the 16 KiB dispatch limit")
     return encoded
@@ -169,6 +206,7 @@ def main():
     args.output.write_text(json.dumps(plan, indent=2) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("context=" + report_context(plan) + "\n")
+        output.write(f"profile={plan['profile']}\n")
         output.write(f"test_level={plan['test_level']}\n")
         output.write("platforms=" + json.dumps(plan["expected_platforms"]) + "\n")
         output.write(

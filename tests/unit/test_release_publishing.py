@@ -285,25 +285,14 @@ def test_the_build_workflow_derives_the_pre_release_from_the_tag():
 # the platform somewhere in the workflow (the test above) is satisfied either way.
 
 
-def test_every_release_build_job_carries_the_upload():
-    """The one matrix job builds and uploads every publishing platform.
-
-    There were seven spelled-out jobs before, each holding its own `publish:`
-    and `NEXUS_TOKEN`; a platform wired without them produced a green release
-    with a wheel silently missing. There is one job now, so the upload is
-    checked once, and the matrix it fans out over is held to the publishing
-    platforms so a platform cannot drop out of the release unnoticed.
-    """
+def test_release_publishes_only_after_accepting_all_candidate_wheels():
     jobs = _release_jobs(RELEASE.read_text(encoding="utf-8"))
-    builds = {
-        name: body
-        for name, body in jobs.items()
-        if ".github/workflows/build-wheel.yml" in body
-    }
-    assert len(builds) == 1, sorted(builds)
-    name, body = next(iter(builds.items()))
-    assert "publish: true" in body, f"{name} builds a wheel but does not publish it"
-    assert "NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}" in body, name
+    assert "publish: false" in jobs["build"]
+    assert "test_profile: release" in jobs["acceptance"]
+    assert "candidate_artifact: wheel-${{ matrix.platform }}" in jobs["acceptance"]
+    assert "needs: [guard, acceptance]" in jobs["publish"]
+    assert ".github/workflows/publish-accepted-wheel.yml" in jobs["publish"]
+    assert "NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}" in jobs["publish"]
     assert set(_release_matrix_platforms()) == set(publishing_platforms())
 
 

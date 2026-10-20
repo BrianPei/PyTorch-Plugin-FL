@@ -445,6 +445,10 @@ install_flagcx() {
 # Build the in-tree extension so package_data sees libtorch_fl.so before the
 # common workflow runs `python -m build`.
 build_flagos_inplace() {
+  if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" == "1" ]]; then
+    echo "::error::Candidate acceptance must not rebuild torch_fl from source" >&2
+    return 1
+  fi
   cd "$REPO_ROOT"
   python setup.py build_ext --inplace
 }

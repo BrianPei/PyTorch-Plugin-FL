@@ -181,7 +181,7 @@ def _environment(entry, field):
     return {str(key): str(value) for key, value in environment.items()}
 
 
-def compose(manifest, config, platform, known):
+def compose(manifest, config, platform, known, profile=None, tier_policy=None):
     """The `integration_tests` list for one platform.
 
     Order is the manifest's, never the config's, so two platforms that run the
@@ -248,6 +248,14 @@ def compose(manifest, config, platform, known):
 
     if not composed:
         raise ManifestError(f"no steps apply to {platform!r}")
+    if profile:
+        from test_tiers import policy, select
+
+        ids = [
+            entry["id"] for entry in steps if platform in _entry_platforms(entry, known)
+        ]
+        composed = select(composed, ids, profile, platform, tier_policy or policy())
+        composed.sort(key=lambda group: group["level"])
     return composed
 
 
@@ -274,6 +282,9 @@ def main(argv=None):
         default=".github/configs",
         help="directory the platform list is read from",
     )
+    parser.add_argument(
+        "--profile", choices=("pr", "pr-risk", "nightly", "weekly", "release")
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -281,8 +292,8 @@ def main(argv=None):
         config = json.loads(Path(args.platform_config).read_text())
         known = known_platforms(args.config_dir)
         steps, _ids, assigned = validate_manifest(manifest, known)
-        composed = compose(manifest, config, args.platform, known)
-    except ManifestError as error:
+        composed = compose(manifest, config, args.platform, known, args.profile)
+    except (ManifestError, ValueError, KeyError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
     except (OSError, json.JSONDecodeError) as error:

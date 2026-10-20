@@ -20,7 +20,8 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # 02:00 CST daily
+    - cron: '0 18 * * 0-5'   # 02:00 CST Monday-Saturday: L3
+    - cron: '0 18 * * 6'   # 02:00 CST Sunday: weekly stability/model regression
   push:
     branches: [main, dev, devops, dev-hygon, dev-thead, dev-musa, iluvatar_build_and_test]
   pull_request:
@@ -136,6 +137,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       platforms: ${{ steps.detect.outputs.platforms }}
+      profile: ${{ steps.detect.outputs.profile }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -174,6 +176,7 @@ jobs:
             --pr-labels "$PR_LABELS" \
             --dispatch-platforms "$DISPATCH_PLATFORMS" \
             >> "$GITHUB_OUTPUT"
+          python .github/scripts/test_tiers.py --event-profile >> "$GITHUB_OUTPUT"
 
   # One hardware pipeline per configured platform. The reusable workflow reads
   # runner, image, timeout, and test manifest values from that platform config.
@@ -189,6 +192,7 @@ jobs:
       FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
     with:
       platform: ${{ matrix.platform }}
+      test_profile: ${{ needs.discover-platforms.outputs.profile }}
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
@@ -217,7 +221,7 @@ jobs:
 
           jobs = json.loads(os.environ["RESULTS"])
           errors = []
-          for name in ("resolve-checkout", "lint", "agnostic-checks", "codegen-checks", "discover-platforms"):
+          for name in ("resolve-checkout", "lint", "agnostic-checks", "codegen-checks", "wheel-checks", "discover-platforms"):
               if jobs[name]["result"] != "success":
                   errors.append(f"{name}: {jobs[name]['result']}")
 

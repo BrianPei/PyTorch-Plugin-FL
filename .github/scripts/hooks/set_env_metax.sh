@@ -305,6 +305,8 @@ fi
 
 cd "$REPO_ROOT"
 
+# Candidate acceptance checks the installed archive, not source build outputs.
+if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" != "1" ]]; then
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   # setuptools collects package_data before build_ext on the first wheel build.
   # Prebuilding makes torch_fl/lib/*.so available when the common workflow
@@ -405,3 +407,5 @@ print(f"FlagGems: {flag_gems.__version__} ({flag_gems.__file__})")
 PY
   fi
 fi
+fi
+# End source-only checks; environment exports also apply to candidates.

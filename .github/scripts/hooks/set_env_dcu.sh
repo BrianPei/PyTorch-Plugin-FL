@@ -364,6 +364,8 @@ export LIBRARY_PATH="${HYHAL_LD_PATH:+$HYHAL_LD_PATH:}$CPU_TORCH_ROOT/lib${VENDO
 export LD_LIBRARY_PATH="${HYHAL_LD_PATH:+$HYHAL_LD_PATH:}$CPU_TORCH_ROOT/lib${VENDOR_FLAGGEMS_LIB:+:$VENDOR_FLAGGEMS_LIB}${CLEAN_LD_LIBRARY_PATH:+:$CLEAN_LD_LIBRARY_PATH}"
 
 cd "$REPO_ROOT"
+# Candidate acceptance checks the installed archive, not source build outputs.
+if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" != "1" ]]; then
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   # Prebuild so package_data sees libtorch_fl.so before python -m build.
   build_flagos_inplace
@@ -583,6 +585,8 @@ print(f"CPU PyTorch: {torch.__version__}")
 print(f"CPU torch path: {torch_path}")
 print(f"DCU torch lib: {os.environ.get('FLAGOS_VENDOR_TORCH_LIB', '?')}")
 PY
+fi
+# End source-only checks; environment exports also apply to candidates.
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"

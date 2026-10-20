@@ -95,6 +95,12 @@ jobs:
       # secret that is not visible to this repository, or one of the `secrets:`
       # hops that carries it to a vendor runner, is otherwise only noticed when
       # the upload finally runs.
+      - name: Refuse publication without candidate acceptance
+        if: inputs.publish
+        run: |
+          echo "::error::Use release.yml: build once, accept the candidate, then publish the accepted bytes."
+          exit 1
+
       - name: Check the release credentials
         if: inputs.publish
         env:

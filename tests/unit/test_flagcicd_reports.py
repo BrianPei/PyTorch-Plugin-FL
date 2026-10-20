@@ -205,7 +205,11 @@ def test_abrupt_exit_keeps_completed_sessions_without_inventing_crash_results(tm
     assert process.returncode == 3
     report = _merge(reports, "failure")
     assert report["summary"]["total"] == report["summary"]["passed"] == 1
-    assert len(report["flagcicd"]["incomplete_sessions"]) == 1
+    assert "groups.json" in report["flagcicd"]["incomplete_sessions"]
+    assert any(
+        name.endswith(".json") and name != "groups.json"
+        for name in report["flagcicd"]["incomplete_sessions"]
+    )
     assert report["exitcode"] == 1
 
 

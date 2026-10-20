@@ -12,48 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tag a release, get the wheels.
-#
-# Push `v2.10.0` and this builds the wheel on every publishing platform's own
-# runner and uploads each one to the vendor PyPI lane it belongs to -- build and
-# upload in the same job, on the same runner. The tag names the release and each
-# wheel's local segment names its SDK, so `v2.10.0` produces
-# `torch_fl-2.10.0+cuda13.3`, `torch_fl-2.10.0+dtk2604`, and so on: one release,
-# one artifact per platform.
-#
-# The build reuses `build-wheel.yml`, the one wheel build, with the platform's
-# own config, so a release builds exactly what CI verified (same image, same
-# setup hook, same wheel build, and the same `Verify wheel` step that re-installs
-# the artifact before it is offered here). Nothing about the build is
-# release-only; `publish: true` is the only release-specific input.
-#
-# Uploading from the platform's own job is deliberate, and is how
-# flagos-ai/build-infra releases its own wheels. The other shape -- one
-# GitHub-hosted job downloading all seven artifacts and pushing them to Nexus --
-# put 2.35 GB on a cross-border link at ~0.13 MB/s and was killed by its own
-# 60-minute timeout on v2.10.0rc1, while the same bytes uploaded from a runner in
-# China at 13-23 MB/s. GitHub's own artifact hop is not the cost: that run moved
-# all seven artifacts in 22 seconds. Where each wheel goes is the `pypi_lane`
-# column of cmake/flagos_platforms.json; the upload itself is
-# .github/scripts/publish_wheels.py, run per platform by `build-wheel-common.yml`.
-#
-# Credentials: the organization secret NEXUS_TOKEN, in `user:token` form -- the
-# same one flagos-ai/build-infra uses. Publishing from each platform's own job
-# means it now reaches every vendor runner, with write access to every vendor
-# lane; the guard that travels with it is publish_wheels.py's version check,
-# which refuses to publish a wheel whose base version is not the tag, plus the
-# ref check that refuses to publish from anything but a tag. It is mapped
-# explicitly at every `uses:` hop, because `secrets: inherit` is not transitive.
-# No per-repo secret is needed; if the organization secret is not visible to this
-# repository, each build job fails on an empty token before it builds anything
-# rather than uploading nothing quietly.
-#
-# Recovering a single failed lane: each wheel is still uploaded as a workflow
-# artifact, so `gh run download <run-id> --pattern 'wheel-<platform>'` plus a
-# local `python .github/scripts/publish_wheels.py --wheels <dir> --tag <tag>`
-# re-uploads just that lane in about a minute, without rebuilding anything. The
-# version check makes it a no-op for lanes that already have the wheel. See
-# docs/development/releasing.md.
+# Build candidates once, accept the exact wheels, then publish on vendor runners.
+# A failed or incomplete platform blocks publication of every lane. Artifact
+# transfer is required evidence transport; accepted wheels are never rebuilt.
 
 name: Release
 
@@ -69,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   # The tag decides whether this is a release at all. Mirrors the guard in
@@ -129,18 +91,10 @@ jobs:
             echo "::notice::Non-release tag '${REF_NAME}' - building nothing. Re-run this workflow with workflow_dispatch to release it deliberately."
           fi
 
-  # One job per publishing platform, as a matrix rather than seven spelled-out
-  # blocks: the runner label, image, mounts and timeout each one used to name
-  # come from `.github/configs/<platform>.yml` through build-wheel.yml. The list
-  # below is what a release ships, so it is held to the platforms that carry a
-  # `pypi_lane` in cmake/flagos_platforms.json, in both directions, by
-  # tests/unit/test_release_publishing.py. `fail-fast: false` so one vendor's
-  # runner cannot cancel another vendor's build -- the blocks were independent
-  # before. Every job carries the upload with it.
   build:
     name: Build wheel (${{ matrix.platform }})
     if: needs.guard.outputs.publish == 'true'
-    needs: guard
+    needs: [guard, lint, preflight, agnostic, codegen, wheel-checks]
     strategy:
       fail-fast: false
       matrix:
@@ -148,6 +102,56 @@ jobs:
     uses: ./.github/workflows/build-wheel.yml
     with:
       platform: ${{ matrix.platform }}
-      publish: true
+      publish: false
+
+  lint:
+    needs: guard
+    uses: ./.github/workflows/lint.yml
+
+  preflight:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ascend, cuda, dcu, gcu, metax, musa, ppu]
+    uses: ./.github/workflows/load-platform-config.yml
+    with:
+      platform: ${{ matrix.platform }}
+
+  agnostic:
+    needs: [lint, preflight]
+    uses: ./.github/workflows/agnostic-checks.yml
+
+  codegen:
+    needs: [lint, preflight]
+    uses: ./.github/workflows/codegen-checks.yml
+
+  wheel-checks:
+    needs: [lint, preflight]
+    uses: ./.github/workflows/wheel-checks.yml
+
+  acceptance:
+    name: Accept candidate (${{ matrix.platform }})
+    needs: [guard, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ascend, cuda, dcu, gcu, metax, musa, ppu]
+    uses: ./.github/workflows/integration-tests.yml
+    with:
+      platform: ${{ matrix.platform }}
+      test_profile: release
+      candidate_artifact: wheel-${{ matrix.platform }}
+
+  publish:
+    name: Publish accepted wheel (${{ matrix.platform }})
+    needs: [guard, acceptance]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ascend, cuda, dcu, gcu, metax, musa, ppu]
+    uses: ./.github/workflows/publish-accepted-wheel.yml
+    with:
+      platform: ${{ matrix.platform }}
     secrets:
       NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}

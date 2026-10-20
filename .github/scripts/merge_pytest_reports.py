@@ -47,6 +47,21 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
             incomplete.append(session["report"])
             sessions.append(session)
             continue
+        selected = session.get("selected_nodeids")
+        if selected is None and (Path(directory) / "groups.json").exists():
+            incomplete.append(session["report"])
+            session["collection_error"] = "selected test inventory is missing"
+        if selected is not None:
+            observed = [test["nodeid"] for test in report["tests"]]
+            if (
+                not selected
+                or len(observed) != len(selected)
+                or set(selected) != set(observed)
+            ):
+                incomplete.append(session["report"])
+                session["collection_error"] = (
+                    "selected test inventory does not match executed tests"
+                )
         session["exitcode"] = report["exitcode"]
         session["summary"] = report["summary"]
         sessions.append(session)
@@ -63,6 +78,22 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
 
     if not sessions:
         raise ValueError("No pytest sessions started; no test report to upload")
+    ledger_path = Path(directory) / "groups.json"
+    ledger = None
+    if ledger_path.exists():
+        ledger = json.loads(ledger_path.read_text())
+        groups = ledger["groups"]
+        if (
+            not ledger["complete"]
+            or ledger["expected"] != [group["name"] for group in groups]
+            or any(group["status"] != "passed" for group in groups)
+        ):
+            incomplete.append("groups.json")
+        for group in groups:
+            if group["requires_pytest"] and not any(
+                session.get("group") == group["name"] for session in sessions
+            ):
+                incomplete.append("missing pytest session: " + group["name"])
     complete = not incomplete
     # The integration runner owns the verdict, including its existing explicit
     # teardown-crash policy and failures in non-pytest environment checks.
@@ -84,6 +115,7 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
             "complete": complete,
             "incomplete_sessions": incomplete,
             "sessions": sessions,
+            "execution": ledger,
         },
     }
 

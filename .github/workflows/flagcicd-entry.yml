@@ -37,7 +37,12 @@ on:
         description: Minimum level; changed files may raise it
         type: choice
         default: auto
-        options: [auto, L0, L1, L2]
+        options: [auto, L0, L1, L2, L3]
+      profile:
+        description: Execution profile; auto selects a bounded L3 subset for runtime changes
+        type: choice
+        default: auto
+        options: [auto, pr, pr-risk, nightly, weekly]
       task_id:
         description: Optional external task identifier
         type: string
@@ -75,6 +80,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       context: ${{ steps.plan.outputs.context }}
+      profile: ${{ steps.plan.outputs.profile }}
       test_level: ${{ steps.plan.outputs.test_level }}
       platforms: ${{ steps.plan.outputs.platforms }}
       validated_platforms: ${{ steps.plan.outputs.validated_platforms }}
@@ -164,9 +170,17 @@ jobs:
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
 
+  wheel-checks:
+    needs: [plan, lint, preflight]
+    if: needs.plan.outputs.test_level != 'L0'
+    uses: ./.github/workflows/wheel-checks.yml
+    with:
+      checkout_repository: ${{ needs.plan.outputs.source_repository }}
+      checkout_ref: ${{ needs.plan.outputs.source_sha }}
+
   platforms:
-    needs: [plan, lint, preflight, agnostic, codegen]
-    if: needs.plan.outputs.test_level == 'L2'
+    needs: [plan, lint, preflight, agnostic, codegen, wheel-checks]
+    if: needs.plan.outputs.test_level == 'L2' || needs.plan.outputs.test_level == 'L3'
     strategy:
       fail-fast: false
       matrix:
@@ -179,11 +193,12 @@ jobs:
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
       flagcicd_plan: ${{ needs.plan.outputs.context }}
+      test_profile: ${{ needs.plan.outputs.profile }}
 
   complete:
     name: FlagCICD complete
     if: always()
-    needs: [plan, lint, preflight, agnostic, codegen, platforms]
+    needs: [plan, lint, preflight, agnostic, codegen, wheel-checks, platforms]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

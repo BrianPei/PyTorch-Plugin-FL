@@ -1,0 +1,332 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Exercise tier selection, lost test evidence and immutable release candidates."""
+
+import copy
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import zipfile
+
+import pytest
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ROOT / ".github/scripts"
+sys.path.insert(0, str(SCRIPTS))
+from candidate_evidence import finish, sha256, verify, verify_installation  # noqa: E402
+from compose_integration_manifest import compose  # noqa: E402
+from merge_pytest_reports import merge_reports  # noqa: E402
+from flagcicd_plan import build_plan, report_context  # noqa: E402
+from test_tiers import check_inventory, policy, risk_profile  # noqa: E402
+
+sys.path.pop(0)
+
+
+def test_repository_inventory_is_complete():
+    check_inventory()
+
+
+def test_unregistered_file_is_rejected(tmp_path):
+    (tmp_path / ".flagcicd").mkdir()
+    (tmp_path / ".flagcicd/test-inventory.json").write_text('{"files": {}}')
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_forgotten.py").touch()
+    with pytest.raises(ValueError, match="unclassified"):
+        check_inventory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "platform", sorted(p.stem for p in (ROOT / ".github/configs").glob("*.yml"))
+)
+def test_profiles_classify_every_manifest_case(platform):
+    manifest = yaml.safe_load((ROOT / ".github/integration-manifest.yml").read_text())
+    config = yaml.safe_load((ROOT / f".github/configs/{platform}.yml").read_text())
+    known = [p.stem for p in (ROOT / ".github/configs").glob("*.yml")]
+    pr = compose(manifest, config, platform, known, "pr")
+    nightly = compose(manifest, config, platform, known, "nightly")
+    assert all(g["level"] == "L2" for g in pr)
+    assert {g["id"] for g in pr} <= {g["id"] for g in nightly}
+    assert {"l3_installed_contract", "l3_lifecycle", "multi_device_contracts"} <= {
+        g["id"] for g in nightly
+    }
+    assert [g["level"] for g in nightly] == sorted(g["level"] for g in nightly)
+    assert all("UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1" not in g["command"] for g in nightly)
+
+
+def test_release_refuses_unconfigured_model_acceptance():
+    from test_tiers import select
+
+    with pytest.raises(ValueError, match="Model mounts"):
+        select([], [], "release", "ascend", policy())
+
+
+def test_candidate_acceptance_excludes_source_only_diagnostics():
+    from test_tiers import select
+
+    selected = select(
+        [{"name": "Source sweep", "command": 'cd "$GITHUB_WORKSPACE" && pytest'}],
+        ["unit_tests_per_file"],
+        "release",
+        "cuda",
+        policy(),
+    )
+    assert "unit_tests_per_file" not in {group["id"] for group in selected}
+
+
+@pytest.mark.parametrize(
+    "changed,expected",
+    [
+        (None, "pr-risk"),
+        (["README.md"], "pr"),
+        (["csrc/runtime.cpp"], "pr-risk"),
+        (["setup.py"], "pr-risk"),
+    ],
+)
+def test_runtime_changes_get_bounded_l3(changed, expected):
+    assert risk_profile(changed) == expected
+
+
+def evidence():
+    receipt = {
+        "source_sha": "a" * 40,
+        "source_repository": "flagos-ai/Torch-FL",
+        "platform": "cuda",
+    }
+    groups = [
+        {"name": c, "category": c, "status": "passed"}
+        for c in ("compatibility", "resource", "stability", "model", "performance")
+    ]
+    report = {
+        "exitcode": 0,
+        "summary": {"passed": 4},
+        "flagcicd": {
+            "complete": True,
+            "source_ref": receipt["source_sha"],
+            "source_repository": receipt["source_repository"],
+            "platform": "cuda",
+            "execution": {
+                "complete": True,
+                "expected": [g["name"] for g in groups],
+                "groups": groups,
+            },
+        },
+    }
+    hardware = {"accelerator_count": 1, "sdk_version": "verified-sdk"}
+    return receipt, report, hardware, policy()["release"]
+
+
+def test_complete_evidence_accepts_candidate():
+    assert finish(*evidence())["status"] == "accepted"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "skip",
+        "missing_group",
+        "missing_model",
+        "failed",
+        "wrong_source",
+        "unknown_sdk",
+        "missing_device",
+    ],
+)
+def test_partial_evidence_cannot_become_release_verified(defect):
+    receipt, report, hardware, requirements = evidence()
+    if defect == "skip":
+        report["summary"]["skipped"] = 1
+    elif defect == "missing_group":
+        report["flagcicd"]["execution"]["groups"].pop()
+    elif defect == "missing_model":
+        next(
+            g
+            for g in report["flagcicd"]["execution"]["groups"]
+            if g["category"] == "model"
+        )["category"] = "functional"
+    elif defect == "failed":
+        report["flagcicd"]["execution"]["groups"][0]["status"] = "failed"
+    elif defect == "wrong_source":
+        report["flagcicd"]["source_ref"] = "b" * 40
+    elif defect == "unknown_sdk":
+        hardware["sdk_version"] = "unknown"
+    else:
+        hardware["accelerator_count"] = 0
+    with pytest.raises(ValueError):
+        finish(receipt, report, hardware, requirements)
+
+
+def test_publisher_refuses_different_bytes_and_wrong_run(tmp_path):
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"accepted bytes")
+    receipt = {
+        "source_sha": "a" * 40,
+        "platform": "cuda",
+        "run_id": "42",
+        "wheel_sha256": sha256(wheel),
+        "wheel": wheel.name,
+        "status": "accepted",
+        "profile": "release",
+    }
+    verify(receipt, wheel, "a" * 40, "cuda", "42")
+    with pytest.raises(ValueError):
+        verify(receipt, wheel, "a" * 40, "cuda", "43")
+    wheel.write_bytes(b"rebuilt bytes")
+    with pytest.raises(ValueError):
+        verify(receipt, wheel, "a" * 40, "cuda", "42")
+
+
+def test_installed_package_must_match_candidate_archive(tmp_path, monkeypatch):
+    import candidate_evidence
+
+    wheel = tmp_path / "candidate.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("torch_fl/__init__.py", b"candidate = True\n")
+    installed = tmp_path / "installed"
+    (installed / "torch_fl").mkdir(parents=True)
+    package = installed / "torch_fl/__init__.py"
+    package.write_bytes(b"candidate = True\n")
+
+    class Distribution:
+        def locate_file(self, name):
+            return installed / name
+
+    monkeypatch.setattr(
+        candidate_evidence.importlib.metadata,
+        "distribution",
+        lambda name: Distribution(),
+    )
+    verify_installation(wheel)
+    package.write_bytes(b"stale = True\n")
+    with pytest.raises(ValueError, match="differs from candidate"):
+        verify_installation(wheel)
+
+
+def test_nightly_all_is_not_narrowed_by_documentation_diff():
+    contract = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
+    request = {
+        "source_sha": "a" * 40,
+        "source_repository": "flagos-ai/Torch-FL",
+        "base_sha": "b" * 40,
+        "requested_level": "auto",
+        "platforms": "all",
+        "profile": "nightly",
+        "task_id": "",
+        "parent_run_id": "",
+    }
+    plan = build_plan(request, contract, ROOT, ["README.md"])
+    assert plan["test_level"] == "L3"
+    assert plan["expected_platforms"] == sorted(
+        p.stem for p in (ROOT / ".github/configs").glob("*.yml")
+    )
+    plan.update(run_id="42", run_attempt="1")
+    assert len(report_context(plan).encode()) <= 16384
+    request["profile"] = "auto"
+    assert build_plan(request, contract, ROOT, ["README.md"])["test_level"] == "L0"
+    assert (
+        build_plan(request, contract, ROOT, ["csrc/runtime.cpp"])["test_level"] == "L3"
+    )
+
+
+def test_real_pytest_collection_detects_lost_case(tmp_path):
+    if importlib.util.find_spec("pytest_jsonreport") is None:
+        pytest.fail("pytest-json-report is required to validate the real collector")
+    (tmp_path / "test_example.py").write_text("def test_example(): pass\n")
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    env = {
+        **os.environ,
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        "PYTHONPATH": str(SCRIPTS / "pytest_reporting"),
+        "PYTEST_PLUGINS": "pytest_jsonreport.plugin,flagcicd_report",
+        "FLAGCICD_REPORT_DIR": str(reports),
+        "FLAGCICD_TEST_GROUP": "example",
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "test_example.py", "-q"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert merge_reports(reports, "cuda", "success", "repo", "sha")["flagcicd"][
+        "complete"
+    ]
+    marker = next(reports.glob("*.pending"))
+    data = json.loads(marker.read_text())
+    data["selected_nodeids"].append("test_example.py::test_missing")
+    marker.write_text(json.dumps(data))
+    assert not merge_reports(reports, "cuda", "success", "repo", "sha")["flagcicd"][
+        "complete"
+    ]
+
+
+def test_timeout_is_not_success_and_unstarted_groups_remain_visible(tmp_path):
+    groups = [
+        {
+            "name": "hang",
+            "command": f'{sys.executable} -c "import time; time.sleep(20)"',
+            "level": "L3",
+            "timeout_seconds": 0.1,
+        },
+        {"name": "unreached", "command": "true"},
+    ]
+    env = {
+        **os.environ,
+        "INTEGRATION_TESTS": json.dumps(groups),
+        "FLAGCICD_REPORT_DIR": str(tmp_path),
+    }
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "run_integration_tests.py")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 124
+    ledger = json.loads((tmp_path / "groups.json").read_text())
+    assert ledger["groups"][0]["status"] == "timeout"
+    assert not ledger["complete"]
+    assert len(ledger["expected"]) == 2 and len(ledger["groups"]) == 1
+
+
+def test_release_graph_gates_all_lanes_and_reuses_candidates():
+    jobs = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())["jobs"]
+    assert jobs["build"]["with"]["publish"] is False
+    assert {"lint", "preflight", "agnostic", "codegen", "wheel-checks"} <= set(
+        jobs["build"]["needs"]
+    )
+    assert (
+        jobs["acceptance"]["with"]["candidate_artifact"]
+        == "wheel-${{ matrix.platform }}"
+    )
+    assert "acceptance" in jobs["publish"]["needs"]
+    assert (
+        jobs["build"]["strategy"]["matrix"]
+        == jobs["acceptance"]["strategy"]["matrix"]
+        == jobs["publish"]["strategy"]["matrix"]
+    )
+
+
+def test_all_profiled_commands_disable_legacy_crash_tolerance():
+    doc = copy.deepcopy(policy())
+    assert doc["profiles"]["weekly"]["max_level"] == "L4"
+    assert doc["release"]["stability_seconds"] >= 3600

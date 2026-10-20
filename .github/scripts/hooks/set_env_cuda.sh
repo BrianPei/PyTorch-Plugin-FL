@@ -526,6 +526,8 @@ print(f"Triton module: {triton_root}")
 print(f"Triton version: {triton.__version__}")
 PY
 
+# Candidate acceptance checks the installed archive, not source build outputs.
+if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" != "1" ]]; then
 if [[ "$CI_STAGE" == "build" || "$CI_STAGE" == "integration" ]]; then
   # Prebuild so package_data sees libtorch_fl.so before the common workflow
   # invokes python -m build.
@@ -575,6 +577,8 @@ print(f"CPU PyTorch: {torch.__version__}")
 print(f"CPU torch path: {torch_path}")
 print(f"Kernel sets: {tuple(_config.KERNELS)}")
 PY
+fi
+# End source-only checks; environment exports also apply to candidates.
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
   # Later steps resolve `bash` and `python` through a PATH the runner assembles

@@ -88,9 +88,13 @@ def resolve(event, event_name, repository, event_sha):
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise ValueError("source and base must be immutable commit SHAs")
     requested_level = text(request.get("test_level", "auto"), "test_level")
-    if requested_level not in ("auto", "L0", "L1", "L2"):
-        raise ValueError("supported test levels are auto, L0, L1 and L2")
+    if requested_level not in ("auto", "L0", "L1", "L2", "L3"):
+        raise ValueError("supported test levels are auto, L0, L1, L2 and L3")
+    profile = text(request.get("profile", "auto"), "profile")
+    if profile not in ("auto", "pr", "pr-risk", "nightly", "weekly"):
+        raise ValueError("unsupported execution profile; L4 uses the release workflow")
     return {
+        "profile": profile,
         "source_repository": source_repository,
         "source_sha": source_sha,
         "base_sha": base_sha,

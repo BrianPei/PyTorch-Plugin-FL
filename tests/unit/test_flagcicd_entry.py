@@ -132,7 +132,7 @@ def test_contract_changes_change_the_actual_risk_decision():
     assert PLANNER.infer_level(["new-path"], contract)[0] == "L1"
 
 
-@pytest.mark.parametrize("requested", ["L3", "L4", "invalid"])
+@pytest.mark.parametrize("requested", ["L4", "invalid"])
 def test_unsupported_levels_fail_before_platform_dispatch(requested):
     with pytest.raises(ValueError, match="unsupported"):
         PLANNER.build_plan(request(requested_level=requested), CONTRACT, ROOT, [])
@@ -241,6 +241,15 @@ def jobs(result="success", **stages):
 def raw_reports(tmp_path, source=SHA, complete=True):
     directory = tmp_path / "pytest"
     directory.mkdir(exist_ok=True)
+    (directory / "hardware-cuda.json").write_text(
+        json.dumps(
+            {
+                "machine_model": "test-runner",
+                "sdk_version": "fixture-sdk",
+                "accelerator_count": 1,
+            }
+        )
+    )
     (directory / "pytest-cuda.json").write_text(
         json.dumps(
             {
@@ -309,6 +318,7 @@ def entry_jobs(level="L2"):
             "preflight": True,
             "agnostic": level != "L0",
             "codegen": level != "L0",
+            "wheel-checks": level != "L0",
             "platforms": level == "L2",
         }.items()
     }
@@ -497,6 +507,7 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
 def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
     checkout = tmp_path / "source"
     shutil.copytree(ROOT / ".github/configs", checkout / ".github/configs")
+    shutil.copytree(ROOT / ".flagcicd", checkout / ".flagcicd")
     shutil.copyfile(
         ROOT / ".github/integration-manifest.yml",
         checkout / ".github/integration-manifest.yml",
@@ -832,3 +843,31 @@ def test_workflow_stage_recorder_and_platform_report_use_the_same_contract(tmp_p
     report = REPORTER.platform_report(plan(), "cuda", actual, tmp_path, 3)
     assert report["status"] == "passed"
     assert report["execution_attempt"] == "3"
+
+
+def test_missing_hardware_identity_cannot_pass(tmp_path):
+    raw_reports(tmp_path)
+    (tmp_path / "pytest/hardware-cuda.json").unlink()
+    assert (
+        REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)["status"]
+        == "report_error"
+    )
+
+
+def test_nested_artifact_hardware_identity_is_found(tmp_path):
+    raw_reports(tmp_path)
+    nested = tmp_path / "pytest/runner-temp/session"
+    nested.mkdir(parents=True)
+    (tmp_path / "pytest/hardware-cuda.json").rename(nested / "hardware-cuda.json")
+    assert (
+        REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)["status"]
+        == "passed"
+    )
+
+
+def test_malformed_performance_evidence_retains_failure_report(tmp_path):
+    raw_reports(tmp_path)
+    (tmp_path / "pytest/performance.json").write_text("invalid JSON")
+    report = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    assert report["status"] == "report_error"
+    assert any("invalid performance evidence" in error for error in report["errors"])

@@ -1,0 +1,184 @@
+{
+  "schema_version": "flagcicd.tiers/v1",
+  "profiles": {
+    "pr": {
+      "level": "L2",
+      "max_level": "L2"
+    },
+    "pr-risk": {
+      "level": "L3",
+      "max_level": "L3"
+    },
+    "nightly": {
+      "level": "L3",
+      "max_level": "L3"
+    },
+    "weekly": {
+      "level": "L3",
+      "max_level": "L4"
+    },
+    "release": {
+      "level": "L4",
+      "max_level": "L4"
+    }
+  },
+  "cases": {
+    "environment": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "autoload_contract": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "multi_device_contracts": {
+      "level": "L3",
+      "category": "distributed",
+      "timeout_seconds": 1800
+    },
+    "musa_runtime": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "portable_top_level_contracts": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "vendor_ops": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "flaggems_ops": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "musa_flaggems_hybrid": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "rng": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "factory_ops": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "soft_lowp_matrix": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "amp_contract": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "math_bits_contract": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "profiler_contract": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "profiler_parity": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "torch_compile": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "inference": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "training": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "native_comm_bridge": {
+      "level": "L3",
+      "category": "distributed",
+      "timeout_seconds": 1800
+    },
+    "musa_dispatch": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "unit_tests_per_file": {
+      "level": "L3",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "runtime_conformance": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "flaggems_conformance": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "l3_installed_contract": {
+      "level": "L3",
+      "category": "compatibility",
+      "timeout_seconds": 300
+    },
+    "l3_lifecycle": {
+      "level": "L3",
+      "category": "resource",
+      "timeout_seconds": 600
+    },
+    "l4_endurance": {
+      "level": "L4",
+      "category": "stability",
+      "timeout_seconds": 3900
+    },
+    "l4_models": {
+      "level": "L4",
+      "category": "model",
+      "timeout_seconds": 7200
+    },
+    "l3_performance": {
+      "level": "L3",
+      "category": "performance",
+      "timeout_seconds": 600
+    }
+  },
+  "release": {
+    "required_categories": [
+      "compatibility",
+      "resource",
+      "model",
+      "stability",
+      "performance"
+    ],
+    "model_platforms": [
+      "cuda",
+      "ppu"
+    ],
+    "unavailable_reason": "Model mounts and acceptance workloads are not yet verified on other platforms. Release acceptance must fail until configured.",
+    "stability_seconds": 3600,
+    "weekly_stability_seconds": 600,
+    "max_retained_bytes": 16777216
+  }
+}

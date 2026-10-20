@@ -439,4 +439,8 @@ cd "$REPO_ROOT"
 # build_ext produces the libtorch_fl.so that package_data stages into the wheel,
 # and build and test share one job, so it must run in both stages. No device is
 # required here; the card was checked above for the integration stage.
-build_flagos_inplace
+# Candidate acceptance checks the installed archive, not source build outputs.
+if [[ "${TORCH_FL_CANDIDATE_ONLY:-0}" != "1" ]]; then
+  build_flagos_inplace
+fi
+# End source-only checks; environment exports also apply to candidates.

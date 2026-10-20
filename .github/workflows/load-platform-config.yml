@@ -55,6 +55,10 @@ on:
         required: false
         type: string
         default: ''
+      test_profile:
+        description: Test tier profile; empty preserves legacy callers
+        type: string
+        default: ''
     outputs:
       display_name:
         description: Human-readable platform name, used in job and step names
@@ -137,6 +141,7 @@ jobs:
         id: config
         env:
           PLATFORM: ${{ inputs.platform }}
+          TEST_PROFILE: ${{ inputs.test_profile }}
         run: |
           set -euo pipefail
 
@@ -184,11 +189,13 @@ jobs:
           INTEGRATION_TIMEOUT=$(yq -r '.integration_timeout_minutes // .timeout_minutes' "$CONFIG_FILE")
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
+          profile_args=()
+          if [[ -n "$TEST_PROFILE" ]]; then profile_args=(--profile "$TEST_PROFILE"); fi
           INTEGRATION_TESTS=$(python .github/scripts/compose_integration_manifest.py \
             --platform "$PLATFORM" \
             --manifest "$MANIFEST_JSON" \
             --platform-config "$CONFIG_JSON" \
-            --config-dir .github/configs)
+            --config-dir .github/configs "${profile_args[@]}")
 
           # The two command lists reach the hardware job as one line per
           # command, so anything that is not a list of strings would be read as
