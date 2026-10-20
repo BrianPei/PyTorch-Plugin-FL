@@ -62,10 +62,7 @@ def ci_request(event, event_name):
     if event_name == "push":
         return {"profile": "pr", "selection": "all"}
     if event_name == "schedule":
-        return {
-            "profile": "weekly" if event.get("schedule") == "0 18 * * 6" else "nightly",
-            "selection": "all",
-        }
+        return {"profile": "nightly", "selection": "all"}
     if event_name == "workflow_dispatch":
         inputs = event.get("inputs") or {}
         if not isinstance(inputs, dict):

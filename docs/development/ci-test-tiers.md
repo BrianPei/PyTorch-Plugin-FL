@@ -11,8 +11,8 @@ test command inventory. Common workflows do not select chips in shell code.
 | --- | --- | --- |
 | `pr` | PR or push | Fixed L0/L1, then L2 on affected PR platforms or all push platforms |
 | `pr-risk` | Runtime/build/compatibility changes | L2 plus bounded L3 compatibility, lifecycle, performance and applicable communication contracts |
-| `nightly` | 02:00 CST Monday–Saturday | All configured platforms, L2 then L3 |
-| `weekly` | 02:00 CST Sunday | Nightly selection plus 10-minute stability and available model acceptance workloads |
+| `nightly` | 02:00 CST daily | All configured platforms and every applicable L0-L4 case, including endurance and configured model workloads |
+| `weekly` | Manual/future profile | Reserved for a separately designed weekly stability and model schedule; it is not automatically triggered |
 | `release` | Release tag workflow | Existing candidate wheel, L2, L3, mandatory model suites and at least one hour of stability |
 
 FlagCICD Entry accepts `profile=auto/pr/pr-risk/nightly/weekly` and minimum
@@ -59,8 +59,8 @@ distribution is resolved. It does not claim
 driver availability, full runtime
 dependency installation, or accelerator execution; those checks belong to L2+.
 
-Hardware job budgets are 60 minutes for PR profiles, six hours for nightly and
-12 hours for weekly/release. Individual commands have explicit deadlines and
+Hardware job budgets are 60 minutes for PR profiles and 12 hours for nightly,
+weekly and release. Individual commands have explicit deadlines and
 their process groups are killed on timeout. The weekly pipeline can consist of
 multiple jobs; a two-day overall window is not a two-day single job. GitHub's
 [token lifetime](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idtimeout-minutes)
