@@ -12,6 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Run the integration groups one platform's plan selected.
+
+The list comes from the composer, filtered by the plan: each entry carries the
+manifest id it came from, the group's name, its command, its environment, and
+optionally the seconds it may run and the ids it depends on.
+
+Every group's outcome is written to one JSON file so the platform report can
+compare what ran against what the plan said would run. The alternative -- a
+log a human searches -- cannot distinguish "this group passed" from "this
+group was never selected", which is exactly the distinction a gate has to make.
+"""
+
 import argparse
 import json
 import os
@@ -19,6 +31,8 @@ import re
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 
 # A group command can die with a fatal signal *after* pytest has finished:
@@ -52,7 +66,21 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--allow-empty", action="store_true")
+    parser.add_argument(
+        "--groups-output",
+        default="",
+        help="write one JSON record per selected group to this path",
+    )
+    parser.add_argument(
+        "--group-log-dir",
+        default="",
+        help="retain each group's captured output here",
+    )
     return parser.parse_args()
+
+
+def _single_line(value):
+    return isinstance(value, str) and bool(value.strip()) and "\n" not in value
 
 
 def load_configuration(allow_empty):
@@ -72,12 +100,7 @@ def load_configuration(allow_empty):
         name = test.get("name")
         command = test.get("command")
         test_environment = test.get("environment", {})
-        if (
-            not isinstance(name, str)
-            or not name.strip()
-            or "\n" in name
-            or "\r" in name
-        ):
+        if not _single_line(name) or "\r" in name:
             raise SystemExit(
                 f"integration_tests[{index}].name must be a non-empty single-line string"
             )
@@ -89,6 +112,25 @@ def load_configuration(allow_empty):
             test_environment,
             f"integration_tests[{index}].environment",
         )
+        timeout = test.get("timeout_seconds")
+        if timeout is not None and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1
+        ):
+            raise SystemExit(
+                f"integration_tests[{index}].timeout_seconds must be a positive integer"
+            )
+        requires = test.get("requires", [])
+        if not isinstance(requires, list) or not all(
+            _single_line(item) for item in requires
+        ):
+            raise SystemExit(
+                f"integration_tests[{index}].requires must be a list of group ids"
+            )
+        group_id = test.get("id")
+        if group_id is not None and not _single_line(group_id):
+            raise SystemExit(
+                f"integration_tests[{index}].id must be a non-empty single-line string"
+            )
 
     validate_environment(environment, "integration_environment")
 
@@ -163,12 +205,17 @@ def signal_number(returncode):
     return returncode - 128
 
 
-def run_command(command, test_environment, workdir):
+def run_command(command, test_environment, workdir, timeout_seconds=None):
     """Run one group command, streaming its output live while capturing it.
 
     Streaming (not print-at-end) keeps long hardware groups observable and
     leaves the log behind if the runner itself is killed; the captured copy
     feeds the teardown-crash check.
+
+    A timeout kills the process *group*, because the group's command is a
+    shell that may have started pytest and its workers: signalling only the
+    shell would leave the hardware busy for the next group and report a
+    timeout that nothing enforced.
     """
     process = subprocess.Popen(
         ["bash", "-c", f"set -euo pipefail\n{command}"],
@@ -177,14 +224,46 @@ def run_command(command, test_environment, workdir):
         text=True,
         env=test_environment,
         cwd=workdir,
+        start_new_session=True,
     )
     assert process.stdout is not None
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    timer = None
+    if timeout_seconds:
+        timer = threading.Timer(timeout_seconds, expire)
+        timer.daemon = True
+        timer.start()
     lines = []
-    for line in process.stdout:
-        sys.stdout.write(line)
-        lines.append(line)
-    sys.stdout.flush()
-    return process.wait(), "".join(lines)
+    try:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            lines.append(line)
+        sys.stdout.flush()
+        returncode = process.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+    return returncode, "".join(lines), expired.is_set()
+
+
+def group_record(test, status, returncode=None, duration=0.0, detail="", log=""):
+    return {
+        "id": test.get("id") or test["name"],
+        "name": test["name"],
+        "status": status,
+        "exit_code": returncode,
+        "duration_seconds": round(duration, 3),
+        "detail": detail,
+        "log": log,
+    }
 
 
 def main():
@@ -199,7 +278,34 @@ def main():
     workdir = os.environ.get("INTEGRATION_WORKDIR")
     if workdir and not os.path.isdir(workdir):
         raise SystemExit(f"INTEGRATION_WORKDIR does not exist: {workdir}")
+    log_dir = args.group_log_dir
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    records, status_by_id = [], {}
+    failure = 0
     for index, test in enumerate(tests, start=1):
+        group_id = test.get("id") or test["name"]
+        if failure:
+            records.append(
+                group_record(test, "blocked", detail="an earlier group failed")
+            )
+            continue
+        unmet = [
+            requirement
+            for requirement in test.get("requires", [])
+            if status_by_id.get(requirement) != "passed"
+        ]
+        if unmet:
+            detail = f"dependency-blocked: {', '.join(unmet)} did not pass"
+            print(
+                f"===== [{index}/{len(tests)}] {test['name']}: {detail} =====",
+                flush=True,
+            )
+            records.append(group_record(test, "blocked", detail=detail))
+            status_by_id[group_id] = "blocked"
+            continue
+
         print(
             f"===== [{index}/{len(tests)}] {test['name']} =====",
             flush=True,
@@ -210,7 +316,38 @@ def main():
         if test_environment.get("FLAGCICD_REPORT_DIR"):
             test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
         allow_crash = teardown_crash_allowed(test_environment)
-        returncode, output = run_command(test["command"], test_environment, workdir)
+        started = time.monotonic()
+        returncode, output, timed_out = run_command(
+            test["command"],
+            test_environment,
+            workdir,
+            test.get("timeout_seconds"),
+        )
+        duration = time.monotonic() - started
+        log_path = ""
+        if log_dir:
+            log_path = os.path.join(log_dir, f"{index:02d}-{group_id}.log")
+            with open(log_path, "w", encoding="utf-8") as log:
+                log.write(output)
+        if timed_out:
+            print(
+                f"Integration test '{test['name']}' exceeded "
+                f"{test['timeout_seconds']}s and was killed",
+                flush=True,
+            )
+            records.append(
+                group_record(
+                    test,
+                    "timed_out",
+                    returncode,
+                    duration,
+                    f"exceeded {test['timeout_seconds']}s",
+                    log_path,
+                )
+            )
+            status_by_id[group_id] = "timed_out"
+            failure = returncode or 1
+            continue
         ok, tolerated = classify_command_result(returncode, output, allow_crash)
         if tolerated:
             print(
@@ -221,14 +358,42 @@ def main():
                 f"script's header comment)",
                 flush=True,
             )
-            continue
-        if not ok:
-            print(
-                f"Integration test '{test['name']}' failed with exit code {returncode}",
-                flush=True,
+        if ok:
+            records.append(
+                group_record(
+                    test,
+                    "passed",
+                    returncode,
+                    duration,
+                    "tolerated teardown crash" if tolerated else "",
+                    log_path,
+                )
             )
-            return returncode
-    return 0
+            status_by_id[group_id] = "passed"
+            continue
+        print(
+            f"Integration test '{test['name']}' failed with exit code {returncode}",
+            flush=True,
+        )
+        records.append(
+            group_record(test, "failed", returncode, duration, "nonzero exit", log_path)
+        )
+        status_by_id[group_id] = "failed"
+        failure = returncode
+
+    if args.groups_output:
+        with open(args.groups_output, "w", encoding="utf-8") as output:
+            json.dump(
+                {
+                    "schema_version": "flagcicd.groups/v1",
+                    "platform": os.environ.get("FLAGCICD_PLATFORM", ""),
+                    "groups": records,
+                },
+                output,
+                indent=2,
+            )
+            output.write("\n")
+    return failure
 
 
 if __name__ == "__main__":

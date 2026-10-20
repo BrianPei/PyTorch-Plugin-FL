@@ -1,0 +1,42 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The record that turns a declared level into an executable one.
+#
+# A level in project.yaml may say `pending_acceptance`. It becomes runnable
+# only here, and only with: a named owner, at least one evidence entry, and
+# the control commit whose workflows produced that evidence. This file is the
+# difference between "we wrote the tests" and "the tests ran on hardware and
+# the result was accepted"; the planner reads it on every run and refuses a
+# level whose record is not accepted. Editing a status to `accepted` without
+# evidence is a diff a reviewer can see, which is the point.
+#
+# acceptance is a recorded decision, not a checkbox: keep the previous
+# entries in `history` when re-accepting after a source change.
+schema_version: flagcicd.acceptance/v1
+levels:
+  L3:
+    status: not_accepted
+    owner: ''
+    accepted_sha: ''
+    accepted_at: ''
+    evidence: []
+    history: []
+  L4:
+    status: not_accepted
+    owner: ''
+    accepted_sha: ''
+    accepted_at: ''
+    evidence: []
+    history: []

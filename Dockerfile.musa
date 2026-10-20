@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+#
+# Release image for the PyTorch-Plugin-FL MUSA build-and-test job.
+#
+# The vendor image supplies only the MUSA SDK/runtime. Do not reuse its
+# torch_musa Python package in the CI venv: it carries vendor libtorch 2.9.1,
+# while this project builds and tests against stock CPU PyTorch 2.10.0.
+
+ARG MUSA_BASE_IMAGE=registry.mthreads.com/mcconline/musa-pytorch-release-public:rc5.1.0-v2.9.1-S5000-py310_tef
+FROM ${MUSA_BASE_IMAGE}
+
+USER root
+
+ARG PYTHON_BIN=python3.10
+ARG CPU_TORCH_VERSION=2.10.0
+ARG CPU_TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG VENV_ROOT=/opt/torch-fl-musa-venv
+
+# The native extension is compiled with the host C/C++ compiler; MUSA kernels
+# call musart/mudnn/murand through the SDK headers and libraries below.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      git \
+      python3.10-dev \
+      python3.10-venv \
+ && rm -rf /var/lib/apt/lists/* \
+ && command -v "${PYTHON_BIN}" \
+ && command -v c++ \
+ && test -f /usr/local/musa/include/musa_runtime.h \
+ && test -f /usr/local/musa/include/mudnncxx/mudnn.h \
+ && test -f /usr/local/musa/include/murand.h \
+ && test -f /usr/local/musa/lib/libmusart.so \
+ && test -f /usr/local/musa/lib/libmudnn.so \
+ && test -f /usr/local/musa/lib/libmurand.so
+
+# Keep the project runtime isolated from the vendor Python environment. These
+# packages mirror .github/scripts/set_env_musa.sh, including the test-only
+# dependencies that it installs during CI_STAGE=integration.
+RUN "${PYTHON_BIN}" -m venv "${VENV_ROOT}" \
+ && "${VENV_ROOT}/bin/python" -m pip install --no-cache-dir \
+      --index-url "${PIP_INDEX_URL}" \
+      --upgrade pip setuptools wheel cmake ninja build \
+ && "${VENV_ROOT}/bin/python" -m pip install --no-cache-dir \
+      --index-url "${CPU_TORCH_INDEX_URL}" \
+      "torch==${CPU_TORCH_VERSION}" \
+ && "${VENV_ROOT}/bin/python" -m pip install --no-cache-dir \
+      --index-url "${PIP_INDEX_URL}" \
+      pytest \
+      "transformers>=4.51,<5" \
+      "numpy<2" \
+      safetensors \
+      sentencepiece \
+      tiktoken \
+      protobuf \
+ && "${VENV_ROOT}/bin/python" - <<'PY'
+import importlib.util
+from pathlib import Path
+
+import torch
+
+assert torch.__version__.split("+", 1)[0] == "2.10.0", torch.__version__
+assert torch.version.cuda is None, torch.version.cuda
+assert importlib.util.find_spec("torch_musa") is None
+assert "/opt/conda/" not in str(Path(torch.__file__).resolve())
+PY
+
+# set_env_musa.sh discovers and activates this venv. Do not prepend it to PATH
+# here: the setup script chooses its bootstrap interpreter before activation.
+ENV TORCH_FL_PREBUILT_MUSA_VENV=${VENV_ROOT} \
+    MUSA_HOME=/usr/local/musa \
+    MTHREADS_VISIBLE_DEVICES=all

@@ -66,6 +66,14 @@ on:
         required: false
         type: string
         default: ''
+      flagcicd_groups:
+        description: >-
+          JSON array of manifest ids the plan selected for this platform. The
+          loader composes the manifest and keeps only these; empty runs every
+          group that applies to the platform.
+        required: false
+        type: string
+        default: ''
     secrets:
       FLAGCICD_API_TOKEN:
         description: Optional token for publishing pytest results and Python coverage to FlagCICD
@@ -87,6 +95,7 @@ jobs:
       platform: ${{ inputs.platform }}
       checkout_repository: ${{ inputs.checkout_repository }}
       checkout_ref: ${{ inputs.checkout_ref }}
+      flagcicd_groups: ${{ inputs.flagcicd_groups }}
 
   integration-tests:
     name: Build and test (${{ needs.configuration.outputs.display_name }})
@@ -213,6 +222,13 @@ jobs:
           REPORT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-pytest.XXXXXX")
           printf 'FLAGCICD_REPORT_DIR=%s\n' "$REPORT_DIR" >> "$GITHUB_ENV"
 
+      - name: Record hardware identity
+        id: record-identity
+        run: |
+          python .github/scripts/record_hardware_identity.py \
+            --platform "${{ inputs.platform }}" \
+            --output "$FLAGCICD_REPORT_DIR/hardware-${{ inputs.platform }}.json"
+
       - name: Install pytest JSON reporting
         run: python -m pip install pytest-json-report==1.5.0 coverage==7.10.7
 
@@ -224,15 +240,34 @@ jobs:
           COVERAGE_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-coverage.XXXXXX")
           python .github/scripts/python_coverage.py prepare --report-dir "$COVERAGE_DIR" --env-file "$GITHUB_ENV"
 
+      # `groups.json` is the runner's half of the plan's claim: one record per
+      # selected group with its outcome, so the platform report can tell "this
+      # group passed" from "this group was selected and never ran". It is
+      # written even when a group fails, because that is when it matters.
       - name: Run ${{ needs.configuration.outputs.display_name }} integration tests
         id: integration-tests
         env:
           INTEGRATION_TESTS: ${{ needs.configuration.outputs.integration_tests }}
           INTEGRATION_ENVIRONMENT: ${{ needs.configuration.outputs.integration_environment }}
+          FLAGCICD_PLATFORM: ${{ inputs.platform }}
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/.github/scripts/pytest_reporting${PYTHONPATH:+:$PYTHONPATH}"
           export PYTEST_PLUGINS="flagcicd_report,flagcicd_coverage${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
-          python .github/scripts/run_integration_tests.py
+          python .github/scripts/run_integration_tests.py \
+            --groups-output "$GITHUB_WORKSPACE/groups-${{ inputs.platform }}.json" \
+            --group-log-dir "$GITHUB_WORKSPACE/group-logs"
+
+      - name: Report groups the plan did not select
+        if: ${{ !cancelled() && needs.configuration.outputs.not_selected != '[]' }}
+        env:
+          NOT_SELECTED: ${{ needs.configuration.outputs.not_selected }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          for group in json.loads(os.environ['NOT_SELECTED']):
+              print(f"::notice::Not selected: {group['id']} -- {group['reason']}")
+          PY
 
       # Preserve failed sessions too; reporting never changes the test verdict.
       - name: Merge pytest reports
@@ -263,6 +298,8 @@ jobs:
           name: pytest-${{ inputs.platform }}-${{ github.run_attempt }}
           path: |
             pytest-${{ inputs.platform }}.json
+            groups-${{ inputs.platform }}.json
+            group-logs/
             ${{ env.FLAGCICD_REPORT_DIR }}/
           if-no-files-found: warn
 
@@ -407,15 +444,35 @@ jobs:
         with:
           name: coverage-${{ inputs.platform }}-${{ needs.integration-tests.outputs.run_attempt || github.run_attempt }}
           path: raw/coverage
+      # The compact context carries no groups: it is cut down to fit a dispatch
+      # payload. The plan artifact is the only copy that says which groups this
+      # platform was told to run, and the report needs that to tell a group
+      # that passed from one that was selected and never ran. Absent, the
+      # report says so instead of assuming the selection was satisfied.
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flagcicd-plan-${{ github.run_attempt }}
+          path: plan
       - name: Describe platform execution
         env:
           FLAGCICD_PLAN: ${{ inputs.flagcicd_plan }}
           JOB_RESULTS: ${{ toJSON(needs) }}
           REPORT_PLATFORM: ${{ inputs.platform }}
-        run: >-
-          python3 .github/scripts/flagcicd_report.py platform
-          --platform "$REPORT_PLATFORM" --directory raw
-          --output "flagcicd-platform-${REPORT_PLATFORM}.json"
+        run: |
+          set -euo pipefail
+          PLAN_ARGS=()
+          if [[ -f plan/flagcicd-plan.json ]]; then
+            PLAN_ARGS=(--plan-file plan/flagcicd-plan.json)
+          else
+            echo "::warning::the plan artifact is unavailable; group selection cannot be checked"
+          fi
+          python3 .github/scripts/flagcicd_report.py platform \
+            --platform "$REPORT_PLATFORM" --directory raw \
+            --groups "raw/pytest/groups-${REPORT_PLATFORM}.json" \
+            "${PLAN_ARGS[@]}" \
+            --output "flagcicd-platform-${REPORT_PLATFORM}.json"
       - name: Retain platform outcome
         if: always()
         uses: actions/upload-artifact@v4

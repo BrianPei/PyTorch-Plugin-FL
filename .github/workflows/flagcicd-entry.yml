@@ -30,14 +30,26 @@ on:
         type: string
         default: ''
       platforms:
-        description: all (change-aware) or comma-separated platform names
+        description: all or comma-separated platform names
         type: string
         default: all
+      profile:
+        description: Execution set and budget; defaults to pr
+        type: choice
+        default: pr
+        options: [pr, nightly, weekly]
+      selection:
+        description: >-
+          affected runs the platforms the diff touches, all runs every
+          configured platform. Empty uses the profile's default.
+        type: choice
+        default: ''
+        options: ['', affected, all]
       test_level:
-        description: Minimum level; changed files may raise it
+        description: Minimum level; the diff and profile may raise it
         type: choice
         default: auto
-        options: [auto, L0, L1, L2]
+        options: [auto, L0, L1, L2, L3, L4]
       task_id:
         description: Optional external task identifier
         type: string
@@ -78,6 +90,7 @@ jobs:
       test_level: ${{ steps.plan.outputs.test_level }}
       platforms: ${{ steps.plan.outputs.platforms }}
       validated_platforms: ${{ steps.plan.outputs.validated_platforms }}
+      matrix: ${{ steps.plan.outputs.matrix }}
       source_repository: ${{ steps.resolve.outputs.source_repository }}
       source_sha: ${{ steps.resolve.outputs.source_sha }}
     steps:
@@ -96,7 +109,9 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python control/.github/scripts/flagcicd_resolve.py --output request.json
+        run: >-
+          python control/.github/scripts/flagcicd_resolve.py
+          --contract control/.flagcicd/project.yaml --output request.json
       - name: Checkout source data
         uses: actions/checkout@v4
         with:
@@ -119,7 +134,8 @@ jobs:
         id: plan
         run: >-
           python control/.github/scripts/flagcicd_plan.py
-          --request request.json --source source --output flagcicd-plan.json
+          --request request.json --source source --contract-dir control
+          --output flagcicd-plan.json
       - name: Retain plan
         uses: actions/upload-artifact@v4
         with:
@@ -164,13 +180,17 @@ jobs:
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
 
+  # Every level that builds a wheel runs hardware, not only L2: L3 and L4 add
+  # depth to the same pipeline, they do not replace it. The matrix comes from
+  # the plan and carries each platform's group ids, so a dispatch of this
+  # workflow runs the same selection ci.yml would.
   platforms:
     needs: [plan, lint, preflight, agnostic, codegen]
-    if: needs.plan.outputs.test_level == 'L2'
+    if: needs.plan.outputs.test_level != 'L0' && needs.plan.outputs.test_level != 'L1'
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON(needs.plan.outputs.platforms) }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     uses: ./.github/workflows/integration-tests.yml
     secrets:
       FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
@@ -179,6 +199,7 @@ jobs:
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
       flagcicd_plan: ${{ needs.plan.outputs.context }}
+      flagcicd_groups: ${{ matrix.groups }}
 
   complete:
     name: FlagCICD complete
@@ -192,6 +213,12 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flagcicd-plan-${{ github.run_attempt }}
+          path: plan
       - name: Download platform outcomes
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -202,9 +229,16 @@ jobs:
         env:
           FLAGCICD_PLAN: ${{ needs.plan.outputs.context }}
           JOB_RESULTS: ${{ toJSON(needs) }}
-        run: >-
-          python .github/scripts/flagcicd_report.py summary
-          --directory platform-reports --output flagcicd-run-summary.json
+        run: |
+          set -euo pipefail
+          PLAN_ARGS=()
+          if [[ -f plan/flagcicd-plan.json ]]; then
+            PLAN_ARGS=(--plan-file plan/flagcicd-plan.json)
+          fi
+          python .github/scripts/flagcicd_report.py summary \
+            --directory platform-reports \
+            "${PLAN_ARGS[@]}" \
+            --output flagcicd-run-summary.json
       - name: Retain run summary
         if: always()
         uses: actions/upload-artifact@v4

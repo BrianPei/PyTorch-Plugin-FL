@@ -55,6 +55,13 @@ on:
         required: false
         type: string
         default: ''
+      flagcicd_groups:
+        description: >-
+          JSON array of manifest ids the plan selected for this platform.
+          Empty composes every group, which is what the wheel build wants.
+        required: false
+        type: string
+        default: ''
     outputs:
       display_name:
         description: Human-readable platform name, used in job and step names
@@ -92,6 +99,9 @@ on:
       integration_tests:
         description: The integration test manifest, as JSON
         value: ${{ jobs.configuration.outputs.integration_tests }}
+      not_selected:
+        description: Groups the plan did not select, with a reason, as JSON
+        value: ${{ jobs.configuration.outputs.not_selected }}
       integration_environment:
         description: The manifest's shared environment, as JSON
         value: ${{ jobs.configuration.outputs.integration_environment }}
@@ -123,6 +133,7 @@ jobs:
       integration_timeout_minutes: ${{ steps.config.outputs.integration_timeout_minutes }}
       wheel_artifact_name: ${{ steps.config.outputs.wheel_artifact_name }}
       integration_tests: ${{ steps.config.outputs.integration_tests }}
+      not_selected: ${{ steps.config.outputs.not_selected }}
       integration_environment: ${{ steps.config.outputs.integration_environment }}
       integration_build_tools: ${{ steps.config.outputs.integration_build_tools }}
       integration_test_dependencies: ${{ steps.config.outputs.integration_test_dependencies }}
@@ -137,6 +148,7 @@ jobs:
         id: config
         env:
           PLATFORM: ${{ inputs.platform }}
+          FLAGCICD_GROUPS: ${{ inputs.flagcicd_groups }}
         run: |
           set -euo pipefail
 
@@ -184,11 +196,28 @@ jobs:
           INTEGRATION_TIMEOUT=$(yq -r '.integration_timeout_minutes // .timeout_minutes' "$CONFIG_FILE")
           ARTIFACT_NAME=$(yq -r '.wheel_artifact_name' "$CONFIG_FILE")
           INTEGRATION_ENVIRONMENT=$(yq -o=json -I=0 '.integration_environment // {}' "$CONFIG_FILE")
+
+          # The plan is the only thing that decides which groups run; this job
+          # only narrows the composed list to it. When no plan is handed in --
+          # the wheel build -- every group is composed, which is the same list
+          # this job produced before the plan existed.
+          GROUPS_ARGS=()
+          NOT_SELECTED="[]"
+          if [[ -n "$FLAGCICD_GROUPS" ]]; then
+            GROUPS_FILE="${RUNNER_TEMP:-/tmp}/${PLATFORM}-selected-groups.json"
+            NOT_SELECTED_FILE="${RUNNER_TEMP:-/tmp}/${PLATFORM}-not-selected.json"
+            printf '%s' "$FLAGCICD_GROUPS" > "$GROUPS_FILE"
+            GROUPS_ARGS=(--groups-file "$GROUPS_FILE" --not-selected-output "$NOT_SELECTED_FILE")
+          fi
           INTEGRATION_TESTS=$(python .github/scripts/compose_integration_manifest.py \
             --platform "$PLATFORM" \
             --manifest "$MANIFEST_JSON" \
             --platform-config "$CONFIG_JSON" \
-            --config-dir .github/configs)
+            --config-dir .github/configs \
+            "${GROUPS_ARGS[@]}")
+          if [[ -f "${NOT_SELECTED_FILE:-}" ]]; then
+            NOT_SELECTED=$(cat "$NOT_SELECTED_FILE")
+          fi
 
           # The two command lists reach the hardware job as one line per
           # command, so anything that is not a list of strings would be read as
@@ -299,6 +328,7 @@ jobs:
           emit integration_timeout_minutes "$INTEGRATION_TIMEOUT"
           emit wheel_artifact_name "$ARTIFACT_NAME"
           emit integration_tests "$INTEGRATION_TESTS"
+          emit not_selected "$NOT_SELECTED"
           emit integration_environment "$INTEGRATION_ENVIRONMENT"
           emit_list integration_build_tools "$BUILD_TOOLS"
           emit_list integration_test_dependencies "$TEST_DEPENDENCIES"

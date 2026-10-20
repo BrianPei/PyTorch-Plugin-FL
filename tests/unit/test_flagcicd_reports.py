@@ -441,3 +441,134 @@ def test_missing_token_skips_upload_without_logging_credentials(
     assert result.returncode == 0, result.stderr
     assert output.read_text() == expected
     assert not token or token not in result.stdout + result.stderr
+
+
+def test_l2_plus_platform_report_requires_hardware_identity(tmp_path):
+    """ci-test-tiers.md line 13: L2+ runs must record hardware identity."""
+    import importlib.util
+    import sys
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "flagcicd_report", SCRIPTS / "flagcicd_report.py"
+        )
+        reporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reporter)
+
+        plan = {
+            "test_level": "L2",
+            "expected_platforms": ["cuda"],
+            "source_repository": "flagos-ai/Torch-FL",
+            "source_sha": "a" * 40,
+            "run_id": "123456",
+            "config_hash": "config123",
+            "scope": "installed_wheel_integration",
+            "risk_level": "medium",
+            "task_id": "task1",
+            "parent_run_id": "",
+            "groups": {"cuda": [{"id": "unit"}]},
+        }
+        jobs = {
+            "configuration": {"result": "success"},
+            "integration-tests": {
+                "result": "success",
+                "outputs": {"stages": '{"build": "success", "validate": "success", "install": "success", "tests": "success"}'},
+            },
+        }
+        raw = tmp_path / "raw"
+        pytest_dir = raw / "pytest"
+        pytest_dir.mkdir(parents=True)
+
+        # Missing hardware identity file should add error
+        (pytest_dir / "pytest-cuda.json").write_text(json.dumps({
+            "flagcicd": {
+                "source_repository": "flagos-ai/Torch-FL",
+                "source_ref": "a" * 40,
+                "platform": "cuda",
+                "complete": True,
+            },
+            "summary": {"passed": 1},
+            "exitcode": 0,
+            "tests": [],
+        }))
+        groups_path = tmp_path / "groups-cuda.json"
+        groups_path.write_text(json.dumps([{"id": "unit", "status": "passed"}]))
+
+        report = reporter.platform_report(plan, "cuda", jobs, raw, 1, groups_path)
+        assert any("hardware identity" in err for err in report["errors"])
+        assert report["platform"]["name"] == "cuda"
+
+        # L2+ with hardware identity present should succeed
+        (pytest_dir / "hardware-cuda.json").write_text(json.dumps({
+            "machine_model": "Intel(R) Xeon(R) Gold 6148",
+            "sdk_version": "12.4",
+            "accelerator_count": 8,
+        }))
+
+        report = reporter.platform_report(plan, "cuda", jobs, raw, 1, groups_path)
+        assert not any("hardware identity" in err for err in report["errors"])
+        assert report["platform"]["machine_model"] == "Intel(R) Xeon(R) Gold 6148"
+        assert report["platform"]["sdk_version"] == "12.4"
+        assert report["platform"]["accelerator_count"] == 8
+    finally:
+        sys.path.pop(0)
+
+
+def test_l0_l1_do_not_require_hardware_identity(tmp_path):
+    """L0 and L1 are hardware-free and should not gate on identity."""
+    import importlib.util
+    import sys
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "flagcicd_report", SCRIPTS / "flagcicd_report.py"
+        )
+        reporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reporter)
+
+        for level in ("L0", "L1"):
+            plan = {
+                "test_level": level,
+                "expected_platforms": ["agnostic"],
+                "source_repository": "flagos-ai/Torch-FL",
+                "source_sha": "a" * 40,
+                "run_id": "123456",
+                "config_hash": "config123",
+                "scope": "platform_agnostic",
+                "risk_level": "low",
+                "task_id": "task1",
+                "parent_run_id": "",
+                "groups": {"agnostic": [{"id": "unit"}]},
+            }
+            jobs = {
+                "configuration": {"result": "success"},
+                "integration-tests": {
+                    "result": "success",
+                    "outputs": {"stages": '{"build": "success", "validate": "success", "install": "success", "tests": "success"}'},
+                },
+            }
+            raw = tmp_path / f"raw-{level}"
+            pytest_dir = raw / "pytest"
+            pytest_dir.mkdir(parents=True)
+            (pytest_dir / "pytest-agnostic.json").write_text(json.dumps({
+                "flagcicd": {
+                    "source_repository": "flagos-ai/Torch-FL",
+                    "source_ref": "a" * 40,
+                    "platform": "agnostic",
+                    "complete": True,
+                },
+                "summary": {"passed": 1},
+                "exitcode": 0,
+                "tests": [],
+            }))
+            groups_path = tmp_path / f"groups-agnostic-{level}.json"
+            groups_path.write_text(json.dumps([{"id": "unit", "status": "passed"}]))
+
+            # No hardware identity file, but L0/L1 should not error
+            report = reporter.platform_report(plan, "agnostic", jobs, raw, 1, groups_path)
+            assert not any("hardware identity" in err for err in report["errors"])
+            assert report["platform"]["name"] == "agnostic"
+            assert "machine_model" not in report["platform"]
+    finally:
+        sys.path.pop(0)
+

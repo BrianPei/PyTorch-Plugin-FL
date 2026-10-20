@@ -12,6 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The entry for native events: pull_request, push, schedule, dispatch.
+#
+# Two commits are loaded before anything else, and which is which is the
+# central fact of this file:
+#
+#   control  github.workflow_sha -- the commit whose workflows and scripts are
+#            running. Every script that decides what to test, and the report
+#            that decides whether the run passed, come from here.
+#   source   the commit under test, resolved by the request resolver.
+#
+# A fork PR can change `.flagcicd/project.yaml` and `.github/scripts/`. If the
+# resolver or the planner read those from the PR head, the PR could choose not
+# to be tested and then certify itself. So resolution, planning and the final
+# gate all read `control/`, and the only thing taken from the source is the
+# code that will be built.
+#
+# The plan is one job, and it is what every later job consumes: which level is
+# being proven, which platforms run, and which manifest groups each platform
+# runs. The matrix is the plan's `matrix` output, so a platform is scheduled
+# because the plan says so -- not because a second, independent discovery step
+# happened to agree.
+
 name: CI
 
 permissions:
@@ -20,7 +42,14 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 18 * * *'   # 02:00 CST daily
+    # Both crons are declared in .flagcicd/project.yaml's `schedules` block,
+    # which maps each one to its profile. A cron added here without an entry
+    # there fails resolution by name; a cron declared there without a trigger
+    # here never runs, which is why the two are kept in step by hand and
+    # tests/unit/test_ci_resolution.py checks that every declared cron is
+    # scheduled.
+    - cron: '0 18 * * *'   # 02:00 CST daily -> nightly
+    - cron: '0 18 * * 6'   # 02:00 CST Saturday -> weekly
   push:
     branches: [main, dev, devops, dev-hygon, dev-thead, dev-musa]
   pull_request:
@@ -44,70 +73,147 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Resolve the source repository and immutable commit before any reusable
-  # workflow starts. Fork on-demand runs are dispatched from this workflow on
-  # the base branch, so the workflow definition remains trusted while the jobs
-  # test the PR head commit supplied by the API.
+  # Resolve the source repository, the source commit and the comparison commit
+  # from the event payload, in trusted code. A pull request is read from its
+  # payload rather than re-fetched through the API: the payload already carries
+  # the immutable head and base, and removing that API call removes a token
+  # dependency from the step that decides what gets tested. A dispatch naming
+  # pr_number still needs the API, because that PR is not in the payload.
   resolve-checkout:
     name: Resolve checkout source
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      repository: ${{ steps.resolve.outputs.repository }}
-      ref: ${{ steps.resolve.outputs.ref }}
+      repository: ${{ steps.resolve.outputs.source_repository }}
+      ref: ${{ steps.resolve.outputs.source_sha }}
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      control_sha: ${{ steps.resolve.outputs.control_sha }}
+      profile: ${{ steps.resolve.outputs.profile }}
+      selection: ${{ steps.resolve.outputs.selection }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
+      - name: Checkout trusted control code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install resolver dependency
+        run: python -m pip install "PyYAML==6.0.2"
       - name: Resolve trusted source
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_REPOSITORY: ${{ github.repository }}
-          EVENT_REF: ${{ github.sha }}
-          PR_NUMBER: ${{ inputs.pr_number || '' }}
+          DISPATCH_PLATFORMS: ${{ inputs.platforms || 'all' }}
         run: |
           set -euo pipefail
-
-          repository="$EVENT_REPOSITORY"
-          ref="$EVENT_REF"
-          if [[ -n "$PR_NUMBER" ]]; then
-            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::pr_number must be a positive integer"
-              exit 1
-            fi
-            pr=$(gh api "repos/${EVENT_REPOSITORY}/pulls/${PR_NUMBER}")
-            repository=$(jq -r '.head.repo.full_name // empty' <<<"$pr")
-            ref=$(jq -r '.head.sha // empty' <<<"$pr")
-            state=$(jq -r '.state // empty' <<<"$pr")
-            if [[ "$state" != "open" ]]; then
-              echo "::error::PR #${PR_NUMBER} is not open"
-              exit 1
-            fi
-            if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-              echo "::error::PR head repository is unavailable (the fork may have been deleted)"
-              exit 1
-            fi
-            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::PR head SHA is not a full commit SHA"
-              exit 1
-            fi
-            echo "Testing PR #${PR_NUMBER} from ${repository}@${ref}"
+          python control/.github/scripts/flagcicd_resolve.py \
+            --contract control/.flagcicd/project.yaml \
+            --output request.json
+          if [[ -n "${DISPATCH_PLATFORMS:-}" ]]; then
+            printf 'A dispatch platform list is carried into the plan below.\n'
           fi
 
-          printf 'repository=%s\n' "$repository" >> "$GITHUB_OUTPUT"
-          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
-
-  lint:
+  # One plan, computed from the request, the diff and the contract. A level,
+  # profile or platform the contract cannot honour is refused here, before any
+  # hardware is scheduled, instead of becoming an empty matrix that reports
+  # success without running anything.
+  plan:
+    name: Plan execution
     needs: resolve-checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      context: ${{ steps.plan.outputs.context }}
+      test_level: ${{ steps.plan.outputs.test_level }}
+      profile: ${{ steps.plan.outputs.profile }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout trusted control code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout source data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve-checkout.outputs.repository }}
+          ref: ${{ needs.resolve-checkout.outputs.ref }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      # The base commit lives upstream, so a fork's clone cannot reach it. Fetch
+      # it by SHA without --depth: a shallow base has no parents, and
+      # `git diff base...head` then fails with "no merge base". A failed fetch
+      # stays visible -- the planner reads the missing comparison as an
+      # unavailable diff, which is a conservative level, not a clean one.
+      - name: Fetch comparison commit
+        if: needs.resolve-checkout.outputs.base_sha != ''
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ needs.resolve-checkout.outputs.base_sha }}
+        run: >-
+          git -C source fetch --no-tags
+          "${{ github.server_url }}/${{ needs.resolve-checkout.outputs.repository }}"
+          "$BASE_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install plan parser
+        run: python -m pip install "PyYAML==6.0.2"
+      - name: Build plan
+        id: plan
+        env:
+          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
+        run: |
+          set -euo pipefail
+          python3 - "$DISPATCH_PLATFORMS" <<'PY'
+          import json
+          import sys
+
+          path = "request.json"
+          request = json.loads(open(path).read())
+          # A workflow_dispatch may name platforms. `all` keeps its resolved
+          # meaning -- change-aware for a PR, every platform for a nightly --
+          # so only a named list changes what the request says, and naming an
+          # explicit list is what makes this a selection=all run.
+          chosen = sys.argv[1].strip()
+          if chosen and chosen != "all":
+              request["platforms"] = chosen
+              request["selection"] = "all"
+          open(path, "w").write(json.dumps(request, indent=2) + "\n")
+          PY
+          python control/.github/scripts/flagcicd_plan.py \
+            --request request.json --source source --contract-dir control \
+            --output flagcicd-plan.json
+      - name: Retain plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: flagcicd-plan-${{ github.run_attempt }}
+          path: flagcicd-plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Static checks. They run against the immutable source, so a fork on-demand
+  # run tests the submitted PR rather than the base branch.
+  lint:
+    needs: [resolve-checkout, plan]
     uses: ./.github/workflows/lint.yml
     with:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
   # Repository-wide checks that need no accelerator, no vendor image, and no
-  # built wheel. They run against the same immutable source as the hardware
-  # matrix, so fork on-demand runs test the submitted PR rather than base main.
+  # built wheel. L0 is a configuration-and-lint plan; it does not pay for them.
   agnostic-checks:
     name: Platform-agnostic checks
-    needs: [resolve-checkout, lint]
+    needs: [resolve-checkout, plan, lint]
+    if: needs.plan.outputs.test_level != 'L0'
     uses: ./.github/workflows/agnostic-checks.yml
     with:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
@@ -115,67 +221,33 @@ jobs:
 
   codegen-checks:
     name: Codegen checks
-    needs: [resolve-checkout, lint]
+    needs: [resolve-checkout, plan, lint]
+    if: needs.plan.outputs.test_level != 'L0'
     uses: ./.github/workflows/codegen-checks.yml
     with:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
-  discover-platforms:
-    name: Discover platforms
-    needs: [resolve-checkout, lint, agnostic-checks, codegen-checks]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      platforms: ${{ steps.detect.outputs.platforms }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.resolve-checkout.outputs.repository }}
-          ref: ${{ needs.resolve-checkout.outputs.ref }}
-          persist-credentials: false
-          fetch-depth: 0
+  wheel-checks:
+    name: Wheel validation (L1)
+    needs: [resolve-checkout, plan, lint]
+    if: needs.plan.outputs.test_level != 'L0'
+    uses: ./.github/workflows/wheel-checks.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
-      - name: Install matrix parser dependency
-        run: python -m pip install PyYAML
-
-      # Emits `platforms` as a JSON array of config basenames, narrowed to the
-      # platforms a pull request can affect. Labels take precedence over files.
-      - name: Detect configured platforms
-        id: detect
-        env:
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref || 'main' }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          PR_LABELS=""
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            PR_LABELS=$(jq -r 'join(",")' <<<"$PR_LABELS_JSON")
-          fi
-
-          python .github/scripts/ci/generate_matrix.py \
-            --event-name "$EVENT_NAME" \
-            --base-ref "$BASE_REF" \
-            --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA" \
-            --configs-dir .github/configs \
-            --pr-labels "$PR_LABELS" \
-            --dispatch-platforms "$DISPATCH_PLATFORMS" \
-            >> "$GITHUB_OUTPUT"
-
-  # One hardware pipeline per configured platform. The reusable workflow reads
-  # runner, image, timeout, and test manifest values from that platform config.
+  # One hardware pipeline per platform the plan selected, each running exactly
+  # the groups the plan selected for it. The matrix carries the platform's
+  # group ids, so the runner does not re-decide what to run.
   platform-pipeline:
     name: Platform pipeline (${{ matrix.platform }})
-    needs: [resolve-checkout, discover-platforms]
+    needs: [resolve-checkout, plan, lint, agnostic-checks, codegen-checks, wheel-checks]
+    if: needs.plan.outputs.test_level != 'L0' && needs.plan.outputs.test_level != 'L1'
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJson(needs.discover-platforms.outputs.platforms) }}
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
     uses: ./.github/workflows/integration-tests.yml
     secrets:
       FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
@@ -183,52 +255,77 @@ jobs:
       platform: ${{ matrix.platform }}
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
+      flagcicd_plan: ${{ needs.plan.outputs.context }}
+      flagcicd_groups: ${{ matrix.groups }}
 
-  # Single required-check gate for branch protection.
+  # Single required-check gate for branch protection. The name stays "CI
+  # complete" because branch protection and every open PR reference it.
+  #
+  # The decision is not made here: flagcicd_report.py owns what a passing run
+  # means, including that every expected platform report exists, that each
+  # platform ran the groups its plan selected, and that L0/L1 did not report
+  # hardware work. This job only relays the verdict.
   ci-complete:
     name: CI complete
     if: always()
     needs:
       - resolve-checkout
+      - plan
       - lint
       - agnostic-checks
       - codegen-checks
-      - discover-platforms
+      - wheel-checks
       - platform-pipeline
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Verify shared checks and selected platforms passed
+      - name: Checkout trusted report code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flagcicd-plan-${{ github.run_attempt }}
+          path: plan
+      - name: Download platform outcomes
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: flagcicd-platform-*
+          path: platform-reports
+      - name: Verify shared checks and planned platforms
         env:
-          RESULTS: ${{ toJSON(needs) }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          # Canonical name -> this workflow's job id. flagcicd_report.py checks
+          # the canonical set; this map is the only place the two vocabularies
+          # meet, so renaming a job fails here with a named error instead of
+          # silently satisfying a check that is not run.
+          JOB_MAP: >-
+            {"plan":"plan","preflight":"plan","lint":"lint",
+            "agnostic":"agnostic-checks","codegen":"codegen-checks",
+            "wheel":"wheel-checks","platforms":"platform-pipeline"}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-
-          jobs = json.loads(os.environ["RESULTS"])
-          errors = []
-          for name in ("resolve-checkout", "lint", "agnostic-checks", "codegen-checks", "discover-platforms"):
-              if jobs[name]["result"] != "success":
-                  errors.append(f"{name}: {jobs[name]['result']}")
-
-          try:
-              selected = json.loads(jobs["discover-platforms"]["outputs"]["platforms"])
-              if not isinstance(selected, list) or not all(isinstance(p, str) for p in selected):
-                  raise ValueError("platforms must be an array of strings")
-          except (KeyError, TypeError, ValueError) as exc:
-              errors.append(f"Invalid platform discovery: {exc}")
-              selected = []
-
-          platform_result = jobs["platform-pipeline"]["result"]
-          if selected and platform_result != "success":
-              errors.append(f"platform-pipeline: {platform_result}")
-          elif not selected and platform_result not in ("success", "skipped"):
-              errors.append(f"platform-pipeline: {platform_result}")
-
-          for error in errors:
-              print(f"::error::{error}")
-          if errors:
-              sys.exit(1)
-          print("Shared checks and all selected platforms passed.")
-          PY
+          set -euo pipefail
+          if [[ -f plan/flagcicd-plan.json ]]; then
+            python3 .github/scripts/flagcicd_report.py summary \
+              --directory platform-reports \
+              --plan-file plan/flagcicd-plan.json \
+              --output flagcicd-run-summary.json
+          else
+            # No plan means the plan job failed. The report still runs, and
+            # still says so; a missing plan must not read as "nothing to check".
+            python3 .github/scripts/flagcicd_report.py summary \
+              --directory platform-reports \
+              --output flagcicd-run-summary.json
+          fi
+      - name: Retain run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flagcicd-run-summary-${{ github.run_attempt }}
+          path: flagcicd-run-summary.json
+          if-no-files-found: error
+          retention-days: 14

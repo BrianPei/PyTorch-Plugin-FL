@@ -290,9 +290,15 @@ steps:
   # registration both bypasses that dispatcher and registers lift_fresh, whose
   # vendor-device check rejects flagos tensors. The file skips itself when the
   # wheel carries no FlagGems kernels or the runtime has no mthreads backend.
+  #
+  # `requires` states the dependency the comment above describes: the group
+  # skips itself when the FlagGems runtime is missing, and `musa_runtime`
+  # is the check that says whether it is missing or broken. Both ids are
+  # MUSA-only, so the requirement constrains nothing on other platforms.
   - id: musa_flaggems_hybrid
     name: Run MUSA FlagGems hybrid tests
     platforms: [musa]
+    requires: [musa_runtime]
     command: >-
       python -m pytest tests/integration/ops/test_musa_flaggems.py
       -m musa -v -s --tb=short

@@ -1,8 +1,33 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The capability contract. One file states what this repository can prove,
+# how deep each kind of change must be tested, and which execution set each
+# profile is allowed to spend. The planner reads it and refuses requests it
+# cannot honour; nothing here is advisory.
+#
+# A level is executable only when it is `supported` here AND, for levels that
+# carry hardware acceptance, the record in acceptance.yaml says `accepted`
+# with evidence. `pending_acceptance` is the honest state of L3/L4 today:
+# the machinery below exists, the measurements do not.
+
 schema_version: flagcicd.project/v1
 repository: Torch-FL
 entry_workflow: .github/workflows/flagcicd-entry.yml
 platform_config_glob: .github/configs/*.yml
 
+# Verification depth. `scope` is what a green run of that level means.
 levels:
   L0:
     support: supported
@@ -11,15 +36,57 @@ levels:
   L1:
     support: supported
     scope: platform_agnostic
-    checks: [L0, agnostic-checks, codegen-checks]
+    checks: [L0, agnostic-checks, codegen-checks, wheel-checks]
   L2:
     support: supported
     scope: installed_wheel_integration
     checks: [L1, build, wheel-validation, install, integration-tests]
   L3:
-    support: unsupported
+    support: pending_acceptance
+    scope: compatibility_and_runtime_stability
+    checks:
+      - L2
+      - version-compatibility-matrix
+      - abi-check
+      - device-lifecycle
+      - stress-and-performance
+    acceptance: acceptance.yaml#levels.L3
   L4:
-    support: unsupported
+    support: pending_acceptance
+    scope: release_candidate
+    checks:
+      - L3
+      - model-inference-and-training
+      - accuracy-acceptance
+      - long-run-stability
+      - install-upgrade
+      - release-environment
+    acceptance: acceptance.yaml#levels.L4
+
+# Execution sets. A profile is a budget and a case set, not a level: the
+# effective level is the maximum of the requested level, the diff's minimum,
+# and the profile's minimum. `selection` decides the platform set when the
+# request does not name one; `cases` names the manifest groups by class.
+profiles:
+  pr:
+    selection: affected
+    minimum_level: L0
+    cases: [baseline]
+  nightly:
+    selection: all
+    minimum_level: L2
+    cases: [baseline, regression]
+  weekly:
+    selection: all
+    minimum_level: L3
+    cases: [baseline, regression, compatibility, lifecycle, soak]
+
+# Scheduled events carry their cron string in the payload; this is the only
+# place a cron becomes a profile, so a new schedule cannot silently inherit
+# the cheapest budget.
+schedules:
+  '0 18 * * *': nightly
+  '0 18 * * 6': weekly
 
 risk_rules:
   version: v1
@@ -56,5 +123,21 @@ report:
   schema_version: flagcicd.report/v1
   summary_artifact: flagcicd-run-summary-{run_attempt}
   raw_formats: [pytest-json-report, coverage.py]
-  coverage_scope: installed torch_fl Python files; line coverage
-  coverage_regression: not_enabled
+  coverage_scopes:
+    python_line:
+      scope: installed torch_fl Python files
+      metric: line
+    capability:
+      scope: operators and dtypes selected by the composed manifest
+      metric: case
+    native:
+      scope: instrumented C++ translation units in the installed library
+      metric: line
+      support: pending_acceptance
+  coverage_regression: observation
+  regression_policy:
+    baseline: .flagcicd/baselines
+    samples_required: 5
+    observation_sigma: 3
+    reference_platform: cuda
+    comparison_guards: [source_repository, platform, test_level, profile, case_set_hash, environment]

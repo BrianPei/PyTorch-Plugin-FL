@@ -45,7 +45,9 @@ PLANNER = load("flagcicd_plan")
 RESOLVER = load("flagcicd_resolve")
 REPORTER = load("flagcicd_report")
 CONTRACT = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
+ACCEPTANCE = yaml.safe_load((ROOT / ".flagcicd/acceptance.yaml").read_text())
 SHA = "a" * 40
+CONTROL = "c" * 40
 
 
 def request(**overrides):
@@ -53,6 +55,9 @@ def request(**overrides):
         "source_repository": "flagos-ai/Torch-FL",
         "source_sha": SHA,
         "base_sha": "b" * 40,
+        "control_sha": CONTROL,
+        "profile": "pr",
+        "selection": "affected",
         "requested_level": "auto",
         "platforms": "all",
         "task_id": 'task-"quoted"',
@@ -62,6 +67,7 @@ def request(**overrides):
 
 
 def plan(level="L2", platforms=None):
+    expected = platforms if platforms is not None else ["cuda"]
     return {
         **request(),
         "test_level": level,
@@ -69,7 +75,14 @@ def plan(level="L2", platforms=None):
         "config_hash": "c" * 64,
         "risk_level": "R2",
         "run_id": "42",
-        "expected_platforms": platforms if platforms is not None else ["cuda"],
+        "expected_platforms": expected,
+        # The report checks that each platform ran the groups its plan chose,
+        # so a plan fixture without groups would test a shape no real plan has.
+        "groups": {platform: [{"id": "unit"}] for platform in expected},
+        "not_selected": {platform: [] for platform in expected},
+        "selection_reason": {
+            platform: "the request names this platform" for platform in expected
+        },
     }
 
 
@@ -132,16 +145,48 @@ def test_contract_changes_change_the_actual_risk_decision():
     assert PLANNER.infer_level(["new-path"], contract)[0] == "L1"
 
 
-@pytest.mark.parametrize("requested", ["L3", "L4", "invalid"])
-def test_unsupported_levels_fail_before_platform_dispatch(requested):
-    with pytest.raises(ValueError, match="unsupported"):
-        PLANNER.build_plan(request(requested_level=requested), CONTRACT, ROOT, [])
+@pytest.mark.parametrize("requested", ["L3", "L4"])
+def test_levels_awaiting_acceptance_fail_before_platform_dispatch(requested):
+    # The contract declares L3/L4 pending_acceptance, and acceptance.yaml has
+    # no evidence for either: the refusal names that state rather than the
+    # generic "unsupported", because the code exists and only a hardware
+    # record is missing.
+    with pytest.raises(PLANNER.PlanError, match="pending hardware acceptance"):
+        PLANNER.build_plan(request(requested_level=requested), CONTRACT, ACCEPTANCE, ROOT, [])
+
+
+def test_an_unknown_level_is_rejected_by_the_resolver():
+    # The resolver owns the request vocabulary, so "invalid" never reaches the
+    # planner: it fails here, before a checkout is resolved.
+    with pytest.raises(ValueError, match="supported test levels are auto"):
+        RESOLVER.normalized(
+            profile="pr",
+            selection="affected",
+            platforms="all",
+            event_labels=[],
+            contract=CONTRACT,
+            requested_level="invalid",
+        )
+
+
+def test_accepting_a_level_requires_evidence():
+    claimed = json.loads(json.dumps(ACCEPTANCE))
+    claimed["levels"]["L3"]["status"] = "accepted"
+    with pytest.raises(PLANNER.PlanError, match="accepted without evidence"):
+        PLANNER.build_plan(
+            request(requested_level="L3"), CONTRACT, claimed, ROOT, []
+        )
+    claimed["levels"]["L3"]["evidence"] = [{"run_id": "1"}]
+    with pytest.raises(PLANNER.PlanError, match="accepted without a control commit"):
+        PLANNER.build_plan(
+            request(requested_level="L3"), CONTRACT, claimed, ROOT, []
+        )
 
 
 def test_runtime_changes_cannot_be_lowered_to_l0():
     result = PLANNER.build_plan(
-        request(requested_level="L0", platforms=["cuda"]),
-        CONTRACT,
+        request(requested_level="L0", platforms="cuda"),
+        CONTRACT, ACCEPTANCE,
         ROOT,
         ["csrc/aten/common.cc"],
     )
@@ -150,19 +195,82 @@ def test_runtime_changes_cannot_be_lowered_to_l0():
 
 
 def test_documentation_has_no_hardware_but_explicit_l2_is_nonempty():
-    result = PLANNER.build_plan(request(), CONTRACT, ROOT, ["README.md"])
+    result = PLANNER.build_plan(request(), CONTRACT, ACCEPTANCE, ROOT, ["README.md"])
     assert result["test_level"] == "L0"
     assert result["expected_platforms"] == []
     result = PLANNER.build_plan(
-        request(requested_level="L2"), CONTRACT, ROOT, ["README.md"]
+        request(requested_level="L2"), CONTRACT, ACCEPTANCE, ROOT, ["README.md"]
     )
     assert result["expected_platforms"]
 
 
-@pytest.mark.parametrize("platforms", [["../cuda"], [], [True], "cuda,wrong", {}])
+def test_a_profile_minimum_above_the_accepted_level_is_deferred_not_refused():
+    # weekly asks for L3 and L3 is pending acceptance. Refusing the whole
+    # schedule would also cancel the L2 work that is runnable, so the profile's
+    # ask is capped and the shortfall is recorded -- the plan says "L2, wanted
+    # L3" instead of passing L2 off as the weekly budget.
+    result = PLANNER.build_plan(
+        request(profile="weekly", selection="all"), CONTRACT, ACCEPTANCE, ROOT, []
+    )
+    assert result["test_level"] == "L2"
+    assert result["level_sources"]["profile"] == "L3"
+    assert result["level_deferred"] == {
+        "wanted": "L3",
+        "applied": "L2",
+        "reason": result["level_deferred"]["reason"],
+    }
+    assert "pending hardware acceptance" in result["level_deferred"]["reason"]
+    # The deferral must survive the trip through the report context, or a
+    # reader of the summary would see an L2 weekly with no explanation. The CLI
+    # adds the run identity after build_plan, so the fixture does too.
+    result.update(run_id="42", run_attempt="1")
+    assert json.loads(PLANNER.report_context(result))["level_deferred"] == (
+        result["level_deferred"]
+    )
+
+
+def test_an_accepted_level_releases_the_deferred_profile_minimum():
+    # The cap is a function of the acceptance record, not a permanent ceiling:
+    # once L3 has evidence and a control commit, weekly plans L3 and there is
+    # nothing to defer.
+    accepted = json.loads(json.dumps(ACCEPTANCE))
+    accepted["levels"]["L3"] = {
+        "status": "accepted",
+        "owner": "hardware-ci",
+        "accepted_sha": CONTROL,
+        "evidence": [{"run_id": "1", "platform": "cuda"}],
+    }
+    result = PLANNER.build_plan(
+        request(profile="weekly", selection="all"), CONTRACT, accepted, ROOT, []
+    )
+    assert result["test_level"] == "L3"
+    assert result["level_deferred"] is None
+
+
+def test_an_explicit_level_is_never_rewritten_by_the_cap():
+    # A requested L3 or a diff that demands it is honoured or refused, never
+    # silently lowered: the cap applies only when the profile minimum is the
+    # sole reason for the depth.
+    with pytest.raises(PLANNER.PlanError, match="pending hardware acceptance"):
+        PLANNER.build_plan(
+            request(profile="weekly", selection="all", requested_level="L3"),
+            CONTRACT, ACCEPTANCE, ROOT, [],
+        )
+
+
+@pytest.mark.parametrize("platforms", [["../cuda"], [], [True], ["cuda,ppu"], {}])
 def test_invalid_platforms_are_rejected(platforms):
+    # The resolver owns the platform vocabulary -- it joins an array into the
+    # comma-separated form and rejects an empty, non-string or unknown entry
+    # before the request reaches the planner.
     with pytest.raises(ValueError):
-        PLANNER.build_plan(request(platforms=platforms), CONTRACT, ROOT, [])
+        RESOLVER.normalized(
+            profile="pr",
+            selection="affected",
+            platforms=platforms,
+            event_labels=[],
+            contract=CONTRACT,
+        )
 
 
 def test_pr_resolution_pins_head_and_base_and_ignores_claimed_changed_files(
@@ -187,6 +295,8 @@ def test_pr_resolution_pins_head_and_base_and_ignores_claimed_changed_files(
         "repository_dispatch",
         "flagos-ai/Torch-FL",
         "c" * 40,
+        "d" * 40,
+        CONTRACT,
     )
     assert result["source_repository"] == "contributor/fork"
     assert result["source_sha"] == SHA
@@ -201,14 +311,21 @@ def test_pr_resolution_pins_head_and_base_and_ignores_claimed_changed_files(
         {"pr_number": "$(whoami)"},
         {"pr_number": "12", "checkout_ref": "main"},
         {"task_id": "first\nplatforms=cuda"},
-        {"test_level": "L4"},
+        {"test_level": "L5"},
     ],
 )
 def test_bad_requests_fail(monkeypatch, payload):
     monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
     monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
     with pytest.raises(ValueError):
-        RESOLVER.resolve({"inputs": payload}, "workflow_dispatch", "owner/repo", SHA)
+        RESOLVER.resolve(
+            {"inputs": payload},
+            "workflow_dispatch",
+            "owner/repo",
+            SHA,
+            CONTROL,
+            CONTRACT,
+        )
 
 
 def jobs(result="success", **stages):
@@ -285,7 +402,9 @@ def test_successful_job_requires_complete_pytest_data_but_coverage_is_optional(
     missing = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
     assert missing["status"] == "report_error"
     raw_reports(tmp_path)
-    report = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    report = REPORTER.platform_report(
+        plan(), "cuda", jobs(), tmp_path, 1, group_records(tmp_path)
+    )
     assert report["status"] == "passed"
     assert report["metrics"]["tests"]["passed"] == 1
     assert report["coverage_warnings"]
@@ -300,6 +419,21 @@ def test_stale_or_partial_pytest_data_cannot_pass(tmp_path, source, complete):
     )
 
 
+def group_records(tmp_path, platform="cuda", status="passed"):
+    """A passing run must account for the groups its plan selected."""
+    path = tmp_path / f"groups-{platform}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": REPORTER.GROUPS_SCHEMA,
+                "platform": platform,
+                "groups": [{"id": "unit", "status": status, "tests": 1}],
+            }
+        )
+    )
+    return path
+
+
 def entry_jobs(level="L2"):
     return {
         name: {"result": "success" if expected else "skipped"}
@@ -309,6 +443,7 @@ def entry_jobs(level="L2"):
             "preflight": True,
             "agnostic": level != "L0",
             "codegen": level != "L0",
+            "wheel": level != "L0",
             "platforms": level == "L2",
         }.items()
     }
@@ -458,7 +593,9 @@ def test_coverage_is_per_platform_and_partial_data_is_unavailable(
             }
         )
     )
-    report = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    report = REPORTER.platform_report(
+        plan(), "cuda", jobs(), tmp_path, 1, group_records(tmp_path)
+    )
     assert report["status"] == "passed"
     assert report["metrics"]["coverage"]["available"] is available
 
@@ -702,9 +839,26 @@ def test_a_rerun_can_replace_a_report_from_a_previous_plan(tmp_path):
     assert summary["children"][0]["run_attempt"] == 2
 
 
-def test_array_platforms_are_names_not_comma_separated_sublists():
-    with pytest.raises(ValueError):
-        PLANNER.build_plan(request(platforms=["cuda,ppu"]), CONTRACT, ROOT, [])
+def test_array_platforms_are_names_not_comma_separated_sublists(monkeypatch):
+    # An array is one name per element; the resolver refuses an element that
+    # is itself a comma-separated list instead of silently splitting it.
+    monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
+    monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
+    with pytest.raises(ValueError, match="single name"):
+        RESOLVER.dispatch_request(
+            {"inputs": {"platforms": ["cuda,ppu"]}},
+            "workflow_dispatch",
+            "flagos-ai/Torch-FL",
+            SHA,
+            CONTROL,
+            CONTRACT,
+        )
+    # A list reaches the planner only through the resolver's normalization,
+    # and a hand-built request cannot smuggle one past it.
+    with pytest.raises(PLANNER.PlanError, match="platforms must be a string"):
+        PLANNER.build_plan(
+            request(platforms=["cuda", "ppu"]), CONTRACT, ACCEPTANCE, ROOT, []
+        )
 
 
 def test_large_diffs_remain_in_artifacts_and_context_can_start_a_process():
@@ -712,7 +866,7 @@ def test_large_diffs_remain_in_artifacts_and_context_can_start_a_process():
         f"csrc/runtime/generated/accelerator_implementation_{index}.cc"
         for index in range(2000)
     ]
-    actual = PLANNER.build_plan(request(), CONTRACT, ROOT, changed)
+    actual = PLANNER.build_plan(request(), CONTRACT, ACCEPTANCE, ROOT, changed)
     actual.update(run_id="42", run_attempt="1")
     assert len(json.dumps(actual).encode()) > 131072
     context = PLANNER.report_context(actual)
@@ -829,6 +983,8 @@ def test_workflow_stage_recorder_and_platform_report_use_the_same_contract(tmp_p
     raw_reports(tmp_path)
     actual = jobs()
     actual["integration-tests"]["outputs"] = values
-    report = REPORTER.platform_report(plan(), "cuda", actual, tmp_path, 3)
+    report = REPORTER.platform_report(
+        plan(), "cuda", actual, tmp_path, 3, group_records(tmp_path)
+    )
     assert report["status"] == "passed"
     assert report["execution_attempt"] == "3"

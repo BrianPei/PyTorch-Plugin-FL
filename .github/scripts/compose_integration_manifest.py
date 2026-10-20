@@ -27,6 +27,13 @@ one platform ran look like a step every platform ran; here the deviation is a
 `platforms:` key in one file, and how much is still per-platform is a number
 the loader prints on every run.
 
+``compose()`` is what the loader job prints: every group a platform runs, which
+is the set the pipeline must still execute in one pass. ``select()`` is what
+the planner calls: the subset that a level and a profile pay for, plus a written
+reason for every group it leaves out. Both read the same entries and produce
+the same step shape, so a group cannot be described one way in the plan and run
+another way on the runner.
+
 Input is JSON, not YAML: this runs in the loader job on ubuntu-latest, where
 `yq` is already the YAML reader, and the vendor images are not required to
 carry a Python YAML module. The parsing side of the seam is `yq -o=json`; this
@@ -44,6 +51,21 @@ from pathlib import Path
 # variable belongs to the shell on the hardware runner.
 DISPLAY_NAME_TOKEN = "{{display_name}}"
 
+# Verification depths, in order. A group declares the shallowest level that can
+# prove it; it runs at that level and every deeper one.
+LEVEL_ORDER = {"L0": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4}
+
+# The case classes a profile can buy. A group that declares none belongs to
+# `baseline`, which every profile includes -- a group is only skipped when the
+# manifest says so in a way a reviewer can read.
+CASE_CLASSES = ("baseline", "regression", "compatibility", "lifecycle", "soak")
+
+# Integration groups install a wheel on hardware, so L2 is the default: a group
+# that forgets to declare its level runs rather than quietly disappearing from
+# the deepest profile that does not happen to name it.
+DEFAULT_LEVEL = "L2"
+DEFAULT_CASES = ("baseline",)
+
 _ENTRY_KEYS = {
     "id",
     "name",
@@ -51,6 +73,12 @@ _ENTRY_KEYS = {
     "platforms",
     "environment",
     "environment_from_config",
+    "level",
+    "profiles",
+    "cases",
+    "requires",
+    "timeout_minutes",
+    "resources",
 }
 
 
@@ -102,12 +130,75 @@ def _entry_platforms(entry, known):
     return list(platforms)
 
 
+def _string_list(value, field, allowed=None):
+    if not isinstance(value, list) or not value:
+        raise ManifestError(f"{field} must be a non-empty list")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ManifestError(f"{field} must contain non-empty strings")
+        if allowed is not None and item not in allowed:
+            raise ManifestError(
+                f"{field} names {item!r}, which is not one of {', '.join(allowed)}"
+            )
+    if len(set(value)) != len(value):
+        raise ManifestError(f"{field} repeats a value")
+    return list(value)
+
+
+def entry_metadata(entry, field):
+    """The execution metadata one entry declares, with its defaults filled in.
+
+    Every key is optional because the manifest predates levels and profiles;
+    the defaults are the conservative ones. A group that says nothing runs at
+    the shallowest level that proves an installed wheel, in every profile, in
+    the baseline case set -- so omitting the keys keeps a group running, and
+    skipping a group always takes a key someone can grep for.
+    """
+    level = entry.get("level", DEFAULT_LEVEL)
+    if level not in LEVEL_ORDER:
+        raise ManifestError(
+            f"{field}.level must be one of {', '.join(LEVEL_ORDER)}; got {level!r}"
+        )
+    profiles = entry.get("profiles")
+    if profiles is not None:
+        profiles = _string_list(profiles, f"{field}.profiles")
+    cases = _string_list(
+        entry.get("cases", list(DEFAULT_CASES)), f"{field}.cases", CASE_CLASSES
+    )
+    requires = entry.get("requires")
+    if requires is not None:
+        requires = _string_list(requires, f"{field}.requires")
+    timeout = entry.get("timeout_minutes")
+    if timeout is not None:
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+            raise ManifestError(f"{field}.timeout_minutes must be a positive integer")
+    resources = entry.get("resources")
+    if resources is not None:
+        if not isinstance(resources, dict) or not resources:
+            raise ManifestError(f"{field}.resources must be a non-empty mapping")
+        for key, value in resources.items():
+            _require_string(key, f"{field}.resources key")
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                raise ManifestError(f"{field}.resources[{key}] must be a scalar")
+    return {
+        "level": level,
+        "profiles": profiles,
+        "cases": cases,
+        "requires": requires or [],
+        "timeout_minutes": timeout,
+        "resources": dict(resources or {}),
+    }
+
+
 def validate_manifest(manifest, known):
     """Check the manifest's shape and return its entries.
 
     The invariants that matter: every entry is complete, a step's variants sit
     together and never overlap (a platform that got the same step twice would
-    run it twice, silently), and every entry names a platform that exists.
+    run it twice, silently), every entry names a platform that exists, and the
+    variants of one id agree on what that id means -- its level, its profiles,
+    its case classes and what it requires. A group that means one thing on CUDA
+    and another on Ascend makes the plan's case set hash a claim about nothing.
     """
     if not isinstance(manifest, dict):
         raise ManifestError("the manifest must be a mapping with a steps list")
@@ -117,6 +208,7 @@ def validate_manifest(manifest, known):
 
     seen_order: list[str] = []
     assigned: dict[str, set[str]] = {}
+    metadata: dict[str, dict] = {}
     for index, entry in enumerate(steps):
         if not isinstance(entry, dict):
             raise ManifestError(f"steps[{index}] must be a mapping")
@@ -129,6 +221,12 @@ def validate_manifest(manifest, known):
         _require_string(entry.get("name"), f"steps[{index}].name")
         _require_string(entry.get("command"), f"steps[{index}].command")
         platforms = _entry_platforms(entry, known)
+        declared = entry_metadata(entry, f"steps[{index}]")
+        for requirement in declared["requires"]:
+            if requirement == step_id:
+                raise ManifestError(
+                    f"step {step_id!r} requires itself, so it could never run"
+                )
 
         if entry.get("environment") is not None:
             _environment(entry, f"steps[{index}].environment")
@@ -158,10 +256,33 @@ def validate_manifest(manifest, known):
                     f"step {step_id!r} lists {', '.join(sorted(overlap))} in more "
                     "than one variant, so those platforms would run it twice"
                 )
+            if metadata[step_id] != declared:
+                raise ManifestError(
+                    f"step {step_id!r} declares different level, profiles, cases or "
+                    "requires on different platforms; a group has one meaning"
+                )
             assigned[step_id].update(platforms)
         else:
             assigned[step_id] = set(platforms)
+            metadata[step_id] = declared
             seen_order.append(step_id)
+
+    # A requirement must name an earlier id: execution follows this file's
+    # order, so a dependency declared later would never have run when the
+    # dependent group starts.
+    position = {step_id: index for index, step_id in enumerate(seen_order)}
+    for step_id in seen_order:
+        for requirement in metadata[step_id]["requires"]:
+            if requirement not in position:
+                raise ManifestError(
+                    f"step {step_id!r} requires {requirement!r}, which is not a "
+                    "manifest id"
+                )
+            if position[requirement] >= position[step_id]:
+                raise ManifestError(
+                    f"step {step_id!r} requires {requirement!r}, which runs later "
+                    "or at the same position; requirements must run first"
+                )
 
     return steps, seen_order, assigned
 
@@ -181,12 +302,60 @@ def _environment(entry, field):
     return {str(key): str(value) for key, value in environment.items()}
 
 
-def compose(manifest, config, platform, known):
-    """The `integration_tests` list for one platform.
+def _compose_entry(entry, config, platform, display_name, consumed):
+    """Render one manifest entry as the step the runner executes."""
+    environment = _environment(entry, f"step {entry['id']}.environment")
+    for key, variable in (entry.get("environment_from_config") or {}).items():
+        block = config.get(key)
+        if not block:
+            raise ManifestError(
+                f"step {entry['id']!r} reads {key!r} from the {platform} config, "
+                "which does not define it"
+            )
+        if not isinstance(block, dict):
+            raise ManifestError(
+                f"step {entry['id']!r} reads {key!r} from the {platform} "
+                f"config, which states it as {type(block).__name__} rather "
+                "than the mapping the step is handed"
+            )
+        environment[variable] = json.dumps(block, separators=(",", ":"), sort_keys=True)
+        consumed.add(key)
+    declared = entry_metadata(entry, f"step {entry['id']!r}")
+    step = {
+        "id": entry["id"],
+        "name": entry["name"].replace(DISPLAY_NAME_TOKEN, display_name),
+        "command": entry["command"],
+    }
+    if declared["requires"]:
+        step["requires"] = declared["requires"]
+    if declared["timeout_minutes"] is not None:
+        step["timeout_seconds"] = declared["timeout_minutes"] * 60
+    if declared["resources"]:
+        step["resources"] = declared["resources"]
+    if environment:
+        step["environment"] = environment
+    return step
 
-    Order is the manifest's, never the config's, so two platforms that run the
-    same steps run them in the same sequence.
+
+def _check_config_consumed(config, platform, steps, consumed):
+    """Refuse expectations a config states that no running step reads.
+
+    The other direction from ``_compose_entry``: data nobody checks is data
+    nobody validates. Left unchecked, a platform can carry a whole expectation
+    block and run against nothing.
     """
+    declared = {
+        key for entry in steps for key in (entry.get("environment_from_config") or {})
+    }
+    unread = sorted(key for key in declared if config.get(key) and key not in consumed)
+    if unread:
+        raise ManifestError(
+            f"the {platform} config defines {', '.join(unread)}, which no step that "
+            "runs on this platform consumes"
+        )
+
+
+def _prepare(manifest, config, platform, known):
     steps, _ids, _assigned = validate_manifest(manifest, known)
     if platform not in known:
         raise ManifestError(
@@ -194,61 +363,151 @@ def compose(manifest, config, platform, known):
         )
     if not isinstance(config, dict):
         raise ManifestError("the platform config must be a mapping")
-
     display_name = _require_string(config.get("display_name"), "display_name")
+    return steps, display_name
 
-    consumed_from_config: set[str] = set()
-    declared_from_config = {
-        key for entry in steps for key in (entry.get("environment_from_config") or {})
-    }
 
+def compose(manifest, config, platform, known):
+    """The `integration_tests` list for one platform.
+
+    Order is the manifest's, never the config's, so two platforms that run the
+    same steps run them in the same sequence.
+    """
+    steps, display_name = _prepare(manifest, config, platform, known)
+
+    consumed: set[str] = set()
     composed = []
     for entry in steps:
         if platform not in _entry_platforms(entry, known):
             continue
-        environment = _environment(entry, f"step {entry['id']}.environment")
-        for key, variable in (entry.get("environment_from_config") or {}).items():
-            block = config.get(key)
-            if not block:
-                raise ManifestError(
-                    f"step {entry['id']!r} reads {key!r} from the {platform} config, "
-                    "which does not define it"
-                )
-            if not isinstance(block, dict):
-                raise ManifestError(
-                    f"step {entry['id']!r} reads {key!r} from the {platform} "
-                    f"config, which states it as {type(block).__name__} rather "
-                    "than the mapping the step is handed"
-                )
-            environment[variable] = json.dumps(
-                block, separators=(",", ":"), sort_keys=True
-            )
-            consumed_from_config.add(key)
-        step = {
-            "name": entry["name"].replace(DISPLAY_NAME_TOKEN, display_name),
-            "command": entry["command"],
-        }
-        if environment:
-            step["environment"] = environment
-        composed.append(step)
+        composed.append(_compose_entry(entry, config, platform, display_name, consumed))
 
-    # The other direction: data a config states that no step of this platform
-    # reads is data nobody checks. Left unchecked, a platform can carry a whole
-    # expectation block and run against nothing.
-    unread = sorted(
-        key
-        for key in declared_from_config
-        if config.get(key) and key not in consumed_from_config
-    )
-    if unread:
-        raise ManifestError(
-            f"the {platform} config defines {', '.join(unread)}, which no step that "
-            "runs on this platform consumes"
-        )
+    _check_config_consumed(config, platform, steps, consumed)
 
     if not composed:
         raise ManifestError(f"no steps apply to {platform!r}")
     return composed
+
+
+def select(
+    manifest,
+    config,
+    platform,
+    known,
+    level=DEFAULT_LEVEL,
+    profile="pr",
+    cases=DEFAULT_CASES,
+    level_order=None,
+):
+    """The groups one plan runs on one platform, and why each other is skipped.
+
+    Selection is subtractive and every subtraction is a manifest statement: a
+    group left out because its level is deeper than the plan, because it
+    declares other profiles, because its case class is not in this profile's
+    set, or because something it requires was not selected. Execution order is
+    still the manifest's -- ``requires`` only has to name an earlier id, which
+    ``validate_manifest`` enforces -- so the returned list is a subsequence of
+    ``compose()``'s.
+
+    The skipped list is returned rather than logged because the plan carries it
+    into the artifact: a group that did not run is a fact a reviewer checks,
+    not one a CI log search has to reconstruct.
+    """
+    order = dict(level_order or LEVEL_ORDER)
+    if level not in order:
+        raise ManifestError(f"unknown level {level!r}")
+    cases = _string_list(list(cases), "profile cases", CASE_CLASSES)
+    steps, display_name = _prepare(manifest, config, platform, known)
+
+    # A requirement is only a dependency where it also runs: `musa_runtime` is
+    # declared for MUSA alone, so a group that requires it is unconstrained on
+    # the other platforms rather than permanently blocked by a group they never
+    # had.
+    applicable = {
+        entry["id"] for entry in steps if platform in _entry_platforms(entry, known)
+    }
+
+    chosen, skipped, selected_ids = [], [], set()
+    consumed: set[str] = set()
+    for entry in steps:
+        if platform not in _entry_platforms(entry, known):
+            continue
+        step_id = entry["id"]
+        declared = entry_metadata(entry, f"step {step_id!r}")
+        reason = None
+        if order[declared["level"]] > order[level]:
+            reason = f"requires {declared['level']}, the plan runs {level}"
+        elif declared["profiles"] is not None and profile not in declared["profiles"]:
+            reason = f"not declared for the {profile} profile"
+        elif not set(declared["cases"]) & set(cases):
+            reason = f"not in the {profile} case set ({', '.join(cases)})"
+        else:
+            missing = [
+                item
+                for item in declared["requires"]
+                if item in applicable and item not in selected_ids
+            ]
+            if missing:
+                reason = f"dependency-blocked: {', '.join(missing)} was not selected"
+        if reason is not None:
+            skipped.append({"id": step_id, "name": entry["name"], "reason": reason})
+            continue
+        chosen.append(_compose_entry(entry, config, platform, display_name, consumed))
+        selected_ids.add(step_id)
+
+    _check_config_consumed(config, platform, steps, consumed)
+
+    if not chosen:
+        raise ManifestError(
+            f"no steps apply to {platform!r} at {level} for the {profile} profile"
+        )
+    return chosen, skipped
+
+
+def filter_groups(composed, wanted, platform):
+    """Narrow a composed list to the ids a plan selected, in manifest order.
+
+    The plan already chose these ids with ``select()``; this is the seam that
+    hands that choice to the runner. It re-filters rather than trusting the
+    order it was given, keeps the manifest's order, and refuses an id the
+    manifest does not define *for this platform*: a plan naming a group this
+    commit does not have describes a different commit, and running the
+    remainder would report success for a selection that was never honoured.
+
+    Exactness is deliberate in the other direction too. The result must be
+    the same set the plan stated, so a filter that silently dropped an id is
+    as wrong as one that silently added a group.
+    """
+    if not isinstance(wanted, list) or not all(
+        isinstance(item, str) for item in wanted
+    ):
+        raise ManifestError("the selected groups must be a list of ids")
+    if len(set(wanted)) != len(wanted):
+        raise ManifestError("the selected groups repeat an id")
+    available = {step["id"]: step for step in composed}
+    unknown = [step_id for step_id in wanted if step_id not in available]
+    if unknown:
+        raise ManifestError(
+            f"the plan selects {', '.join(unknown)} on {platform!r}, which the "
+            "manifest does not define for this platform"
+        )
+    chosen_ids = set(wanted)
+    kept = [step for step in composed if step["id"] in chosen_ids]
+    dropped = [
+        {
+            "id": step["id"],
+            "name": step["name"],
+            "reason": "not selected by the plan",
+        }
+        for step in composed
+        if step["id"] not in chosen_ids
+    ]
+    if not kept:
+        raise ManifestError(
+            f"the plan selects no group on {platform!r}; a plan that runs nothing "
+            "cannot report success"
+        )
+    return kept, dropped
 
 
 def coverage_report(assigned, known):
@@ -274,6 +533,16 @@ def main(argv=None):
         default=".github/configs",
         help="directory the platform list is read from",
     )
+    parser.add_argument(
+        "--groups-file",
+        default="",
+        help="JSON array of ids the plan selected; omit to compose every group",
+    )
+    parser.add_argument(
+        "--not-selected-output",
+        default="",
+        help="write the groups the filter dropped, with a reason, to this path",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -282,6 +551,10 @@ def main(argv=None):
         known = known_platforms(args.config_dir)
         steps, _ids, assigned = validate_manifest(manifest, known)
         composed = compose(manifest, config, args.platform, known)
+        dropped = []
+        if args.groups_file:
+            wanted = json.loads(Path(args.groups_file).read_text())
+            composed, dropped = filter_groups(composed, wanted, args.platform)
     except ManifestError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
@@ -297,6 +570,13 @@ def main(argv=None):
         f"({variants} platform-restricted variant(s))",
         file=sys.stderr,
     )
+    if dropped:
+        print(
+            f"{len(dropped)} group(s) the plan did not select on {args.platform}:",
+            file=sys.stderr,
+        )
+        for group in dropped:
+            print(f"  {group['id']}: {group['reason']}", file=sys.stderr)
     report = coverage_report(assigned, known)
     if report:
         print(
@@ -305,6 +585,9 @@ def main(argv=None):
         )
         for line in report:
             print(line, file=sys.stderr)
+
+    if args.not_selected_output:
+        Path(args.not_selected_output).write_text(json.dumps(dropped, indent=2) + "\n")
 
     print(json.dumps(composed, separators=(",", ":")))
     return 0
