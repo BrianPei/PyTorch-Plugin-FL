@@ -113,7 +113,7 @@ def main():
     )
     args.output.write_text(json.dumps(request, indent=2) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-        for key in ("source_repository", "source_sha"):
+        for key in ("source_repository", "source_sha", "base_sha"):
             output.write(f"{key}={request[key]}\n")
 
 

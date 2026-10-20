@@ -91,6 +91,41 @@ def test_risk_rules_come_from_the_capability_contract(changed, level, risk):
     assert actual[:2] == (level, risk)
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        ["requirements.txt"],
+        ["requirements-dev.txt"],
+        ["constraints.txt"],
+        ["uv.lock"],
+    ],
+)
+def test_dependency_pins_are_runtime_changes(changed):
+    assert PLANNER.infer_level(changed, CONTRACT)[:2] == ("L2", "R2")
+
+
+def test_unavailable_diff_risk_comes_from_the_contract():
+    contract = json.loads(json.dumps(CONTRACT))
+    contract["risk_rules"]["unknown_risk"] = "R1"
+    assert PLANNER.infer_level(None, contract)[:2] == ("L2", "R1")
+
+
+def test_plan_fetches_the_comparison_commit_for_fork_checkouts():
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/flagcicd-entry.yml").read_text()
+    )
+    fetch = [
+        step
+        for step in workflow["jobs"]["plan"]["steps"]
+        if "git -C source fetch" in step.get("run", "")
+    ]
+    assert len(fetch) == 1
+    assert fetch[0]["env"]["BASE_SHA"] == "${{ steps.resolve.outputs.base_sha }}"
+    # A shallow base has no parents, so merge-base cannot find the fork point.
+    assert "--depth" not in fetch[0]["run"]
+    assert "${{ github.repository }}" in fetch[0]["run"]
+
+
 def test_contract_changes_change_the_actual_risk_decision():
     contract = json.loads(json.dumps(CONTRACT))
     contract["risk_rules"]["unknown_level"] = "L1"
@@ -386,6 +421,15 @@ def test_build_failure_keeps_its_stage_classification_in_summary(tmp_path):
     assert REPORTER.aggregate(plan(), results, tmp_path, 1)["status"] == "build_failed"
 
 
+def test_matrix_failure_with_a_passing_report_is_infrastructure(tmp_path):
+    # Every expected report exists and passes, so the report itself is not the
+    # defect: the matrix job failed outside the stages it records.
+    save_report(tmp_path)
+    results = entry_jobs()
+    results["platforms"]["result"] = "failure"
+    assert REPORTER.aggregate(plan(), results, tmp_path, 1)["status"] == "infra_error"
+
+
 @pytest.mark.parametrize("complete,available", [(True, True), (False, False)])
 def test_coverage_is_per_platform_and_partial_data_is_unavailable(
     tmp_path, complete, available
@@ -431,8 +475,13 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
         (ROOT / ".github/workflows/flagcicd-entry.yml").read_text()
     )
     assert set(workflow[True]) == {"workflow_dispatch", "repository_dispatch"}
+    group = workflow["concurrency"]["group"]
     assert workflow["concurrency"]["cancel-in-progress"] is False
-    assert "github.run_id" in workflow["concurrency"]["group"]
+    # A run id is unique per run, so keying on it serializes nothing.
+    assert "github.run_id" not in group
+    for identity in ("pr_number", "checkout_ref", "task_id"):
+        assert f"github.event.inputs.{identity}" in group
+        assert f"github.event.client_payload.{identity}" in group
     control = workflow["jobs"]["plan"]["steps"][0]
     assert control["with"]["ref"] == "${{ github.workflow_sha }}"
     for name in ("lint", "preflight", "agnostic", "codegen", "platforms"):

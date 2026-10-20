@@ -54,14 +54,25 @@ permissions:
   pull-requests: read
   actions: read
 
+# Key on the logical request, not the run: github.run_id is unique per run, so
+# it would never serialize anything. Two dispatches for the same PR write the
+# same artifact names and must queue instead of racing.
 concurrency:
-  group: flagcicd-${{ github.run_id }}
+  group: >-
+    flagcicd-${{ github.event.inputs.pr_number
+    || github.event.client_payload.pr_number
+    || github.event.inputs.checkout_ref
+    || github.event.client_payload.checkout_ref
+    || github.event.inputs.task_id
+    || github.event.client_payload.task_id
+    || github.sha }}
   cancel-in-progress: false
 
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Full-history source clone plus the comparison-commit fetch.
+    timeout-minutes: 20
     outputs:
       context: ${{ steps.plan.outputs.context }}
       test_level: ${{ steps.plan.outputs.test_level }}
@@ -80,7 +91,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install plan parser
-        run: python -m pip install PyYAML
+        run: python -m pip install "PyYAML==6.0.2"
       - name: Resolve immutable source
         id: resolve
         env:
@@ -94,6 +105,16 @@ jobs:
           path: source
           fetch-depth: 0
           persist-credentials: false
+      # The base commit lives upstream, so a fork's clone cannot reach it. Fetch
+      # it by SHA without --depth: a shallow base has no parents, and
+      # `git diff base...head` then fails with "no merge base" and silently
+      # degrades the plan to an unavailable diff.
+      - name: Fetch comparison commit
+        env:
+          BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
+        run: >-
+          git -C source fetch --no-tags
+          "${{ github.server_url }}/${{ github.repository }}" "$BASE_SHA"
       - name: Validate source configuration and create plan
         id: plan
         run: >-

@@ -38,7 +38,15 @@ risk_rules:
       minimum_level: L2
       risk: R3
     - id: runtime-and-build
-      paths: [torch_fl/**, .github/**, .flagcicd/**, setup.py, pyproject.toml]
+      paths:
+        - torch_fl/**
+        - .github/**
+        - .flagcicd/**
+        - setup.py
+        - pyproject.toml
+        - requirements*.txt
+        - constraints*.txt
+        - '*.lock'
       minimum_level: L2
       risk: R2
   unknown_level: L2

@@ -38,7 +38,7 @@ LEVELS = {"L0": 0, "L1": 1, "L2": 2}
 def infer_level(changed, contract):
     policy = contract["risk_rules"]
     if changed is None:
-        return policy["no_diff_level"], "R2", [], "unavailable"
+        return policy["no_diff_level"], policy["unknown_risk"], [], "unavailable"
     level, risk, matched = "L0", "R0", []
     for path in changed:
         path = path[2:] if path.startswith("./") else path

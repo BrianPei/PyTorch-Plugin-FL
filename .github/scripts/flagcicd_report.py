@@ -262,11 +262,12 @@ def aggregate(plan, jobs, directory, attempt):
             elif name != "platforms":
                 status = "test_failed"
             elif status == "passed":
-                status = (
-                    "report_error"
-                    if len(latest) == len(plan["expected_platforms"])
-                    else "infra_error"
-                )
+                # All expected reports are present and passing, yet the matrix
+                # job failed: the failure sits outside the stages the report
+                # covers (a child workflow's own failure, a setup step before
+                # the stages, an unusable runner). That is infra, not a report
+                # defect; a missing or contradictory report is caught above.
+                status = "infra_error"
         elif result == "cancelled" and status == "passed":
             status = "cancelled"
         elif result in ("missing", "skipped") and status == "passed":
