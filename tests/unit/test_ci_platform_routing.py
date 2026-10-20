@@ -45,6 +45,7 @@ def test_required_gate_covers_matrix_pipeline():
         "lint",
         "agnostic-checks",
         "codegen-checks",
+        "wheel-checks",
         "discover-platforms",
         "platform-pipeline",
     }
@@ -148,14 +149,16 @@ def test_required_gate_checks_platform_result(selected, result):
         "lint",
         "agnostic-checks",
         "codegen-checks",
+        "wheel-checks",
         "discover-platforms",
     ],
 )
-def test_required_gate_rejects_skipped_shared_checks(name):
+@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
+def test_required_gate_rejects_unsuccessful_shared_checks(name, result):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
     results = {job: {"result": "success"} for job in gate["needs"]}
     results["discover-platforms"]["outputs"] = {"platforms": "[]"}
-    results[name]["result"] = "skipped"
+    results[name]["result"] = result
     process = subprocess.run(
         ["bash", "-e", "-c", gate["steps"][0]["run"]],
         env={**os.environ, "RESULTS": json.dumps(results)},
@@ -163,7 +166,7 @@ def test_required_gate_rejects_skipped_shared_checks(name):
         text=True,
     )
     assert process.returncode == 1
-    assert f"{name}: skipped" in process.stdout
+    assert f"{name}: {result}" in process.stdout
 
 
 def _container_expression(name):
