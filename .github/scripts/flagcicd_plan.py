@@ -31,7 +31,7 @@ from ci.generate_matrix import (
     _platforms_from_labels,
 )
 from compose_integration_manifest import compose
-from test_tiers import policy, risk_profile
+from test_tiers import exclusion_reason, policy, risk_profile
 
 
 LEVELS = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}
@@ -124,10 +124,42 @@ def build_plan(request, contract, source, changed):
         selected = candidates
     if profile in ("nightly", "weekly") and selection.strip() == "all":
         selected = known
+    required_platforms = _platforms_from_files(changed, known, configs)
+    if profile in ("nightly", "weekly"):
+        required_platforms = known
+    diagnostic = level in ("L2", "L3") and bool(set(required_platforms) - set(selected))
+    validation_scope = "diagnostic" if diagnostic else "full"
+    platform_decisions = [
+        {
+            "platform": platform,
+            "status": "selected"
+            if level in ("L2", "L3") and platform in selected
+            else "excluded",
+            "reason": (
+                "hardware_not_required"
+                if level in ("L0", "L1")
+                else "platform_label"
+                if routed is not None
+                else "scheduled_profile"
+                if profile in ("nightly", "weekly")
+                else "candidate_platform_set"
+                if platform not in candidates
+                else "all_candidates"
+                if mode == "all"
+                else "affected_or_hardware_floor"
+                if platform in selected
+                else "not_affected"
+            ),
+        }
+        for platform in known
+    ]
     manifest_path = source / ".github/integration-manifest.yml"
     manifest = yaml.safe_load(manifest_path.read_text())
     fingerprint = hashlib.sha256(manifest_path.read_bytes())
     selections = {}
+    case_decisions = {}
+    blocked_cases = []
+    case_contracts = {}
     fingerprint.update(json.dumps(tiers, sort_keys=True).encode())
     for name in ("test-inventory.json", "performance-baselines.json"):
         fingerprint.update((source / ".flagcicd" / name).read_bytes())
@@ -135,12 +167,79 @@ def build_plan(request, contract, source, changed):
         path = configs / f"{platform}.yml"
         config = yaml.safe_load(path.read_text())
         groups = compose(manifest, config, platform, known, profile, tiers)
+        for group in groups:
+            requirement = {
+                "min_accelerators": group["resources"]["min_accelerators"],
+                "min_passed": group["min_passed"]
+                if "pytest" in group["command"]
+                or "run_unit_tests.py" in group["command"]
+                else 0,
+            }
+            previous = case_contracts.setdefault(group["id"], requirement)
+            if previous != requirement:
+                raise ValueError(f"inconsistent execution contract for {group['id']}")
         selections[platform] = [
-            {key: group[key] for key in ("id", "level", "category")} for group in groups
+            {
+                key: group[key]
+                for key in (
+                    "id",
+                    "level",
+                    "category",
+                    "requires",
+                    "resources",
+                    "timeout_seconds",
+                )
+            }
+            for group in groups
         ]
+        group_map = {group["id"]: group for group in groups}
+        case_decisions[platform] = []
+        applicable = {
+            entry["id"]
+            for entry in manifest["steps"]
+            if platform in entry.get("platforms", known)
+        }
+        for case_id, case in tiers["cases"].items():
+            group = group_map.get(case_id)
+            if group:
+                reason = group.get("blocked_reason", "selected_by_profile")
+                state = "blocked" if group.get("blocked_reason") else "selected"
+                evidence = group["requirement_evidence"]
+                if level in ("L0", "L1"):
+                    state, reason = "excluded", "hardware_not_required"
+                if (
+                    state == "blocked"
+                    and platform in selected
+                    and level in ("L2", "L3")
+                ):
+                    blocked_cases.append(
+                        {"platform": platform, "id": case_id, "reason": reason}
+                    )
+            else:
+                reason = exclusion_reason(case_id, case, profile, tiers) or (
+                    "platform_not_applicable"
+                    if case_id not in applicable
+                    else "not_selected"
+                )
+                state, evidence = "excluded", {}
+            case_decisions[platform].append(
+                {
+                    "id": case_id,
+                    "status": state,
+                    "reason": reason,
+                    "requirements": evidence,
+                }
+            )
         fingerprint.update(platform.encode())
         fingerprint.update(path.read_bytes())
     fingerprint.update(json.dumps(contract, sort_keys=True).encode())
+    manual_tests = {
+        path: entry
+        for path, entry in json.loads(
+            (source / ".flagcicd/test-inventory.json").read_text()
+        )["files"].items()
+        if entry["lane"] == "manual"
+    }
     expected_cases = {
         p: [g["id"] for g in sorted(groups, key=lambda g: g["level"])]
         for p, groups in selections.items()
@@ -152,6 +251,8 @@ def build_plan(request, contract, source, changed):
                 "profile": profile,
                 "test_level": level,
                 "selection": mode,
+                "validation_scope": validation_scope,
+                "required_platforms": required_platforms,
                 "expected_cases": expected_cases,
                 **{
                     key: request.get(key, "")
@@ -169,8 +270,17 @@ def build_plan(request, contract, source, changed):
             for key in ("control_sha", "target_kind", "diff_sha")
         },
         "selection": mode,
+        "selection_origin": request.get("selection_origin", "legacy_direct_request"),
         "profile": profile,
         "cases": selections,
+        "platform_decisions": platform_decisions,
+        "case_decisions": case_decisions,
+        "case_contracts": case_contracts,
+        "blocked_cases": blocked_cases,
+        "required_platforms": required_platforms,
+        "validation_scope": validation_scope,
+        "manual_tests": manual_tests,
+        "manual_test_count": len(manual_tests),
         "expected_cases": expected_cases,
         "test_level": level,
         "scope": contract["levels"][level]["scope"],
@@ -214,6 +324,19 @@ def report_context(plan):
                 for key in ("control_sha", "target_kind", "diff_sha", "selection")
             },
             "expected_cases": plan.get("expected_cases", {}),
+            **{
+                key: plan.get(key, default)
+                for key, default in (
+                    ("selection_origin", ""),
+                    ("validation_scope", "full"),
+                    ("required_platforms", []),
+                    ("blocked_cases", []),
+                    ("platform_decisions", []),
+                    ("case_contracts", {}),
+                )
+            },
+            "manual_test_count": len(plan.get("manual_tests", {})),
+            "plan_artifact": f"flagcicd-plan-{plan['run_attempt']}",
         },
         separators=(",", ":"),
     )
@@ -245,6 +368,7 @@ def main():
         run_id=os.environ["GITHUB_RUN_ID"],
         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
     )
+    plan["plan_artifact"] = f"flagcicd-plan-{plan['run_attempt']}"
     args.output.write_text(json.dumps(plan, indent=2) + "\n")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write("context=" + report_context(plan) + "\n")

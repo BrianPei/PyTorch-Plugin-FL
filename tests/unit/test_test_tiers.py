@@ -330,3 +330,81 @@ def test_all_profiled_commands_disable_legacy_crash_tolerance():
     doc = copy.deepcopy(policy())
     assert doc["profiles"]["weekly"]["max_level"] == "L4"
     assert doc["release"]["stability_seconds"] >= 3600
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("profiles", []),
+        ("profiles", ["unknown"]),
+        ("profiles", [["pr"]]),
+        ("requires", ["invented_capability"]),
+        ("requires", [["accelerator"]]),
+        ("resources", {"min_accelerators": True}),
+        ("resources", {"min_accelerators": 0}),
+        ("resources", {"min_accelerators": 1, "unverified": 42}),
+    ],
+)
+def test_invalid_case_requirements_fail_before_dispatch(tmp_path, field, value):
+    doc = policy()
+    doc["cases"]["environment"][field] = value
+    (tmp_path / ".flagcicd").mkdir()
+    (tmp_path / ".flagcicd/test-tiers.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="profiles, requirements or resources"):
+        policy(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "platform", sorted(p.stem for p in (ROOT / ".github/configs").glob("*.yml"))
+)
+def test_case_metadata_does_not_rewrite_existing_l2_commands(platform):
+    manifest = yaml.safe_load((ROOT / ".github/integration-manifest.yml").read_text())
+    config = yaml.safe_load((ROOT / f".github/configs/{platform}.yml").read_text())
+    known = [p.stem for p in (ROOT / ".github/configs").glob("*.yml")]
+    original = compose(manifest, config, platform, known)
+    applicable_ids = [
+        g["id"] for g in manifest["steps"] if platform in g.get("platforms", known)
+    ]
+    expected = [
+        g
+        for g, case in zip(original, applicable_ids, strict=True)
+        if policy()["cases"][case]["level"] == "L2"
+    ]
+    selected = compose(manifest, config, platform, known, "pr")
+    assert [(g["name"], g["command"]) for g in selected] == [
+        (
+            g["name"],
+            g["command"].replace(
+                "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1", "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
+            ),
+        )
+        for g in expected
+    ]
+    assert all(
+        g["requires"] == ["accelerator"] and g["resources"]["min_accelerators"] == 1
+        for g in selected
+    )
+    assert all(
+        g["requirement_evidence"]["status"] == "requires_runtime_verification"
+        for g in selected
+    )
+
+
+@pytest.mark.parametrize(
+    "bounds,expected",
+    [
+        ({"exactly": 1}, "blocked"),
+        ({"exactly": 2}, "requires_runtime_verification"),
+        ({"at_least": 1}, "requires_runtime_verification"),
+        ({}, "requires_runtime_verification"),
+    ],
+)
+def test_declared_lower_bound_is_not_mistaken_for_measured_resources(bounds, expected):
+    from test_tiers import requirement_evidence
+
+    case = policy()["cases"]["multi_device_contracts"]
+    result = requirement_evidence(
+        case, {"environment_check": {"flagos_devices": bounds}}
+    )
+    assert result["status"] == expected
+    assert bool(result["reasons"]) is (expected == "blocked")

@@ -26,157 +26,547 @@
     "environment": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "autoload_contract": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "multi_device_contracts": {
       "level": "L3",
       "category": "distributed",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 2
+      }
     },
     "musa_runtime": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "iluvatar_runtime": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "portable_top_level_contracts": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "vendor_ops": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "flaggems_ops": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "musa_flaggems_hybrid": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "rng": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "factory_ops": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "soft_lowp_matrix": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "amp_contract": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "math_bits_contract": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "profiler_contract": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "profiler_parity": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "torch_compile": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "inference": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "training": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "native_comm_bridge": {
       "level": "L3",
       "category": "distributed",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "musa_dispatch": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "unit_tests_per_file": {
       "level": "L3",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "nightly",
+        "weekly"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "runtime_conformance": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "flaggems_conformance": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "l3_installed_contract": {
       "level": "L3",
       "category": "compatibility",
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "l3_lifecycle": {
       "level": "L3",
       "category": "resource",
-      "timeout_seconds": 600
+      "timeout_seconds": 600,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "l4_endurance": {
       "level": "L4",
       "category": "stability",
-      "timeout_seconds": 3900
+      "timeout_seconds": 3900,
+      "profiles": [
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "l4_models": {
       "level": "L4",
       "category": "model",
-      "timeout_seconds": 7200
+      "timeout_seconds": 7200,
+      "profiles": [
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator",
+        "model_directory"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "l3_performance": {
       "level": "L3",
       "category": "performance",
-      "timeout_seconds": 600
+      "timeout_seconds": 600,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "backend_ops": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     },
     "mps_runtime": {
       "level": "L2",
       "category": "functional",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr",
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      }
     }
   },
   "release": {

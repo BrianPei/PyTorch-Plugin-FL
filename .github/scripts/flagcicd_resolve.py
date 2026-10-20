@@ -70,7 +70,7 @@ def ci_request(event, event_name):
         inputs = event.get("inputs") or {}
         if not isinstance(inputs, dict):
             raise ValueError("dispatch request must be an object")
-        return {"test_level": "L2", **inputs, "selection": "all"}
+        return {"test_level": "L2", **inputs}
     raise ValueError("unsupported CI event")
 
 
@@ -146,7 +146,14 @@ def resolve(event, event_name, repository, event_sha, entry="external", control_
         raise ValueError("unsupported execution profile; L4 uses the release workflow")
     platforms = request.get("platforms", "all")
     legacy_all = isinstance(platforms, str) and platforms.strip() == "all"
-    selection = request.get("selection", "affected" if legacy_all else "all")
+    selection = request.get("selection", "legacy")
+    if selection == "legacy":
+        selection = "all" if entry == "ci" else ("affected" if legacy_all else "all")
+        origin = "legacy_ci_manual" if entry == "ci" else "legacy_external"
+    else:
+        origin = "explicit"
+    if entry == "ci" and event_name != "workflow_dispatch":
+        origin = "event_policy"
     if selection not in ("affected", "all"):
         raise ValueError("selection must be affected or all")
     return {
@@ -158,6 +165,7 @@ def resolve(event, event_name, repository, event_sha, entry="external", control_
         "control_sha": control_sha,
         "target_kind": target_kind,
         "selection": selection,
+        "selection_origin": origin,
         "pr_labels": request.get("pr_labels", []) if entry == "ci" else [],
         "platforms": platforms,
         "requested_level": requested_level,

@@ -94,12 +94,35 @@ increase a threshold to make a regression pass.
 
 ## Collection completeness
 
+Each stable case ID has a level, explicit `profiles`, `requires`,
+`resources.min_accelerators` and `timeout_seconds` in `test-tiers.json`.
+Commands remain solely in the integration manifest (acceptance commands are
+assembled by the existing tier selector). Requirements currently cover an
+accelerator and a model directory. The composer reads the existing
+`environment_check` contract; it does not create a second platform support map.
+An undeclared required model directory or an insufficient exact device count
+is recorded as blocked, with the group still required by the plan. Other
+device counts require runtime verification, rather than being claimed as
+measured hardware. Multi-device groups require two devices; existing L2 groups
+and the DCU native bridge's world-size-one packaging/runtime contract require
+one. Resource budgets follow the actual workload, rather than its category.
+
+The runner checks `hardware-<platform>.json` before executing each profiled
+group. Missing, invalid or insufficient hardware evidence blocks the group and
+retains its reason in `groups.json`; it never turns into a passing skip. The
+platform report preserves these details as an infrastructure failure. Summary
+artifacts include platform decisions and a reference to the complete plan
+artifact, where all per-case exclusion and capability decisions are retained.
+
 `.flagcicd/test-inventory.json` explicitly classifies every pytest-discoverable
 file under `tests/`. Adding, moving or deleting a test requires updating its
 owner, lane, fixed entrypoint and selector. L0 rejects unknown/stale files and
 removed selectors. Existing files outside fixed commands are explicitly manual
 gaps, rather than automatically included by a broad glob. Review those entries
 before declaring full test coverage; registering a manual gap does not fix it.
+Manual entries also require a disposition. The 31 existing gaps remain
+`awaiting_platform_validation`, with their existing owner and individual
+reason; the plan lists them separately and the summary records their count.
 
 At runtime, `groups.json` records the expected sequence, commands, levels,
 categories and return codes, including groups that never started. The pytest
@@ -109,6 +132,19 @@ group. Empty collection, missing reports, aborted sessions and unstarted groups
 cannot produce complete evidence. Per-file source tests and nested model suites
 retain their own sessions. Skipped/xfail cases retain their native reason.
 Profiled runs disable historical teardown-crash tolerance.
+Profiled pytest groups each require at least one passing test. A different
+passing group cannot hide a required group whose tests all skipped or xfailed.
+The ledger includes selection reasons, resource requirements, start/end times,
+duration, exit code and run log URL; merged execution evidence adds group test
+counts and pytest session paths. An incomplete failed run still retains its
+observed counts without making an acceptance claim.
+
+The compact plan context also carries each stable case's minimum passing-test
+count and accelerator count. The platform reporter independently compares
+these requirements against every executed group and the recorded hardware;
+an asserted `complete=true` or a passing grand total cannot override a
+contradictory group. Malformed execution evidence produces a retained
+`report_error` rather than preventing the platform report from being written.
 
 ## Candidate acceptance and publication
 

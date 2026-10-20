@@ -35,6 +35,11 @@ on:
         required: false
         default: all
         type: string
+      selection:
+        description: 'Select all candidate platforms or affected candidates; legacy keeps existing behavior'
+        type: choice
+        default: legacy
+        options: [legacy, affected, all]
       pr_number:
         description: 'PR number for a trusted fork on-demand run'
         required: false

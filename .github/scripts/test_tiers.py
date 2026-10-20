@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LEVELS = {f"L{number}": number for number in range(5)}
+REQUIREMENTS = {"accelerator", "model_directory"}
 
 
 def policy(root=ROOT):
@@ -36,7 +37,57 @@ def policy(root=ROOT):
             or not 0 < case["timeout_seconds"] <= 7200
         ):
             raise ValueError(f"invalid tier or timeout for {name}")
+        profiles = case.get("profiles")
+        requires = case.get("requires")
+        resources = case.get("resources")
+        if (
+            not isinstance(profiles, list)
+            or not profiles
+            or not all(isinstance(p, str) for p in profiles)
+            or len(profiles) != len(set(profiles))
+            or any(p not in document["profiles"] for p in profiles)
+            or not isinstance(requires, list)
+            or not all(isinstance(r, str) for r in requires)
+            or any(r not in REQUIREMENTS for r in requires)
+            or len(requires) != len(set(requires))
+            or not isinstance(resources, dict)
+            or set(resources) != {"min_accelerators"}
+            or type(resources["min_accelerators"]) is not int
+            or not 1 <= resources["min_accelerators"] <= 1024
+        ):
+            raise ValueError(f"invalid profiles, requirements or resources for {name}")
     return document
+
+
+def exclusion_reason(case_id, case, profile, document):
+    if profile not in case["profiles"]:
+        return "profile_excluded"
+    if LEVELS[case["level"]] > LEVELS[document["profiles"][profile]["max_level"]]:
+        return "above_profile_level"
+    return ""
+
+
+def requirement_evidence(case, config):
+    """Use the existing environment contract, without inventing device support."""
+    environment = config.get("environment_check", {})
+    blocked = []
+    if (
+        "model_directory" in case["requires"]
+        and environment.get("model_dir") is not True
+    ):
+        blocked.append("model directory is not declared by environment_check.model_dir")
+    bounds = environment.get("flagos_devices", {})
+    minimum = case["resources"]["min_accelerators"]
+    exact = bounds.get("exactly")
+    if type(exact) is int and exact < minimum:
+        blocked.append(
+            f"requires {minimum} accelerators; environment declares exactly {exact}"
+        )
+    return {
+        "status": "blocked" if blocked else "requires_runtime_verification",
+        "reasons": blocked,
+        "source": "environment_check and recorded hardware identity",
+    }
 
 
 def select(groups, ids, profile, platform, document):
@@ -48,11 +99,16 @@ def select(groups, ids, profile, platform, document):
     for group, case_id in zip(groups, ids, strict=True):
         case = document["cases"][case_id]
         # The legacy source-contract diagnostic cannot accept an installed wheel.
-        if profile in ("pr-risk", "release") and case_id == "unit_tests_per_file":
+        if exclusion_reason(case_id, case, profile, document):
             continue
-        if LEVELS[case["level"]] > LEVELS[definition["max_level"]]:
-            continue
-        item = {**group, "id": case_id, **case}
+        item = {
+            **group,
+            "id": case_id,
+            "platform": platform,
+            "min_passed": 1,
+            "selection_reason": f"profile:{profile}",
+            **case,
+        }
         item["command"] = item["command"].replace(
             "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1", "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
         )
@@ -74,12 +130,15 @@ def select(groups, ids, profile, platform, document):
             extras.append(("l4_models", "tests/acceptance/test_models.py"))
     for case_id, path in extras:
         case = document["cases"][case_id]
-        if LEVELS[case["level"]] <= LEVELS[definition["max_level"]]:
+        if not exclusion_reason(case_id, case, profile, document):
             selected.append(
                 {
                     "id": case_id,
                     "name": case_id,
                     "command": f"python -m pytest {path} -v --tb=short",
+                    "platform": platform,
+                    "min_passed": 1,
+                    "selection_reason": f"profile:{profile}",
                     **case,
                     "environment": {
                         "FLAGCICD_PROFILE": profile,
@@ -155,6 +214,11 @@ def check_inventory(root=ROOT):
                 selector in (root / target).read_text() for target in targets
             ):
                 raise ValueError(f"test lost its fixed selection: {path}")
+        elif entry.get("disposition") not in (
+            "manual_validation",
+            "awaiting_platform_validation",
+        ):
+            raise ValueError(f"manual test has no explicit disposition: {path}")
     manifest_path = root / ".github/integration-manifest.yml"
     if manifest_path.exists():
         import yaml

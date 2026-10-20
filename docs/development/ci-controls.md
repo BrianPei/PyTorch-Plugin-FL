@@ -26,6 +26,22 @@ minimum and interprets `platforms=all` as the full matrix. Legacy external
 `platforms=all` remains change-aware unless an explicit full selection or
 nightly/weekly profile is requested.
 
+Both dispatch forms expose `selection=legacy|affected|all`. `platforms` defines
+the candidate set; `affected` intersects it with changed-file routing, while
+`all` selects every candidate. `legacy` is normalized to the old entry-specific
+default and recorded as `selection_origin` in the request and summary. Omitting
+the field in repository dispatch has the same compatibility mapping. An explicit
+hardware minimum may restore an empty affected set to its candidate set; the
+plan records this as `affected_or_hardware_floor`.
+
+The plan lists `required_platforms` before narrowing, `platform_decisions` and
+per-platform `case_decisions` with selection, exclusion and blocking reasons.
+Routing labels retain their previous precedence. If labels or an explicit
+subset omit affected platforms, the plan and summary say
+`validation_scope=diagnostic`; a successful diagnostic does not satisfy the
+automatic `CI complete` gate. Nightly/weekly with `platforms=all` still covers
+every configured platform. Explicit subsets of those profiles remain diagnostic.
+
 Ordinary PR CI tests its event merge commit and records `target_kind=merge`;
 selection compares the PR base with its head via `diff_sha`. An on-demand fork
 PR request resolves and tests the immutable head with `target_kind=head`.

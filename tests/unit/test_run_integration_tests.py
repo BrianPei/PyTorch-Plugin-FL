@@ -209,3 +209,49 @@ def test_failure_summary_is_not_tolerated_even_when_opted_in(monkeypatch, tmp_pa
 )
 def test_classify_command_result(returncode, output, allow, expected):
     assert _RUNNER.classify_command_result(returncode, output, allow) == expected
+
+
+@pytest.mark.parametrize(
+    "hardware,minimum,blocked",
+    [(1, 2, True), (2, 2, False), (None, 1, True), (True, 1, True)],
+)
+def test_resource_requirements_use_recorded_hardware_and_keep_a_ledger(
+    monkeypatch, tmp_path, hardware, minimum, blocked
+):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    if hardware is not None:
+        (reports / "hardware-cuda.json").write_text(
+            json.dumps({"accelerator_count": hardware})
+        )
+    command = "printf executed > executed.txt"
+    group = {
+        "id": "resource-fixture",
+        "name": "resource fixture",
+        "platform": "cuda",
+        "command": command,
+        "resources": {"min_accelerators": minimum},
+        "requires": ["accelerator"],
+    }
+    monkeypatch.setenv("INTEGRATION_TESTS", json.dumps([group]))
+    monkeypatch.setenv("INTEGRATION_ENVIRONMENT", "{}")
+    monkeypatch.setenv("INTEGRATION_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FLAGCICD_REPORT_DIR", str(reports))
+    monkeypatch.setattr(
+        _RUNNER,
+        "parse_args",
+        lambda: type("Args", (), {"validate_only": False, "allow_empty": False})(),
+    )
+    if blocked:
+        with pytest.raises(SystemExit, match="blocked"):
+            _RUNNER.main()
+        assert not (tmp_path / "executed.txt").exists()
+    else:
+        assert _RUNNER.main() == 0
+        assert (tmp_path / "executed.txt").read_text() == "executed"
+    ledger = json.loads((reports / "groups.json").read_text())
+    record = ledger["groups"][0]
+    assert record["status"] == ("blocked" if blocked else "passed")
+    assert record["duration_seconds"] >= 0 and record["finished"] >= record["started"]
+    assert record["resources"] == {"min_accelerators": minimum}
+    assert ledger["complete"] is (not blocked)

@@ -90,10 +90,21 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
         ):
             incomplete.append("groups.json")
         for group in groups:
-            if group["requires_pytest"] and not any(
-                session.get("group") == group["name"] for session in sessions
-            ):
-                incomplete.append("missing pytest session: " + group["name"])
+            if group["requires_pytest"]:
+                matched = [s for s in sessions if s.get("group") == group["name"]]
+                counts = Counter()
+                for session in matched:
+                    counts.update(session.get("summary", {}))
+                group["summary"] = dict(counts)
+                group["pytest_sessions"] = [s["report"] for s in matched]
+                if not matched:
+                    incomplete.append("missing pytest session: " + group["name"])
+                elif group.get("min_passed", 0) > sum(
+                    s.get("summary", {}).get("passed", 0) for s in matched
+                ):
+                    incomplete.append(
+                        "required group has no passing tests: " + group["name"]
+                    )
     complete = not incomplete
     # The integration runner owns the verdict, including its existing explicit
     # teardown-crash policy and failures in non-pytest environment checks.

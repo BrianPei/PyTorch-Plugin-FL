@@ -1218,6 +1218,15 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
     raw = tmp_path / "raw"
     reports = raw / "pytest"
     reports.mkdir(parents=True)
+    (reports / "hardware-cuda.json").write_text(
+        json.dumps(
+            {
+                "machine_model": "synthetic-orchestration-fixture",
+                "sdk_version": "fixture-sdk",
+                "accelerator_count": 1,
+            }
+        )
+    )
     env = {
         **os.environ,
         "PYTEST_ADDOPTS": "",
@@ -1241,15 +1250,6 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
         reports, "cuda", outcome, planned["source_repository"], SHA
     )
     (reports / "pytest-cuda.json").write_text(json.dumps(merged))
-    (reports / "hardware-cuda.json").write_text(
-        json.dumps(
-            {
-                "machine_model": "synthetic-orchestration-fixture",
-                "sdk_version": "fixture-sdk",
-                "accelerator_count": 1,
-            }
-        )
-    )
     platform = REPORTER.platform_report(
         planned, "cuda", jobs(outcome, tests=outcome), raw, 1
     )
@@ -1273,3 +1273,304 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
         REPORTER.aggregate(planned, REPORTER.entry_jobs(ci_jobs, "ci"), directory, 1)
         == summary
     )
+
+
+@pytest.mark.parametrize(
+    "entry,platforms,selection,expected",
+    [
+        ("ci", "all", "legacy", "all"),
+        ("external", "all", "legacy", "affected"),
+        ("external", "cuda", "legacy", "all"),
+        ("ci", "cuda", "affected", "affected"),
+        ("external", "cuda", "affected", "affected"),
+        ("ci", "all", "all", "all"),
+    ],
+)
+def test_selection_input_has_an_explicit_legacy_mapping(
+    monkeypatch, entry, platforms, selection, expected
+):
+    monkeypatch.setattr(
+        RESOLVER,
+        "api",
+        lambda _: {
+            "state": "open",
+            "head": {"repo": {"full_name": "owner/repo"}, "sha": SHA},
+            "base": {"sha": "b" * 40},
+        },
+    )
+    actual = RESOLVER.resolve(
+        {
+            "inputs": {
+                "pr_number": "12",
+                "platforms": platforms,
+                "selection": selection,
+            }
+        },
+        "workflow_dispatch",
+        "owner/repo",
+        SHA,
+        entry=entry,
+    )
+    assert actual["selection"] == expected
+    assert actual["selection_origin"] == (
+        ("legacy_ci_manual" if entry == "ci" else "legacy_external")
+        if selection == "legacy"
+        else "explicit"
+    )
+
+
+def test_partial_label_selection_is_visible_as_diagnostic():
+    actual = PLANNER.build_plan(
+        request(profile="auto", pr_labels=["platform:cuda"]),
+        CONTRACT,
+        ROOT,
+        ["setup.py"],
+    )
+    assert actual["expected_platforms"] == ["cuda"]
+    assert actual["validation_scope"] == "diagnostic"
+    assert set(actual["required_platforms"]) == set(
+        PLANNER._load_platforms(ROOT / ".github/configs")
+    )
+    assert (
+        next(p for p in actual["platform_decisions"] if p["platform"] == "cuda")[
+            "reason"
+        ]
+        == "platform_label"
+    )
+
+
+def test_nightly_subset_does_not_claim_complete_platform_coverage():
+    actual = PLANNER.build_plan(
+        request(profile="nightly", platforms="cuda"), CONTRACT, ROOT, ["README.md"]
+    )
+    assert actual["expected_platforms"] == ["cuda"]
+    assert actual["validation_scope"] == "diagnostic"
+
+
+def test_no_hardware_plan_does_not_claim_selected_cases():
+    actual = PLANNER.build_plan(request(), CONTRACT, ROOT, ["README.md"])
+    assert actual["expected_platforms"] == []
+    assert all(
+        case["status"] == "excluded"
+        for cases in actual["case_decisions"].values()
+        for case in cases
+    )
+    assert actual["manual_test_count"] == len(actual["manual_tests"]) == 31
+    assert all(
+        entry["owner"] and entry["reason"] and entry["disposition"]
+        for entry in actual["manual_tests"].values()
+    )
+
+
+def test_planned_missing_capability_remains_required_and_blocks(tmp_path):
+    source = tmp_path / "source"
+    shutil.copytree(ROOT / ".flagcicd", source / ".flagcicd")
+    shutil.copytree(ROOT / ".github/configs", source / ".github/configs")
+    shutil.copyfile(
+        ROOT / ".github/integration-manifest.yml",
+        source / ".github/integration-manifest.yml",
+    )
+    policy_path = source / ".flagcicd/test-tiers.json"
+    tiers = json.loads(policy_path.read_text())
+    tiers["cases"]["l3_lifecycle"]["requires"].append("model_directory")
+    policy_path.write_text(json.dumps(tiers))
+    actual = PLANNER.build_plan(
+        request(platforms="mps", profile="pr-risk"), CONTRACT, source, ["setup.py"]
+    )
+    blocked = next(
+        case for case in actual["blocked_cases"] if case["id"] == "l3_lifecycle"
+    )
+    assert blocked["platform"] == "mps"
+    assert "model directory" in blocked["reason"]
+    assert "l3_lifecycle" in actual["expected_cases"]["mps"]
+    actual.update(run_id="42", run_attempt="1")
+    context = json.loads(PLANNER.report_context(actual))
+    assert context["blocked_cases"] == actual["blocked_cases"]
+    summary = REPORTER.aggregate(context, entry_jobs("L3"), tmp_path, 1)
+    assert summary["status"] != "passed"
+    assert any("blocked planned case" in error for error in summary["errors"])
+
+
+def test_diagnostic_success_cannot_satisfy_automatic_required_check(tmp_path):
+    planned = {
+        **plan(),
+        "validation_scope": "diagnostic",
+        "required_platforms": ["cuda", "ppu"],
+    }
+    save_report(tmp_path)
+    aliases = {
+        "plan": "discover-platforms",
+        "agnostic": "agnostic-checks",
+        "codegen": "codegen-checks",
+        "platforms": "platform-pipeline",
+    }
+    ci_jobs = {aliases.get(name, name): value for name, value in entry_jobs().items()}
+    ci_jobs["resolve-checkout"] = {"result": "success"}
+    output = tmp_path / "summary.json"
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "flagcicd_report.py"),
+            "summary",
+            "--entry",
+            "ci",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(output),
+        ],
+        env={
+            **os.environ,
+            "FLAGCICD_PLAN": json.dumps(planned),
+            "JOB_RESULTS": json.dumps(ci_jobs),
+            "GITHUB_RUN_ID": "42",
+            "GITHUB_RUN_ATTEMPT": "1",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert process.returncode == 1, process.stderr
+    summary = json.loads(output.read_text())
+    assert summary["validation_scope"] == "diagnostic"
+    assert summary["children"][0]["status"] == "passed"
+    assert any(
+        "cannot satisfy the full PR gate" in error for error in summary["errors"]
+    )
+
+
+def test_resource_block_is_an_infrastructure_failure_even_without_pytest(tmp_path):
+    (tmp_path / "pytest").mkdir()
+    (tmp_path / "pytest/groups.json").write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": "multi_device_contracts",
+                        "status": "blocked",
+                        "reason": "requires 2 accelerators; recorded hardware has 1",
+                    },
+                ],
+                "complete": False,
+            }
+        )
+    )
+    actual = REPORTER.platform_report(
+        plan(), "cuda", jobs("failure", tests="failure"), tmp_path, 1
+    )
+    assert actual["status"] == "infra_error"
+    assert actual["execution"]["groups"][0]["status"] == "blocked"
+    assert any("requires 2 accelerators" in reason for reason in actual["errors"])
+
+
+def test_cancelled_execution_is_not_reclassified_by_a_blocked_ledger(tmp_path):
+    (tmp_path / "pytest").mkdir()
+    (tmp_path / "pytest/groups.json").write_text(
+        json.dumps(
+            {
+                "groups": [
+                    {
+                        "id": "resource-fixture",
+                        "status": "blocked",
+                        "reason": "resource missing",
+                    },
+                ],
+                "complete": False,
+            }
+        )
+    )
+    actual = REPORTER.platform_report(plan(), "cuda", jobs("cancelled"), tmp_path, 1)
+    assert actual["status"] == "cancelled"
+    assert actual["execution"]["groups"][0]["status"] == "blocked"
+
+
+def test_l0_explicit_candidates_are_validated_without_claiming_hardware_execution():
+    actual = PLANNER.build_plan(
+        request(platforms="cuda", requested_level="L0"), CONTRACT, ROOT, ["README.md"]
+    )
+    assert actual["validated_platforms"] == ["cuda"]
+    assert actual["expected_platforms"] == []
+    assert all(
+        item["status"] == "excluded" and item["reason"] == "hardware_not_required"
+        for item in actual["platform_decisions"]
+    )
+
+
+@pytest.mark.parametrize(
+    "defect,expected_error",
+    [
+        ("none", None),
+        ("all_skip_group", "no clean passing evidence"),
+        ("failed_group", "non-passing case"),
+        ("changed_resource_requirement", "resources do not match"),
+        ("insufficient_hardware", "insufficient recorded resources"),
+        ("missing_case_contract", "missing planned execution contract"),
+        ("missing_case_sequence", "planned case sequence is missing"),
+        ("boolean_case_counts", "invalid case counts"),
+        ("boolean_resource_count", "resources do not match"),
+        ("execution_list", "execution evidence must be an object"),
+        ("execution_groups_object", "execution groups must be an array"),
+        ("execution_groups_nonobjects", "execution groups must contain objects"),
+    ],
+)
+def test_reporter_independently_validates_each_planned_case(
+    tmp_path, defect, expected_error
+):
+    raw_reports(tmp_path)
+    planned = {
+        **plan(),
+        "expected_cases": {"cuda": ["first", "second"]},
+        "case_contracts": {
+            "first": {"min_accelerators": 1, "min_passed": 1},
+            "second": {"min_accelerators": 2, "min_passed": 1},
+        },
+    }
+    path = tmp_path / "pytest/pytest-cuda.json"
+    report = json.loads(path.read_text())
+    groups = [
+        {
+            "id": "first",
+            "status": "passed",
+            "resources": {"min_accelerators": 1},
+            "summary": {"passed": 1},
+        },
+        {
+            "id": "second",
+            "status": "passed",
+            "resources": {"min_accelerators": 2},
+            "summary": {"passed": 1},
+        },
+    ]
+    report["flagcicd"]["execution"] = {"complete": True, "groups": groups}
+    report["summary"] = {"total": 2, "passed": 2}
+    hardware_path = tmp_path / "pytest/hardware-cuda.json"
+    hardware = json.loads(hardware_path.read_text())
+    hardware["accelerator_count"] = 2
+    if defect == "all_skip_group":
+        groups[1]["summary"] = {"skipped": 1}
+        report["summary"] = {"total": 2, "passed": 1, "skipped": 1}
+    elif defect == "failed_group":
+        groups[1]["status"] = "failed"
+    elif defect == "changed_resource_requirement":
+        groups[1]["resources"]["min_accelerators"] = 1
+    elif defect == "insufficient_hardware":
+        hardware["accelerator_count"] = 1
+    elif defect == "missing_case_contract":
+        planned["case_contracts"].pop("second")
+    elif defect == "missing_case_sequence":
+        planned.pop("expected_cases")
+    elif defect == "boolean_case_counts":
+        groups[1]["summary"] = {"passed": True}
+    elif defect == "boolean_resource_count":
+        groups[0]["resources"]["min_accelerators"] = True
+    elif defect == "execution_list":
+        report["flagcicd"]["execution"] = [groups[0]]
+    elif defect == "execution_groups_object":
+        report["flagcicd"]["execution"]["groups"] = {"first": "passed"}
+    elif defect == "execution_groups_nonobjects":
+        report["flagcicd"]["execution"]["groups"] = ["first", "second"]
+    path.write_text(json.dumps(report))
+    hardware_path.write_text(json.dumps(hardware))
+    actual = REPORTER.platform_report(planned, "cuda", jobs(), tmp_path, 1)
+    assert actual["status"] == ("report_error" if expected_error else "passed")
+    if expected_error:
+        assert any(expected_error in reason for reason in actual["errors"])

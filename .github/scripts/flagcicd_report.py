@@ -99,6 +99,57 @@ def one_report(directory, filename):
     return payload
 
 
+def validate_case_contracts(plan, execution, hardware):
+    """Independently reject successful evidence that contradicts its plan."""
+    contracts = plan.get("case_contracts")
+    if contracts is None:
+        return
+    if not isinstance(contracts, dict):
+        raise ValueError("invalid planned case contracts")
+    for group in execution.get("groups", []):
+        if not isinstance(group, dict):
+            raise ValueError("invalid executed case evidence")
+        case_id = group.get("id")
+        contract = contracts.get(case_id)
+        if not isinstance(contract, dict):
+            raise ValueError(f"missing planned execution contract: {case_id}")
+        minimum = contract.get("min_accelerators")
+        required_passes = contract.get("min_passed")
+        if (
+            type(minimum) is not int
+            or minimum < 1
+            or type(required_passes) is not int
+            or required_passes < 0
+        ):
+            raise ValueError(f"invalid execution contract: {case_id}")
+        resources = group.get("resources")
+        if (
+            not isinstance(resources, dict)
+            or type(resources.get("min_accelerators")) is not int
+            or resources.get("min_accelerators") != minimum
+        ):
+            raise ValueError(f"executed resources do not match the plan: {case_id}")
+        count = hardware.get("accelerator_count")
+        if type(count) is not int or count < minimum:
+            raise ValueError(f"insufficient recorded resources for case: {case_id}")
+        if group.get("status") != "passed":
+            raise ValueError(
+                f"non-passing case contradicts successful execution: {case_id}"
+            )
+        if required_passes:
+            counts = group.get("summary")
+            if not isinstance(counts, dict) or not all(
+                type(value) is int and value >= 0 for value in counts.values()
+            ):
+                raise ValueError(f"missing or invalid case counts: {case_id}")
+            if counts.get("passed", 0) < required_passes or any(
+                counts.get(key, 0) for key in ("failed", "error")
+            ):
+                raise ValueError(
+                    f"required case has no clean passing evidence: {case_id}"
+                )
+
+
 def platform_report(plan, platform, jobs, raw, attempt):
     if platform not in plan["expected_platforms"]:
         raise ValueError("platform is not expected by the plan")
@@ -150,6 +201,28 @@ def platform_report(plan, platform, jobs, raw, attempt):
         errors.append("the platform did not successfully complete all required stages")
     if errors and status == "passed":
         status = "report_error"
+    execution = {}
+    ledgers = list((raw / "pytest").rglob("groups.json"))
+    if ledgers:
+        try:
+            execution = one_report(raw / "pytest", "groups.json")
+            blocked = [
+                group
+                for group in execution.get("groups", [])
+                if group.get("status") == "blocked"
+            ]
+            if blocked:
+                if status not in ("cancelled", "build_failed"):
+                    status = "infra_error"
+                errors.extend(
+                    f"blocked case {group.get('id')}: {group.get('reason')}"
+                    for group in blocked
+                )
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            execution = {}
+            errors.append(f"invalid execution ledger: {error}")
+            if status == "passed":
+                status = "report_error"
     metrics = {"coverage": {"available": False}}
     if list((raw / "pytest").rglob("performance.json")):
         try:
@@ -169,9 +242,28 @@ def platform_report(plan, platform, jobs, raw, attempt):
             raise ValueError(
                 "pytest report does not match the planned source and platform"
             )
+        counts = pytest["summary"]
+        if not isinstance(counts, dict) or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in counts.values()
+        ):
+            raise ValueError("invalid pytest summary")
+        metrics["tests"] = counts
+        provided_execution = metadata.get("execution")
+        if provided_execution is not None:
+            if not isinstance(provided_execution, dict):
+                raise ValueError("execution evidence must be an object")
+            groups = provided_execution.get("groups", [])
+            if not isinstance(groups, list):
+                raise ValueError("execution groups must be an array")
+            if not all(isinstance(group, dict) for group in groups):
+                raise ValueError("execution groups must contain objects")
+            execution = provided_execution
         if metadata["complete"] is not True:
             raise ValueError("pytest report is incomplete")
         expected_cases = plan.get("expected_cases", {}).get(platform)
+        if plan.get("case_contracts") is not None and expected_cases is None:
+            raise ValueError("planned case sequence is missing")
         if expected_cases is not None:
             execution = metadata.get("execution") or {}
             observed_cases = [group["id"] for group in execution.get("groups", [])]
@@ -182,12 +274,8 @@ def platform_report(plan, platform, jobs, raw, attempt):
                 raise ValueError(
                     "executed case groups do not match the trusted test plan"
                 )
-        counts = pytest["summary"]
-        if not isinstance(counts, dict) or not all(
-            isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in counts.values()
-        ):
-            raise ValueError("invalid pytest summary")
+        if status == "passed":
+            validate_case_contracts(plan, execution, hardware_identity)
         if status == "passed" and pytest["exitcode"] != 0:
             raise ValueError("pytest report contradicts the successful job result")
         if status == "passed" and any(
@@ -249,6 +337,7 @@ def platform_report(plan, platform, jobs, raw, attempt):
         "execution_result": result,
         "execution_attempt": job.get("outputs", {}).get("run_attempt", ""),
         "stages": stages,
+        "execution": execution,
         "metrics": metrics,
         "errors": errors,
         "coverage_warnings": coverage_errors,
@@ -261,6 +350,10 @@ def aggregate(plan, jobs, directory, attempt):
         errors.append("test plan is unavailable")
         plan = {"expected_platforms": []}
     level = plan.get("test_level", "L0")
+    for blocked in plan.get("blocked_cases", []):
+        errors.append(
+            f"blocked planned case: {blocked['platform']}/{blocked['id']}: {blocked['reason']}"
+        )
     expected_jobs = {"plan", "lint", "preflight"}
     if level in ("L1", "L2", "L3", "L4"):
         expected_jobs.update(("agnostic", "codegen", "wheel-checks"))
@@ -385,6 +478,18 @@ def aggregate(plan, jobs, directory, attempt):
         "coverage_aggregation": "per_platform_only",
         "errors": errors,
         "ignored_reports": ignored,
+        **{
+            key: plan.get(key, default)
+            for key, default in (
+                ("validation_scope", "full"),
+                ("selection_origin", ""),
+                ("required_platforms", []),
+                ("blocked_cases", []),
+                ("manual_test_count", 0),
+                ("platform_decisions", []),
+                ("plan_artifact", ""),
+            )
+        },
     }
 
 
@@ -409,6 +514,12 @@ def main():
         report = platform_report(plan, args.platform, jobs, args.directory, attempt)
     else:
         report = aggregate(plan, entry_jobs(jobs, args.entry), args.directory, attempt)
+        if args.entry == "ci" and report["validation_scope"] == "diagnostic":
+            report["errors"].append(
+                "diagnostic platform selection cannot satisfy the full PR gate"
+            )
+            if report["status"] == "passed":
+                report["status"] = "report_error"
         report["entry_jobs"] = {name: job["result"] for name, job in jobs.items()}
         report["run_id"] = os.environ["GITHUB_RUN_ID"]
         if not plan:

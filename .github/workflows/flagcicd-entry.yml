@@ -33,6 +33,11 @@ on:
         description: all (change-aware) or comma-separated platform names
         type: string
         default: all
+      selection:
+        description: 'Select affected or all candidate platforms; legacy preserves old callers'
+        type: choice
+        default: legacy
+        options: [legacy, affected, all]
       test_level:
         description: Minimum level; changed files may raise it
         type: choice

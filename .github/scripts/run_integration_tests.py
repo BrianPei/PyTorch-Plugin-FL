@@ -245,6 +245,32 @@ def run_command(command, test_environment, workdir):
     return (124 if timed_out.is_set() else returncode), "".join(lines)
 
 
+def resource_block(test, environment):
+    """Check recorded hardware before running a group; never skip it as a pass."""
+    if test.get("blocked_reason"):
+        return test["blocked_reason"]
+    resources = test.get("resources")
+    if resources is None:
+        return ""
+    minimum = resources.get("min_accelerators") if isinstance(resources, dict) else None
+    if type(minimum) is not int or minimum < 1:
+        return "invalid accelerator resource requirement"
+    platform = test.get("platform", "")
+    if not isinstance(platform, str) or not re.fullmatch(r"[a-z0-9_-]+", platform):
+        return "resource check requires a platform identity"
+    try:
+        folder = Path(environment["FLAGCICD_REPORT_DIR"])
+        hardware = json.loads((folder / f"hardware-{platform}.json").read_text())
+        count = hardware["accelerator_count"]
+        if type(count) is not int or count < 0:
+            raise ValueError("invalid accelerator count")
+    except (KeyError, OSError, ValueError, TypeError) as error:
+        return f"hardware resource evidence is unavailable: {error}"
+    if count < minimum:
+        return f"requires {minimum} accelerators; recorded hardware has {count}"
+    return ""
+
+
 def main():
     args = parse_args()
     tests, environment = load_configuration(args.allow_empty)
@@ -284,6 +310,20 @@ def main():
             "requires_pytest": "pytest" in test["command"]
             or "run_unit_tests.py" in test["command"],
             "status": "running",
+            "min_passed": test.get("min_passed", 0),
+            "requires": test.get("requires", []),
+            "resources": test.get("resources", {}),
+            "started": time.time(),
+            "selection_reason": test.get("selection_reason", "configured_group"),
+            "log_url": (
+                os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+                + "/"
+                + os.environ.get("GITHUB_REPOSITORY", "")
+                + "/actions/runs/"
+                + os.environ.get("GITHUB_RUN_ID", "")
+            )
+            if os.environ.get("GITHUB_RUN_ID")
+            else "",
         }
         ledger["groups"].append(record)
         save()
@@ -299,16 +339,33 @@ def main():
         test_environment["FLAGCICD_CASE_TIMEOUT"] = str(
             test.get("timeout_seconds", 1800)
         )
+        reason = resource_block(test, test_environment)
+        if reason:
+            record.update(
+                status="blocked", reason=reason, returncode=1, finished=time.time()
+            )
+            record["duration_seconds"] = record["finished"] - record["started"]
+            save()
+            raise SystemExit(f"Integration group {test['name']!r} is blocked: {reason}")
         allow_crash = (
             teardown_crash_allowed(test_environment) if not test.get("level") else False
         )
-        returncode, output = run_command(test["command"], test_environment, workdir)
+        try:
+            returncode, output = run_command(test["command"], test_environment, workdir)
+        except (OSError, SystemExit) as error:
+            record.update(
+                status="failed", reason=str(error), returncode=1, finished=time.time()
+            )
+            record["duration_seconds"] = record["finished"] - record["started"]
+            save()
+            raise
         ok, tolerated = classify_command_result(returncode, output, allow_crash)
         record.update(
             returncode=returncode,
             status="passed" if ok else ("timeout" if returncode == 124 else "failed"),
             finished=time.time(),
         )
+        record["duration_seconds"] = record["finished"] - record["started"]
         save()
         if tolerated:
             print(

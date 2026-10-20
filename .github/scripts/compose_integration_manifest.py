@@ -249,13 +249,18 @@ def compose(manifest, config, platform, known, profile=None, tier_policy=None):
     if not composed:
         raise ManifestError(f"no steps apply to {platform!r}")
     if profile:
-        from test_tiers import policy, select
+        from test_tiers import policy, requirement_evidence, select
 
         ids = [
             entry["id"] for entry in steps if platform in _entry_platforms(entry, known)
         ]
         composed = select(composed, ids, profile, platform, tier_policy or policy())
         composed.sort(key=lambda group: group["level"])
+        for group in composed:
+            evidence = requirement_evidence(group, config)
+            group["requirement_evidence"] = evidence
+            if evidence["status"] == "blocked":
+                group["blocked_reason"] = "; ".join(evidence["reasons"])
     return composed
 
 
