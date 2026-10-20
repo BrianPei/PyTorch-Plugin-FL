@@ -212,6 +212,13 @@ jobs:
           REPORT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-pytest.XXXXXX")
           printf 'FLAGCICD_REPORT_DIR=%s\n' "$REPORT_DIR" >> "$GITHUB_ENV"
 
+      - name: Record hardware identity
+        id: record-identity
+        run: |
+          python .github/scripts/record_hardware_identity.py \
+            --platform "${{ inputs.platform }}" \
+            --output "$FLAGCICD_REPORT_DIR/hardware-${{ inputs.platform }}.json"
+
       - name: Install pytest JSON reporting
         run: python -m pip install pytest-json-report==1.5.0 coverage==7.10.7
 

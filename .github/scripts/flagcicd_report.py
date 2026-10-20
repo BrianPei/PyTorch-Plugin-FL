@@ -82,6 +82,18 @@ def platform_report(plan, platform, jobs, raw, attempt):
     stages = json.loads(job.get("outputs", {}).get("stages") or "{}")
     result = job["result"]
     errors = []
+
+    # Record hardware identity for L2+ runs
+    hardware_identity = {}
+    if plan["test_level"] not in ("L0", "L1"):
+        hardware_path = raw / "pytest" / f"hardware-{platform}.json"
+        try:
+            hardware_identity = json.loads(hardware_path.read_text())
+            if not all(k in hardware_identity for k in ("machine_model", "sdk_version", "accelerator_count")):
+                errors.append(f"hardware identity file missing required fields: {hardware_path}")
+        except OSError:
+            errors.append(f"L2+ run missing hardware identity file: {hardware_path}")
+
     if jobs["configuration"]["result"] == "cancelled" or result == "cancelled":
         status = "cancelled"
     elif jobs["configuration"]["result"] != "success":
@@ -172,7 +184,7 @@ def platform_report(plan, platform, jobs, raw, attempt):
         "report_type": "platform",
         **identity(plan),
         "run_attempt": attempt,
-        "platform": {"name": platform},
+        "platform": {"name": platform, **hardware_identity},
         "status": status,
         "configuration_result": jobs["configuration"]["result"],
         "execution_result": result,
