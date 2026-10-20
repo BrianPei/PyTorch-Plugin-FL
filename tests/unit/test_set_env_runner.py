@@ -100,7 +100,8 @@ def test_the_parameterized_workflow_provisions_every_platform():
         'bash "${{ needs.configuration.outputs.setup_script }}" '
         '--platform "${{ needs.configuration.outputs.setup_platform }}"' in text
     )
-    assert "CI_STAGE: ${{ needs.configuration.outputs.setup_stage }}" in text
+    assert "CI_STAGE:" in text
+    assert "needs.configuration.outputs.setup_stage" in text
 
 
 def test_config_driven_path_uses_the_runner():

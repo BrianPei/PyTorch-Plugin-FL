@@ -43,6 +43,11 @@
       "category": "functional",
       "timeout_seconds": 1800
     },
+    "iluvatar_runtime": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
     "portable_top_level_contracts": {
       "level": "L2",
       "category": "functional",
