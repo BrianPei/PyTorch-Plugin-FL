@@ -18,9 +18,8 @@
 # L1 wheel validation: build, install (--no-deps), and verify packaging content,
 # version/ABI, and wheel manifest without requiring accelerator hardware.
 #
-# Uses ubuntu-latest with a CUDA development image to enable wheel build, but
-# runs no device-dependent tests. torch-fl-preflight already validates packaging,
-# version, ABI, and requirements.
+# The container supplies the CUDA compiler only. Build against isolated CPU
+# PyTorch, and inspect installed files without initializing an accelerator.
 
 name: L1 Wheel Checks
 
@@ -43,17 +42,51 @@ jobs:
     container:
       image: nvcr.io/nvidia/pytorch:24.10-py3
       options: --user root
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONNOUSERSITE: '1'
+      PYTHONPATH: ''
+      FLAGOS_BUILD_FLAGGEMS_CPP: '0'
+      FLAGOS_BUILD_BOXING: '0'
+      FLAGOS_BUILD_JOBS: '2'
 
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.checkout_repository || github.repository }}
           ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up isolated build Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Install build dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install build setuptools wheel
+          set -euo pipefail
+          source .github/version-pins.env
+          VENV_ROOT="$RUNNER_TEMP/torch-fl-wheel-checks"
+          python -m venv "$VENV_ROOT"
+          VENV_PYTHON="$VENV_ROOT/bin/python"
+          "$VENV_PYTHON" -m pip install --upgrade pip
+          "$VENV_PYTHON" -m pip install build 'setuptools>=64,<77' \
+            'wheel==0.46.2' 'cmake>=3.18' 'packaging>=26.0' \
+            'PyYAML==6.0.1' 'sqlalchemy==2.0.48' numpy
+          "$VENV_PYTHON" -m pip install --index-url "$CPU_TORCH_INDEX_URL_DEFAULT" \
+            "torch==$CPU_TORCH_VERSION_DEFAULT"
+          "$VENV_PYTHON" - "$CPU_TORCH_VERSION_DEFAULT" <<'PY'
+          import sys
+          import torch
+          assert sys.prefix != sys.base_prefix, 'Build Python must be isolated'
+          assert torch.__version__.split('+', 1)[0] == sys.argv[1], torch.__version__
+          assert torch.version.cuda is None, 'Build against CPU PyTorch'
+          print(f'Build Python: {sys.executable}; PyTorch: {torch.__version__}')
+          PY
+          printf '%s\n' "$VENV_ROOT/bin" >> "$GITHUB_PATH"
+          printf 'VIRTUAL_ENV=%s\n' "$VENV_ROOT" >> "$GITHUB_ENV"
 
       - name: Build wheel
         id: build
@@ -70,15 +103,29 @@ jobs:
       - name: Verify packaging content
         id: verify
         run: |
-          python3 - <<'PY'
+          python scripts/tools/torch-fl-preflight --installed --check-build-env
+          python - <<'PY'
           import importlib.metadata
-          import torch_fl
+          import importlib.machinery
+          import os
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, '.github/scripts')
+          from candidate_evidence import verify_installation
+
+          wheels = list(Path('dist').glob('*.whl'))
+          assert len(wheels) == 1, f'Expected one wheel, found {len(wheels)}'
+          verify_installation(wheels[0])
           dist = importlib.metadata.distribution("torch_fl")
+          package = Path(dist.locate_file('torch_fl')).resolve()
+          assert Path(os.environ['GITHUB_WORKSPACE']).resolve() not in package.parents
+          assert (package / 'lib/libtorch_fl.so').is_file(), 'Missing native library'
+          assert any((package / ('_C' + suffix)).is_file()
+                     for suffix in importlib.machinery.EXTENSION_SUFFIXES), 'Missing Python ABI extension'
           print("Package version:", dist.version)
           print("Package files:", len(dist.files or []))
-          # Verify core modules are accessible
-          import torch_fl.flagos
-          print("torch_fl.flagos imported successfully")
+          print('Installed wheel files and Python ABI extension verified; device execution belongs to L2')
           PY
 
       - name: Report wheel validation result

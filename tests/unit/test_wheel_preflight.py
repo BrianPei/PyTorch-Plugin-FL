@@ -25,6 +25,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT_PATH = SOURCE_ROOT / "scripts" / "tools" / "torch-fl-preflight"
@@ -348,3 +349,95 @@ def test_every_ci_wheel_build_checks_the_embedded_manifest():
         install_at = source.find("python -m pip install", build_at)
         if install_at >= 0:
             assert verify_at < install_at, path
+
+
+def test_l1_build_uses_isolated_pinned_cpu_torch():
+    workflow = yaml.safe_load(
+        (SOURCE_ROOT / ".github/workflows/wheel-checks.yml").read_text()
+    )
+    job = workflow["jobs"]["wheel-checks"]
+    steps = job["steps"]
+    prepare = next(
+        step for step in steps if step.get("name") == "Install build dependencies"
+    )
+    build = next(step for step in steps if step.get("id") == "build")
+    assert steps.index(prepare) < steps.index(build)
+    assert "source .github/version-pins.env" in prepare["run"]
+    assert 'python -m venv "$VENV_ROOT"' in prepare["run"]
+    assert (
+        '"$VENV_PYTHON" -m pip install --index-url "$CPU_TORCH_INDEX_URL_DEFAULT"'
+        in prepare["run"]
+    )
+    assert '"torch==$CPU_TORCH_VERSION_DEFAULT"' in prepare["run"]
+    assert "torch.version.cuda is None" in prepare["run"]
+    assert '"$VENV_ROOT/bin" >> "$GITHUB_PATH"' in prepare["run"]
+    assert job["env"]["FLAGOS_BUILD_FLAGGEMS_CPP"] == "0"
+    assert job["env"]["FLAGOS_BUILD_BOXING"] == "0"
+
+
+@pytest.mark.parametrize("defect", [None, "native", "extension", "tampered"])
+def test_l1_packaging_verification_never_imports_accelerator(
+    tmp_path, manifest, defect
+):
+    workflow = yaml.safe_load(
+        (SOURCE_ROOT / ".github/workflows/wheel-checks.yml").read_text()
+    )
+    verify = next(
+        step["run"]
+        for step in workflow["jobs"]["wheel-checks"]["steps"]
+        if step.get("id") == "verify"
+    )
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    for relative in (
+        "scripts/tools/torch-fl-preflight",
+        ".github/scripts/candidate_evidence.py",
+    ):
+        target = checkout / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((SOURCE_ROOT / relative).read_text())
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    versions = {
+        "torch_fl": manifest["wheel_version"],
+        **manifest["build"]["distributions"],
+    }
+    for name, version in versions.items():
+        metadata = installed / f"{name}-{version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+    files = {
+        "torch_fl/__init__.py": b"raise RuntimeError('accelerator imported')\n",
+        "torch_fl/compatibility.json": json.dumps(manifest).encode(),
+        "torch_fl/lib/libtorch_fl.so": b"native-library-fixture",
+        "torch_fl/_C" + importlib.machinery.EXTENSION_SUFFIXES[0]: b"extension-fixture",
+    }
+    if defect == "native":
+        del files["torch_fl/lib/libtorch_fl.so"]
+    elif defect == "extension":
+        files = {name: data for name, data in files.items() if "/_C" not in name}
+    dist = checkout / "dist"
+    dist.mkdir()
+    with zipfile.ZipFile(dist / "candidate.whl", "w") as wheel:
+        for name, data in files.items():
+            wheel.writestr(name, data)
+            target = installed / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+    if defect == "tampered":
+        (installed / "torch_fl/__init__.py").write_text("tampered = True")
+    result = subprocess.run(
+        ["bash", "-e", "-c", verify],
+        cwd=checkout,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "PYTHONPATH": str(installed),
+            "GITHUB_WORKSPACE": str(checkout),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert (result.returncode == 0) == (defect is None), result.stdout + result.stderr
+    assert "accelerator imported" not in result.stderr
