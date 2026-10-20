@@ -167,6 +167,16 @@
       "level": "L3",
       "category": "performance",
       "timeout_seconds": 600
+    },
+    "backend_ops": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
+    },
+    "mps_runtime": {
+      "level": "L2",
+      "category": "functional",
+      "timeout_seconds": 1800
     }
   },
   "release": {
