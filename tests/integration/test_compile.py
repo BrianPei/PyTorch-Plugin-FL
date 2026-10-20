@@ -29,6 +29,17 @@ import torch
 from torch_fl._build_config import ACCELERATOR
 
 
+# Compiled-vs-eager tolerance for this device. TsingMicro's FlagGems matmul
+# accumulates at reduced precision (TF32-like): a compiled `nn.Linear`
+# schedules `mm` + a bias add, while eager hits `addmm`, which is exact here.
+# Comparing the two at CUDA's 1e-4 reports that ~1e-3 relative difference as a
+# failure on the one platform that runs this file natively. The measurement is
+# recorded in the TsingMicro section below; use the same device tolerance for
+# the shared tests rather than narrowing what they assert.
+COMPILE_RTOL = 1e-3 if ACCELERATOR == "tsingmicro" else 1e-4
+COMPILE_ATOL = 1e-2 if ACCELERATOR == "tsingmicro" else 1e-4
+
+
 # Skip all tests if torch.compile not available (torch < 2.0)
 try:
     import torch._dynamo
@@ -132,7 +143,9 @@ def test_basic_compile(device):
 
     # Compare with eager mode
     eager_output = model(x)
-    torch.testing.assert_close(output, eager_output, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        output, eager_output, rtol=COMPILE_RTOL, atol=COMPILE_ATOL
+    )
 
 
 def test_compile_vs_eager_correctness(device):
@@ -172,7 +185,9 @@ def test_compile_with_max_autotune(device):
     eager_output = model(x)
 
     assert_on_flagos(output)
-    torch.testing.assert_close(output, eager_output, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        output, eager_output, rtol=COMPILE_RTOL, atol=COMPILE_ATOL
+    )
 
 
 @pytest.mark.skipif(
@@ -377,8 +392,11 @@ def test_compile_dtypes(device, dtype):
 
     eager_output = model(x)
     # Float16 has lower precision
-    rtol = 1e-2 if dtype == torch.float16 else 1e-4
-    torch.testing.assert_close(output, eager_output, rtol=rtol, atol=rtol)
+    if dtype == torch.float16:
+        rtol = atol = 1e-2
+    else:
+        rtol, atol = COMPILE_RTOL, COMPILE_ATOL
+    torch.testing.assert_close(output, eager_output, rtol=rtol, atol=atol)
 
 
 def test_compile_recompile(device):
@@ -456,6 +474,142 @@ class NormalizedModel(torch.nn.Module):
 
     def forward(self, a, b):
         return self.norm(torch.mm(a, b))
+
+
+# --- TsingMicro ------------------------------------------------------------
+#
+# TsingMicro is FlagGems-primary on a wheel that pairs with a CPU-only torch, so
+# there is no CUDA runtime behind torch.flagos: device properties, raw streams
+# and generated device snippets all have to come from the TX runtime. Its
+# FlagTree backend names the target "txda" and registers the package under
+# "tsingmicro". These tests assert the TX profile is what a flagos compile
+# actually uses, rather than the CUDA one silently answering, and are marked so
+# a box without TX hardware does not report them as passing.
+
+
+tsingmicro_only = pytest.mark.skipif(
+    ACCELERATOR != "tsingmicro",
+    reason="TsingMicro build required",
+)
+
+# TsingMicro's matmul is not bit-accurate against a float32 CPU reference: a
+# single 1x128 . 128x1 dot differs by ~1.6e-3, which is the TF32-signature
+# reduced-precision accumulation its FlagGems `mm` kernel does. Eager nn.Linear
+# happens to hit `addmm` (exact here) while inductor schedules `mm` + a bias add,
+# so a compiled Linear inherits the reduced precision the eager path avoided.
+# Measured at ~7e-4 relative on |out| ~ 2, and ~1e-3 across shapes. Elementwise
+# fusion is bit-exact. This tolerance is the device's, not the compile path's.
+TSM_ATOL = 1e-2
+TSM_RTOL = 1e-3
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_profile_selected():
+    """A flagos build on TsingMicro must not present itself as CUDA-like."""
+    from torch_fl.compile.platform_profile import platform_profile
+
+    profile = platform_profile()
+    assert not profile.is_cuda_like
+    assert profile.triton_device_type == "txda"
+    assert profile.triton_backend_key == "tsingmicro"
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_triton_backend_present():
+    """The toolchain probe must find the vendor backend, not fail silently."""
+    import triton.backends
+
+    assert "tsingmicro" in triton.backends.backends
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_raw_stream_is_the_eager_stream():
+    """Compiled kernels must launch on the queue the eager kernels use.
+
+    There is one default queue per device (handle 0). If the generated code
+    resolved a different stream, a compiled kernel and the FlagGems op producing
+    its input would not be ordered against each other -- a wrong answer rather
+    than an error.
+    """
+    from torch_fl import flagos
+    from torch_fl.compile.flagtree_shim import get_tsingmicro_current_raw_stream
+
+    assert get_tsingmicro_current_raw_stream() == flagos.current_stream().txda_stream
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_device_properties_use_the_vendor_warp_size():
+    """Inductor's GPUTarget must carry the driver's warp size, not CUDA's 32.
+
+    ``triton_heuristics`` builds it from ``cc_warp_size(cc)``, which hard-codes
+    32 for every non-HIP build. On a TX8 the driver reports 16, and a kernel
+    compiled for the wrong warp size is wrong-but-running.
+    """
+    from torch._inductor.runtime.triton_heuristics import DeviceProperties
+    from triton.runtime import driver
+
+    props = DeviceProperties.create(torch.device("flagos", 0))
+    assert props.warp_size == driver.active.get_current_target().warp_size
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_compile_fused_elementwise(device):
+    model = SimpleModel().to(device)
+    x = torch.randn(32, 128, device=device)
+    out = torch.compile(model, backend="flagos")(x)
+    assert_on_flagos(out)
+    torch.testing.assert_close(out, model(x), rtol=TSM_RTOL, atol=TSM_ATOL)
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_compile_matmul(device):
+    model = MatMulModel().to(device)
+    a = torch.randn(32, 64, device=device)
+    b = torch.randn(64, 64, device=device)
+    out = torch.compile(model, backend="flagos")(a, b)
+    assert_on_flagos(out)
+    torch.testing.assert_close(out, model(a, b), rtol=TSM_RTOL, atol=TSM_ATOL)
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_compile_reduction(device):
+    """The layer_norm path: a Triton reduction, not a pointwise kernel."""
+    model = NormalizedModel().to(device)
+    a = torch.randn(32, 64, device=device)
+    b = torch.randn(64, 64, device=device)
+    out = torch.compile(model, backend="flagos")(a, b)
+    assert_on_flagos(out)
+    torch.testing.assert_close(out, model(a, b), rtol=TSM_RTOL, atol=TSM_ATOL)
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+def test_tsingmicro_compile_backward_stays_on_flagos(device):
+    """The backward graph must stay on flagos, not round-trip through CUDA."""
+    model = SimpleModel().to(device)
+    x = torch.randn(32, 128, device=device, requires_grad=True)
+    out = torch.compile(model, backend="flagos")(x)
+    out.sum().backward()
+    assert_on_flagos(x.grad, "gradient")
+
+
+@pytest.mark.tsingmicro
+@tsingmicro_only
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_tsingmicro_compile_dtypes(device, dtype):
+    model = SimpleModel().to(device).to(dtype)
+    x = torch.randn(32, 128, device=device, dtype=dtype)
+    out = torch.compile(model, backend="flagos")(x)
+    assert_on_flagos(out)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out, model(x), rtol=TSM_RTOL, atol=TSM_ATOL)
 
 
 # --- Ascend ----------------------------------------------------------------
