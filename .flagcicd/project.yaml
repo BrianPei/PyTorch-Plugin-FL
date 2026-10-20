@@ -11,7 +11,7 @@ levels:
   L1:
     support: supported
     scope: platform_agnostic
-    checks: [L0, agnostic-checks, codegen-checks]
+    checks: [L0, agnostic-checks, codegen-checks, wheel-checks]
   L2:
     support: supported
     scope: installed_wheel_integration

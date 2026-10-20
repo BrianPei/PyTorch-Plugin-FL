@@ -121,9 +121,17 @@ jobs:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
+  wheel-checks:
+    name: Wheel validation (L1)
+    needs: [resolve-checkout, lint]
+    uses: ./.github/workflows/wheel-checks.yml
+    with:
+      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
+      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
+
   discover-platforms:
     name: Discover platforms
-    needs: [resolve-checkout, lint, agnostic-checks, codegen-checks]
+    needs: [resolve-checkout, lint, agnostic-checks, codegen-checks, wheel-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -193,6 +201,7 @@ jobs:
       - lint
       - agnostic-checks
       - codegen-checks
+      - wheel-checks
       - discover-platforms
       - platform-pipeline
     runs-on: ubuntu-latest
