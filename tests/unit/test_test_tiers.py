@@ -66,6 +66,9 @@ def test_profiles_classify_every_manifest_case(platform):
     assert {"l3_installed_contract", "l3_lifecycle", "multi_device_contracts"} <= {
         g["id"] for g in nightly
     }
+    assert "l4_endurance" in {g["id"] for g in nightly}
+    if platform in policy()["release"]["model_platforms"]:
+        assert "l4_models" in {g["id"] for g in nightly}
     assert [g["level"] for g in nightly] == sorted(g["level"] for g in nightly)
     assert all("UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1" not in g["command"] for g in nightly)
 
@@ -329,6 +332,7 @@ def test_release_graph_gates_all_lanes_and_reuses_candidates():
 def test_all_profiled_commands_disable_legacy_crash_tolerance():
     doc = copy.deepcopy(policy())
     assert doc["profiles"]["weekly"]["max_level"] == "L4"
+    assert doc["profiles"]["nightly"]["max_level"] == "L4"
     assert doc["release"]["stability_seconds"] >= 3600
 
 

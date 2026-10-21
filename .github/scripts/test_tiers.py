@@ -247,10 +247,7 @@ def main():
 
         event = os.environ.get("EVENT_NAME")
         if event == "schedule":
-            event_data = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-            selected = (
-                "weekly" if event_data.get("schedule") == "0 18 * * 6" else "nightly"
-            )
+            selected = "nightly"
         elif event == "push":
             selected = "pr"
         else:

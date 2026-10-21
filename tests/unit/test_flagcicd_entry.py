@@ -930,8 +930,9 @@ def test_automatic_pr_preserves_merge_target_and_compares_head(monkeypatch):
     "event_name,event,profile",
     [
         ("push", {}, "pr"),
-        ("schedule", {"schedule": "0 18 * * 0-5"}, "nightly"),
-        ("schedule", {"schedule": "0 18 * * 6"}, "weekly"),
+        ("schedule", {"schedule": "0 18 * * *"}, "nightly"),
+        # Replayed historical schedule payloads stay on the nightly policy.
+        ("schedule", {"schedule": "0 18 * * 6"}, "nightly"),
     ],
 )
 def test_automatic_schedules_use_full_shared_plan(

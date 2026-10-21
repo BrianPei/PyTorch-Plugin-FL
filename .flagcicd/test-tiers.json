@@ -11,7 +11,7 @@
     },
     "nightly": {
       "level": "L3",
-      "max_level": "L3"
+      "max_level": "L4"
     },
     "weekly": {
       "level": "L3",
@@ -489,6 +489,7 @@
       "category": "stability",
       "timeout_seconds": 3900,
       "profiles": [
+        "nightly",
         "weekly",
         "release"
       ],
@@ -504,6 +505,7 @@
       "category": "model",
       "timeout_seconds": 7200,
       "profiles": [
+        "nightly",
         "weekly",
         "release"
       ],

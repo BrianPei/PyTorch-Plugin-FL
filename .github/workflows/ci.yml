@@ -21,8 +21,7 @@ permissions:
 
 on:
   schedule:
-    - cron: '0 18 * * 0-5'   # 02:00 CST Monday-Saturday: L3
-    - cron: '0 18 * * 6'   # 02:00 CST Sunday: weekly stability/model regression
+    - cron: '0 18 * * *'     # 02:00 CST daily: full nightly regression (L0-L4)
   push:
     branches: [main, dev, devops, dev-hygon, dev-thead, dev-musa, iluvatar_build_and_test]
   pull_request:

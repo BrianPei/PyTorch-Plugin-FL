@@ -104,7 +104,7 @@ jobs:
       stages: ${{ steps.execution.outputs.stages }}
       run_attempt: ${{ steps.execution.outputs.run_attempt }}
     runs-on: ${{ fromJson(needs.configuration.outputs.runner_labels) }}
-    timeout-minutes: ${{ inputs.test_profile == 'release' && 720 || inputs.test_profile == 'weekly' && 720 || inputs.test_profile == 'nightly' && 360 || (inputs.test_profile == 'pr' || inputs.test_profile == 'pr-risk') && 60 || fromJson(needs.configuration.outputs.integration_timeout_minutes) }}
+    timeout-minutes: ${{ inputs.test_profile == 'release' && 720 || inputs.test_profile == 'weekly' && 720 || inputs.test_profile == 'nightly' && 720 || (inputs.test_profile == 'pr' || inputs.test_profile == 'pr-risk') && 60 || fromJson(needs.configuration.outputs.integration_timeout_minutes) }}
     # A platform without a `ci_image` runs directly on its runner. MPS needs a
     # macOS host with its Metal GPU, and macOS jobs cannot use containers.
     container: ${{ needs.configuration.outputs.ci_image && fromJson(format('{{"image":{0},"volumes":{1},"options":{2}}}', toJson(needs.configuration.outputs.ci_image), needs.configuration.outputs.container_volumes, toJson(needs.configuration.outputs.container_options))) || null }}

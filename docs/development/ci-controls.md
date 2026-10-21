@@ -13,7 +13,7 @@ test groups come from the shared integration manifest.
 | PR with an unknown routing label | Every platform, conservatively |
 | PR without routing labels | Platforms affected by the changed files |
 | Documentation-only PR without routing labels | No hardware jobs; shared checks still run |
-| Push or daily schedule | Every platform |
+| Push or nightly schedule | Every platform |
 | Manual dispatch | `platforms=all` or a comma-separated platform list |
 
 Automatic CI and FlagCICD Entry normalize requests through `flagcicd_resolve.py`,
@@ -39,8 +39,10 @@ per-platform `case_decisions` with selection, exclusion and blocking reasons.
 Routing labels retain their previous precedence. If labels or an explicit
 subset omit affected platforms, the plan and summary say
 `validation_scope=diagnostic`; a successful diagnostic does not satisfy the
-automatic `CI complete` gate. Nightly/weekly with `platforms=all` still covers
-every configured platform. Explicit subsets of those profiles remain diagnostic.
+automatic `CI complete` gate. Nightly with `platforms=all` still covers every
+configured platform and every applicable L0-L4 case. The weekly profile is
+retained for future/manual use; explicit subsets of either profile remain
+diagnostic.
 
 Ordinary PR CI tests its event merge commit and records `target_kind=merge`;
 selection compares the PR base with its head via `diff_sha`. An on-demand fork
