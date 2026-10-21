@@ -28,7 +28,7 @@ setup_stage: build
 # Python 3.10 venv inside the job, reusing the image's TORCH_FL_PREBUILT_KUNLUNXIN_VENV
 # when it provides one; a derived CI image should bake python3.10-venv in to
 # avoid the apt fallback on every job.
-ci_image: harbor.baai.ac.cn/flagos-runtime/flagos-runtime-kunlunxin-xre5.37.1:2.2.0
+ci_image: harbor.baai.ac.cn/flagos-dev/torch-fl:20261021-kunlunxin-dev
 
 runner_labels:
   - p800-8g-cicd-pytorch
