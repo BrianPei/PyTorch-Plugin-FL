@@ -60,14 +60,25 @@ def policy(root=ROOT):
             raise ValueError(f"invalid profiles, requirements or resources for {name}")
         if execution is not None and execution not in EXECUTION_MODES:
             raise ValueError(f"invalid execution mode for {name}")
+        unsupported = case.get("unsupported_platforms", {})
+        if not isinstance(unsupported, dict) or any(
+            not isinstance(platform, str)
+            or not platform.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+            for platform, reason in unsupported.items()
+        ):
+            raise ValueError(f"invalid unsupported platforms for {name}")
     return document
 
 
-def exclusion_reason(case_id, case, profile, document):
+def exclusion_reason(case_id, case, profile, document, platform=None):
     if profile not in case["profiles"]:
         return "profile_excluded"
     if LEVELS[case["level"]] > LEVELS[document["profiles"][profile]["max_level"]]:
         return "above_profile_level"
+    if platform in case.get("unsupported_platforms", {}):
+        return "platform_unsupported"
     return ""
 
 
@@ -103,7 +114,7 @@ def select(groups, ids, profile, platform, document):
     for group, case_id in zip(groups, ids, strict=True):
         case = document["cases"][case_id]
         # The legacy source-contract diagnostic cannot accept an installed wheel.
-        if exclusion_reason(case_id, case, profile, document):
+        if exclusion_reason(case_id, case, profile, document, platform):
             continue
         item = {
             **group,
@@ -137,7 +148,7 @@ def select(groups, ids, profile, platform, document):
             extras.append(("l4_models", "tests/acceptance/test_models.py"))
     for case_id, path in extras:
         case = document["cases"][case_id]
-        if not exclusion_reason(case_id, case, profile, document):
+        if not exclusion_reason(case_id, case, profile, document, platform):
             selected.append(
                 {
                     "id": case_id,

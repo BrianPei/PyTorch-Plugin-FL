@@ -159,6 +159,7 @@ def build_plan(request, contract, source, changed):
     selections = {}
     case_decisions = {}
     blocked_cases = []
+    unsupported_cases = []
     case_contracts = {}
     fingerprint.update(json.dumps(tiers, sort_keys=True).encode())
     for name in ("test-inventory.json", "performance-baselines.json"):
@@ -216,12 +217,19 @@ def build_plan(request, contract, source, changed):
                         {"platform": platform, "id": case_id, "reason": reason}
                     )
             else:
-                reason = exclusion_reason(case_id, case, profile, tiers) or (
+                reason = exclusion_reason(case_id, case, profile, tiers, platform) or (
                     "platform_not_applicable"
                     if case_id not in applicable
                     else "not_selected"
                 )
                 state, evidence = "excluded", {}
+                if reason == "platform_unsupported" and level in ("L2", "L3"):
+                    state = "unsupported"
+                    reason = case["unsupported_platforms"][platform]
+                    if platform in selected:
+                        unsupported_cases.append(
+                            {"platform": platform, "id": case_id, "reason": reason}
+                        )
             case_decisions[platform].append(
                 {
                     "id": case_id,
@@ -277,6 +285,7 @@ def build_plan(request, contract, source, changed):
         "case_decisions": case_decisions,
         "case_contracts": case_contracts,
         "blocked_cases": blocked_cases,
+        "unsupported_cases": unsupported_cases,
         "required_platforms": required_platforms,
         "validation_scope": validation_scope,
         "manual_tests": manual_tests,
@@ -331,6 +340,7 @@ def report_context(plan):
                     ("validation_scope", "full"),
                     ("required_platforms", []),
                     ("blocked_cases", []),
+                    ("unsupported_cases", []),
                     ("platform_decisions", []),
                     ("case_contracts", {}),
                 )

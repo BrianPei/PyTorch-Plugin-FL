@@ -1575,3 +1575,63 @@ def test_reporter_independently_validates_each_planned_case(
     assert actual["status"] == ("report_error" if expected_error else "passed")
     if expected_error:
         assert any(expected_error in reason for reason in actual["errors"])
+
+
+def test_mps_unsupported_case_is_explicit_in_plan_and_summary(tmp_path):
+    actual = PLANNER.build_plan(
+        request(profile="pr-risk", platforms="mps", selection="all"),
+        CONTRACT,
+        ROOT,
+        [".github/configs/mps.yml"],
+    )
+    assert "multi_device_contracts" not in actual["expected_cases"]["mps"]
+    decision = next(
+        case
+        for case in actual["case_decisions"]["mps"]
+        if case["id"] == "multi_device_contracts"
+    )
+    assert decision["status"] == "unsupported"
+    assert "one logical device" in decision["reason"]
+    assert actual["blocked_cases"] == []
+    actual.update(run_id="42", run_attempt="1")
+    context = json.loads(PLANNER.report_context(actual))
+    assert context["unsupported_cases"] == actual["unsupported_cases"]
+    summary = REPORTER.aggregate(context, entry_jobs("L3"), tmp_path, 1)
+    assert summary["unsupported_cases"] == actual["unsupported_cases"]
+    assert summary["status"] != "passed"  # Missing supported cases still fail.
+
+
+def test_other_single_device_platforms_still_require_multidevice_hardware():
+    actual = PLANNER.build_plan(
+        request(profile="pr-risk", platforms="cuda", selection="all"),
+        CONTRACT,
+        ROOT,
+        [".github/configs/cuda.yml"],
+    )
+    assert "multi_device_contracts" in actual["expected_cases"]["cuda"]
+    assert actual["unsupported_cases"] == []
+    assert actual["case_contracts"]["multi_device_contracts"]["min_accelerators"] == 2
+
+
+def test_platform_report_keeps_only_its_unsupported_capabilities(tmp_path):
+    case = {
+        "platform": "mps",
+        "id": "multi_device_contracts",
+        "reason": "one logical device",
+    }
+    planned = {
+        **plan(platforms=["mps"]),
+        "unsupported_cases": [case, {**case, "platform": "cuda"}],
+    }
+    raw_reports(tmp_path)
+    raw = tmp_path / "pytest"
+    (raw / "hardware-cuda.json").rename(raw / "hardware-mps.json")
+    pytest_path = raw / "pytest-cuda.json"
+    payload = json.loads(pytest_path.read_text())
+    payload["flagcicd"]["platform"] = "mps"
+    (raw / "pytest-mps.json").write_text(json.dumps(payload))
+    pytest_path.unlink()
+    report = REPORTER.platform_report(planned, "mps", jobs(), tmp_path, 1)
+    assert report["status"] == "passed"
+    assert report["unsupported_cases"] == [case]
+    assert report["metrics"]["tests"]["passed"] == 1

@@ -23,8 +23,8 @@ import sys
 
 
 def test_installed_candidate_and_dependencies():
-    import torch
     import torch_fl
+    import torch
 
     package = Path(torch_fl.__file__).resolve()
     workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()

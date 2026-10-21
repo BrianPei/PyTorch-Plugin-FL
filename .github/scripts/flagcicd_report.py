@@ -338,6 +338,11 @@ def platform_report(plan, platform, jobs, raw, attempt):
         "execution_attempt": job.get("outputs", {}).get("run_attempt", ""),
         "stages": stages,
         "execution": execution,
+        "unsupported_cases": [
+            case
+            for case in plan.get("unsupported_cases", [])
+            if case["platform"] == platform
+        ],
         "metrics": metrics,
         "errors": errors,
         "coverage_warnings": coverage_errors,
@@ -485,6 +490,7 @@ def aggregate(plan, jobs, directory, attempt):
                 ("selection_origin", ""),
                 ("required_platforms", []),
                 ("blocked_cases", []),
+                ("unsupported_cases", []),
                 ("manual_test_count", 0),
                 ("platform_decisions", []),
                 ("plan_artifact", ""),

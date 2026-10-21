@@ -63,9 +63,10 @@ def test_profiles_classify_every_manifest_case(platform):
     nightly = compose(manifest, config, platform, known, "nightly")
     assert all(g["level"] == "L2" for g in pr)
     assert {g["id"] for g in pr} <= {g["id"] for g in nightly}
-    assert {"l3_installed_contract", "l3_lifecycle", "multi_device_contracts"} <= {
-        g["id"] for g in nightly
-    }
+    assert {"l3_installed_contract", "l3_lifecycle"} <= {g["id"] for g in nightly}
+    assert ("multi_device_contracts" in {g["id"] for g in nightly}) == (
+        platform != "mps"
+    )
     assert "l4_endurance" in {g["id"] for g in nightly}
     if platform in policy()["release"]["model_platforms"]:
         assert "l4_models" in {g["id"] for g in nightly}
@@ -463,3 +464,131 @@ def test_declared_lower_bound_is_not_mistaken_for_measured_resources(bounds, exp
     )
     assert result["status"] == expected
     assert bool(result["reasons"]) is (expected == "blocked")
+
+
+@pytest.mark.parametrize("value", [[], {"mps": ""}, {"mps": None}, {"": "reason"}])
+def test_unsupported_case_needs_a_platform_and_reason(tmp_path, value):
+    document = policy()
+    document["cases"]["multi_device_contracts"]["unsupported_platforms"] = value
+    (tmp_path / ".flagcicd").mkdir()
+    (tmp_path / ".flagcicd/test-tiers.json").write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="invalid unsupported platforms"):
+        policy(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "filename", ["test_installed_contract.py", "test_lifecycle.py"]
+)
+def test_acceptance_initializes_backend_before_torch(monkeypatch, tmp_path, filename):
+    import builtins
+    import types
+
+    spec = importlib.util.spec_from_file_location(
+        "acceptance_under_test", ROOT / "tests/acceptance" / filename
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    backend = types.SimpleNamespace(
+        __file__=str(tmp_path / "wheel/torch_fl/__init__.py")
+    )
+    package = Path(backend.__file__).parent
+    package.mkdir(parents=True)
+    (package / "compatibility.json").write_text('{"build": {}}')
+    original_import = builtins.__import__
+    initialized = False
+
+    def guarded_import(name, *args, **kwargs):
+        nonlocal initialized
+        if name == "torch_fl":
+            initialized = True
+            return backend
+        if name == "torch":
+            assert initialized, "vendor backend must select its libtorch first"
+            raise RuntimeError("torch reached after backend initialization")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    target = (
+        module.test_installed_candidate_and_dependencies
+        if filename == "test_installed_contract.py"
+        else module.cycle
+    )
+    with pytest.raises(
+        RuntimeError, match="torch reached after backend initialization"
+    ):
+        target()
+
+
+def test_performance_uses_published_device_properties_and_writes_evidence(
+    monkeypatch, tmp_path
+):
+    import builtins
+    import types
+
+    spec = importlib.util.spec_from_file_location(
+        "performance_under_test", ROOT / "tests/acceptance/test_performance.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Tensor:
+        def __init__(self, value, size=512 * 512):
+            self.value, self.size = value, size
+
+        def __mul__(self, other):
+            return Tensor(self.value * other.value, self.size)
+
+        def __add__(self, other):
+            return Tensor(self.value + other.value, self.size)
+
+        def sum(self):
+            return Tensor(self.value * self.size, 1)
+
+        def cpu(self):
+            return self
+
+        def item(self):
+            return self.value
+
+    runtime = types.SimpleNamespace(
+        synchronize=lambda: None,
+        get_device_properties=lambda index: types.SimpleNamespace(name="test-device"),
+    )
+    backend = types.SimpleNamespace(
+        __file__=str(tmp_path / "wheel/torch_fl/__init__.py"), flagos=runtime
+    )
+    package = Path(backend.__file__).parent
+    package.mkdir(parents=True)
+    (package / "compatibility.json").write_text('{"build": {"sdk_version": "test"}}')
+    workspace = tmp_path / "workspace"
+    (workspace / ".flagcicd").mkdir(parents=True)
+    (workspace / ".flagcicd/performance-baselines.json").write_text(
+        '{"environments": {}}'
+    )
+    metrics = tmp_path / "metrics"
+    metrics.mkdir()
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(workspace))
+    monkeypatch.setenv("FLAGCICD_METRICS_DIR", str(metrics))
+    monkeypatch.setenv("FLAGCICD_PROFILE", "pr-risk")
+    original_import = builtins.__import__
+    initialized = False
+
+    def guarded_import(name, *args, **kwargs):
+        nonlocal initialized
+        if name == "torch_fl":
+            initialized = True
+            return backend
+        if name == "torch":
+            assert initialized, "vendor backend must select its libtorch first"
+            return types.SimpleNamespace(ones=lambda *args, **kwargs: Tensor(1))
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    module.test_fixed_workload_performance()
+    evidence = json.loads((metrics / "performance.json").read_text())
+    assert evidence["environment"]["device"] == "test-device"
+    assert len(evidence["samples_seconds"]) == 20
+    assert evidence["baseline_status"] == "uncalibrated"
+    monkeypatch.setenv("FLAGCICD_PROFILE", "release")
+    with pytest.raises(AssertionError, match="approved performance baseline"):
+        module.test_fixed_workload_performance()

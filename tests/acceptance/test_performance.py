@@ -23,8 +23,8 @@ import time
 
 
 def test_fixed_workload_performance():
-    import torch
     import torch_fl
+    import torch
 
     runtime = torch_fl.flagos
     x = torch.ones((512, 512), device="flagos:0")
@@ -46,7 +46,7 @@ def test_fixed_workload_performance():
     )
     identity = {
         "build": compatibility["build"],
-        "device": runtime.get_device_name(0),
+        "device": runtime.get_device_properties(0).name,
         "python": __import__("platform").python_version(),
     }
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()

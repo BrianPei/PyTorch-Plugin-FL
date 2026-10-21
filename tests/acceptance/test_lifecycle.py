@@ -19,8 +19,8 @@ import os
 
 
 def cycle():
-    import torch
     import torch_fl
+    import torch
 
     runtime = torch_fl.flagos
     stream = runtime.Stream()

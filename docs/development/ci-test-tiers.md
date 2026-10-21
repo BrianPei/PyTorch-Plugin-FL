@@ -154,6 +154,13 @@ retain their own sessions. Skipped/xfail cases retain their native reason.
 Profiled runs disable historical teardown-crash tolerance.
 Profiled pytest groups each require at least one passing test. A different
 passing group cannot hide a required group whose tests all skipped or xfailed.
+Tier policy may explicitly declare a platform unsupported for a case, with a
+nonempty reason. Such cases remain visible as `unsupported` in the plan and
+in `unsupported_cases` in platform and aggregate reports; they are never counted
+as passing tests. MPS exposes one logical device, so its cross-device case is
+declared unsupported. Other platforms retain the two-device requirement and
+remain blocked when their recorded hardware is insufficient. This declaration
+does not establish multi-device support on MPS or relax release model gates.
 The ledger includes selection reasons, resource requirements, start/end times,
 duration, exit code and run log URL; merged execution evidence adds group test
 counts and pytest session paths. An incomplete failed run still retains its
