@@ -1,4 +1,16 @@
-# Project conventions for Claude Code
+# Project conventions for AI coding agents
+
+This file is the single source of guidance for AI agents working in this
+repository. Most agents read `AGENTS.md` natively: Claude Code (v2.1.277 and
+later), Codex, Cursor, Opencode, Zed, Copilot code review, Copilot cloud agent,
+and VS Code Copilot Chat. `.github/copilot-instructions.md` is the one symlink
+left, for the github.com Copilot Chat surface, which reads only that filename.
+
+There is deliberately no `CLAUDE.md` and no `GEMINI.md`. Claude Code reads
+`AGENTS.md` directly when no `CLAUDE.md` exists, so a symlink there would add a
+second name for the same bytes and behave worse on a Windows checkout, where Git
+turns a committed symlink into a plain text file unless `core.symlinks` is on.
+Gemini CLI defaults to `GEMINI.md` and is not used in this repository.
 
 ## Language
 
@@ -13,9 +25,9 @@ Chinese during a working session must be translated before it lands. The one
 allowance is an explicitly localized top-level README (`README_zh.md`), which
 exists as a translation of the English `README.md`.
 
-Chat replies to the user in this session stay in whatever language the user is
+Chat replies to the user in a session stay in whatever language the user is
 using (usually Chinese). The rule is about what gets committed and published, not
-about how we talk here.
+about how you talk to the user.
 
 If a PR description has already been opened in the wrong language, fix it with
 `gh api -X PATCH repos/{owner}/{repo}/pulls/{n} -f body=@file` rather than
@@ -48,7 +60,7 @@ skipping the separate design phase when the path forward is clear.
 
 **When creating issues or pull requests, use the appropriate templates:**
 
-### For AI Agents (Claude Code, Codex, etc.)
+### For AI Agents (Claude Code, Codex, Cursor, Copilot, etc.)
 
 **READ THESE FIRST before filing any issue or PR:**
 1. `.github/AI_AGENT_GUIDE.md` - Complete guidelines for AI agents
@@ -309,7 +321,7 @@ Update documentation when:
 - Adding new features → Update README
 - Changing APIs → Update docstrings
 - Platform changes → Update platform-specific sections
-- New conventions → Update this file (CLAUDE.md)
+- New conventions → Update this file (`AGENTS.md`)
 
 All documentation must be in English.
 
