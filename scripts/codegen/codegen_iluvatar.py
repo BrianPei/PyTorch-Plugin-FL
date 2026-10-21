@@ -81,11 +81,16 @@ FLAGGEMS_INC = (
 # override -- FLAGOS_FORCE_BACKEND=vendor, or a per-op FLAGOS_OP_<name>=iluvatar.
 # But only the ops FlagGems does *not* already claim get an m.impl line in
 # iluvatar_register.inc: the FlagGems .inc is included into the same library
-# body, and torch rejects a duplicate m.impl at load. The GEMM trio and the two
-# `_native_batch_norm_legit*` variants are already claimed there (route=flaggems
-# today), so they keep their FlagGems registration and their kernel here is
-# reached only by an override. That the conf cannot move them is intended --
-# FlagGems is the primary path and `route()` gives it priority.
+# body, and torch rejects a duplicate m.impl at load. Today that is the two
+# `_native_batch_norm_legit*` variants: still claimed there (route=flaggems), so
+# they keep their FlagGems registration and their kernel here is reached only by
+# an override. That the conf cannot move them is intended -- FlagGems is the
+# primary path and `route()` gives it priority.
+# `mm` and `bmm` left that group on 2026-10-20 and `addmm` on 2026-10-21
+# (issue #570: the mm perf model rejects float64, FlagGems' generic bmm cannot
+# compile K < 16, and the `_iluvatar` addmm/linear kernels are wrong at small
+# shapes with a transposed weight -- every `nn.Linear` route), so all three
+# kernels now carry the .inc line the conf routes to.
 #
 # The runtime dtype escape is a THIRD mechanism and it does NOT reach them:
 # ResolveFn substitutes the vendor slot only when FlagGemsRejectsArgs() fires,
@@ -1043,16 +1048,21 @@ INC_HEADER = """\
 // TORCH_LIBRARY_IMPL(aten, PrivateUse1) when USE_ILUVATAR and
 // FLAGOS_ILUVATAR_KERNEL are set. It is disjoint from
 // iluvatar_flaggems_register.inc -- both are included into the same body, so an
-// op in both is a duplicate m.impl and a compile/load error. The cohort ops
-// FlagGems already claims (mm, bmm, addmm and the two
-// _native_batch_norm_legit* variants) therefore keep their FlagGems
-// registration; their kernels in iluvatar_kernels.cc are reached only by an
-// explicit override (FLAGOS_FORCE_BACKEND=vendor / FLAGOS_OP_<name>=iluvatar),
-// not by the runtime dtype escape -- see the header of iluvatar_kernels.cc.
+// op in both is a duplicate m.impl and a compile/load error. An op FlagGems
+// claims keeps its FlagGems registration and is reached only by an explicit
+// override (FLAGOS_FORCE_BACKEND=vendor / FLAGOS_OP_<name>=iluvatar); the
+// cohort's kernel is still generated in iluvatar_kernels.cc. Which ops those
+// are is read back from the committed iluvatar_flaggems_register.inc, so the
+// cohort changes (mm moved here on 2026-10-20 when it left the FlagGems route
+// for issue #570, and bmm with it when FlagGems' generic bmm failed to compile
+// every K < 16 shape), not this comment.
 //
 // This file is also what scripts/codegen/gen_vendor_confs.py reads to decide
-// which ops backends_iluvatar.conf may route to `iluvatar`, so the conf cannot
-// claim a route this file does not register.
+// which ops backends_iluvatar.conf may route to `iluvatar`, and a `flaggems`
+// route competing with it takes precedence (the mm and bmm measurements below
+// predate the FlagGems routes they lost on 2026-10-20). An op that is FlagGems-claimed is
+// left out here on the FlagGems-primary build, where only one .inc is
+// included, for the duplicate-registration reason above.
 
 """
 

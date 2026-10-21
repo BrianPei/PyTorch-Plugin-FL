@@ -174,7 +174,49 @@ VENDORS = {
 # `#if defined(USE_ASCEND)` so the call hits the fused aclnnMatmul rather than
 # decomposing into mm/bmm/view; WrapperMatmul reads this conf to decide, so the
 # entry has to be here or the fused kernel is unreachable.
-EXTRA_NATIVE = {"ascend": {"matmul", "matmul_backward"}}
+#
+# Iluvatar claims aten::_conj the same way, for a different reason: it is a view
+# operator, so its `none` route cannot be served by cpu_fallback (ATen refuses a
+# fallback for views -- measured on u180 as a raise from the ViewOp key that took
+# down every path resolving a Conjugate bit). register.cc's USE_ILUVATAR arm
+# publishes ATen's metadata kernel, unconditionally rather than in the
+# FLAGOS_ILUVATAR_KERNEL-gated .inc, which is why it is listed here. It is not a
+# kernel the conf can route to: FlagGems' `_conj` is eager and breaks the
+# lazy-view contract (see the entry in NATIVE_TRITON_GAPS), so iluvatar also
+# joins NATIVE_KERNEL_PREFERRED. That is what keeps the route string `iluvatar`
+# -- the native slot is Backend::kIluvatar and Dispatcher::GetFn answers it for
+# every backend, so it is the same metadata kernel `flaggems` would have reached,
+# while the FlagGems slot would be subtracted as "also a native kernel" and the
+# op would land on `none` again. Both entries are one decision and neither is
+# correct alone.
+#
+# `view_as_real` is the same pair of reasons one step downstream: it is the view
+# FlagGems' complex arithmetic decomposes into (`ops/add.py`), a `none` route
+# refuses it at the ViewOp key like `_conj`, and FlagGems' own route for it is
+# the kernel that is missing (see its entry in NATIVE_TRITON_GAPS). register.cc
+# publishes ATen's metadata kernel for it under the same guard.
+#
+# The three in-place add/div overloads are a different pair of reasons again:
+# they are not views, but FlagGems' complex path is wrong for `add` (complex128
+# returns zeros) and raises for `div` (complex64), and ATen's CPU fallback is
+# not an alternative -- the boxed fallback mutates a CPU copy, so
+# `self.add_(other)` and `self.div_(other)` measured here returned the input
+# unchanged. register.cc publishes add_/div_: add_ through ATen's own add_out,
+# div_ through a host round trip (ATen's complex div writes its destination
+# before it reads its sources, so it is wrong when the destination is the
+# operand). `add.Tensor` and `add.Scalar` are in NATIVE_TRITON_GAPS but
+# not here: they take the out-of-place -> in-place lowering to the same kernel,
+# and an out= m.impl cannot be registered under the add.Tensor schema.
+EXTRA_NATIVE = {
+    "ascend": {"matmul", "matmul_backward"},
+    "iluvatar": {
+        "_conj",
+        "view_as_real",
+        "add_.Tensor",
+        "add_.Scalar",
+        "div_.Tensor",
+    },
+}
 
 # Ops a hand-written wrapper claims for every platform, so they appear in no
 # .inc at all. Same cause as EXTRA_NATIVE, different owner:
@@ -214,20 +256,23 @@ EXTRA_ROUTED = {"scaled_dot_product_attention"}
 #
 # Deliberately folded into NEITHER vendoring function. `vendor_native_ops()` is
 # what the per-vendor generators subtract from their own registration set, so
-# adding these there would make codegen_iluvatar_flaggems.py drop mm/bmm/addmm
-# and the two _native_batch_norm_legit* variants from the FlagGems `.inc` -- and
-# because codegen_iluvatar.py omits exactly those ops from the native `.inc`
+# adding these there would make codegen_iluvatar_flaggems.py drop the two
+# _native_batch_norm_legit* variants from the FlagGems `.inc` -- and because
+# codegen_iluvatar.py omits exactly those ops from the native `.inc`
 # (that is what keeps the two files disjoint), the ops would end up registered
 # nowhere and every call would raise "backend not registered".
 # `vendor_registered_ops()` is the registration closure the conf's `none` gate
 # reads; these ops are registered by FlagGems, so widening that set would change
 # no route. They are used only by render(), to annotate the route line.
-# XLA/musa/gcu/ascend/kunlunxin have no escape-only kernels.
+# iluvatar's `mm` and `bmm` started here (measured, FlagGems-primary) and left
+# on 2026-10-20: gapping them for issue #570 removes them from the FlagGems
+# `.inc`, so codegen_iluvatar.py's read-back now claims them natively and the
+# .inc scan sees their route. `addmm` left with the rest of the gemm family on
+# 2026-10-21 for the same reason: codegen_iluvatar.py has carried an `addmm`
+# kernel all along and the FlagGems claim was what kept its `m.impl` out of the
+# native .inc. XLA/musa/gcu/ascend/kunlunxin have no escape-only kernels.
 ESCAPE_NATIVE = {
     "iluvatar": {
-        "mm",
-        "bmm",
-        "addmm",
         "_native_batch_norm_legit",
         "_native_batch_norm_legit_no_training",
     }
@@ -1873,6 +1918,31 @@ NATIVE_TRITON_GAPS = {
     # ordering is unspecified), `linalg_lstsq` (metadata shape), `_softmax_backward_data`
     # / `_log_softmax_backward_data` (device returns int8 -- needs one targeted
     # probe before gapping) and `unique_dim` (return-metadata).
+    #
+    # Added 2026-10-20: `mean` and `mean.dim` are gapped on a value defect the
+    # CI lane reproduces (issue #570). For a non-last-dim keepdim reduction the
+    # generic mean kernel returns wrong values -- `torch.mean(x, dim=0,
+    # keepdim=True)` on an (8, 12) fp32 tensor disagrees with the CPU reference
+    # far beyond 1e-4 -- and `mean_dim` (last dim) is served by the same kernel
+    # family, so both spellings leave the FlagGems path. `_iluvatar` ships no
+    # `mean` override, so this is the generic kernel, not a vendor one. The
+    # generic mean kernel is wrong on this device, so until a BI-V150
+    # measurement says otherwise the op does not stay on the FlagGems path.
+    # Remove the two entries when a FlagGems mean is measured correct here.
+    #
+    # Added 2026-10-20 from the same lane's "vendor backend, main ops" group:
+    #   * `slice_backward` -- FlagGems' kernel assumes a contiguous
+    #     `grad_output`; on a non-contiguous one (`narrow` on a transposed
+    #     input, `test_narrow_backward_non_contiguous`) it returns wrong grads
+    #     (56% of elements, max |diff| 5.9).
+    #   * `where.self_out` -- the same ATen out= contract defect the MUSA entry
+    #     above records, measured here through
+    #     `test_where_dispatch.py::TestWhereOutCorrectness::test_out_grows_from_empty`
+    #     (`pointwise_dynamic.prepare_args: out tensor at index 0 shape is
+    #     invalid, should be (2, 4) but is torch.Size([0])`). `where.self` is
+    #     unaffected and stays on FlagGems.
+    # Both are FlagGems-claimed, so `none` sends them to cpu_fallback, which is
+    # the reference for each.
     "iluvatar": {
         # device-guard mismatch (cuda vs flagos)
         "i0",
@@ -1898,6 +1968,127 @@ NATIVE_TRITON_GAPS = {
         "special_chebyshev_polynomial_v",
         "special_hermite_polynomial_h",
         "special_shifted_chebyshev_polynomial_u",
+        "mean",
+        "mean.dim",
+        # `_conj`, for the contract test_math_bits_contract.py pins: ATen's conj
+        # is a lazy view (Conjugate bit set, storage untouched) and FlagGems'
+        # `_conj` is a real kernel that materializes it, so `is_conj()` comes
+        # back False -- the same defect DCU pins away and GCU/MUSA gate with this
+        # gap. On iluvatar it is worse than eager: the `_iluvatar` kernel lowers
+        # through `view_as_real`, which has no flagos impl here, so the kernel
+        # warns, returns the *unconjugated* storage as a fresh tensor, and
+        # `resolve_conj` then hands back those values. Measured on u180 at
+        # head cdf8a79f: `torch.conj([1+1j, -2+3j])` reports `is_conj False`
+        # and its values read `(-0.672+0.0085j, ...)`. The test's
+        # materialization predicate sees no exception and admits the complex
+        # cases, which then fail with nothing to blame the route for.
+        #
+        # `_conj` itself is not a gap: it is a view, and a `none` route reaches
+        # the ViewOp key, which refuses every view ("View operators don't
+        # support falling back to run on the CPU") -- measured on u180 as a raise
+        # that took down every path resolving a Conjugate bit (copy_, clone,
+        # contiguous, resolve_conj, arithmetic). register.cc's USE_ILUVATAR arm
+        # answers it from ATen's metadata kernel instead, so it is routed to the
+        # native slot through EXTRA_NATIVE and NATIVE_KERNEL_PREFERRED -- the
+        # same fix `view_as_real` below gets.
+        #
+        # `_conj_copy.out` stays here because an out= copy is not a view, so the
+        # fallback serves it.
+        "_conj_copy.out",
+        # view_as_real, for the complex arithmetic FlagGems sends through it.
+        # flag_gems' elementwise complex path (`ops/add.py`, and everything that
+        # guards on `is_complex()`) decomposes both operands with
+        # `torch.view_as_real`. Here the op had no flagos impl -- it is a view,
+        # and `none` reaches the ViewOp key -- so each call was a UserWarning and
+        # then zero-filled storage. Answering it from ATen's metadata kernel in
+        # register.cc's USE_ILUVATAR arm removes the warning and makes
+        # `view_as_real` itself correct (measured on u180: the real/imag pairs
+        # read back exactly, for f64, f32, complex64 and complex128 sources).
+        #
+        # It does NOT make FlagGems' complex `add` correct. After the view is
+        # fixed, `complex128 + 0`, `complex128 + complex128` and
+        # `complex128 + 1` still return `[0j, ...]` at every size tried (n = 1,
+        # 2, 4, 8) while `complex128 * 1` and every complex64 spelling are
+        # exact; the same `add_func` on a complex64 operand is exact in-process,
+        # so the remaining defect is inside flag_gems' complex add path for
+        # complex128, not in this view. `view_as_real` stays listed here because
+        # that is also the op FlagGems would have to lower to serve a
+        # `flaggems` route, and this platform has no kernel for it.
+        "view_as_real",
+        # The add/div family, for that same remaining defect. FlagGems' complex
+        # `add` returns zeros for complex128 (above), and its complex `div`
+        # raises `AssertionError: unsupported dtype in complex op` for
+        # complex64 -- measured on the CI lane 2026-10-21 as the one remaining
+        # failure of test_math_bits_contract.py once `_conj` and
+        # `view_as_real` were answered, and in-process against flag_gems 5.4.0.
+        # The conf routes these three to the native slot instead, where
+        # register.cc publishes ATen's own add_/div_ (see EXTRA_NATIVE).
+        #
+        # Only the in-place spellings are routed. `add.Tensor` and
+        # `add.Scalar` ride the out-of-place -> in-place lowering: with the
+        # in-place op on a PrivateUse1 kernel, ATen's `add` composite
+        # dispatches `z + t`, `z + 0` and `z + 1` to the in-place slot, so
+        # they leave FlagGems without a second registration (and cannot have
+        # one: an out= kernel does not match add.Tensor's C++ signature, and
+        # the register.cc comment records the abort that measured it).
+        # The in-place pair also fixes a defect of its own: a `none` route
+        # made `self.add_(other)` a boxed cpu_fallback that wrote to a CPU
+        # copy and left `self` unchanged (measured on u180 2026-10-21).
+        # `div_.Tensor` is routed for the same reason, and its kernel has to
+        # be the host round trip: ATen's complex div writes its destination
+        # before it reads its sources, so `x.div_(y)` -- which hands it the
+        # operand itself -- came back as the unchanged operand for complex128
+        # and as zeros for complex64 (measured on u180 2026-10-21).
+        "add.Tensor",
+        "add.Scalar",
+        "add_.Tensor",
+        "add_.Scalar",
+        "div_.Tensor",
+        "_conj_copy.out",
+        # The whole gemm family, for issue #570. `mm`/`mm.out` left first for a
+        # *tuning* defect rather than a wrong kernel: the fp64 failure is
+        # `torch.matmul` -> `mm` -> the `_iluvatar` mm.py libtuner, whose
+        # `estimate_matmul_time` perf model raises "dtype not supported" for
+        # float64 before any kernel is compiled. Gapping one spelling only moved
+        # the failure to `matmul` (which lands on the non-out spelling).
+        #
+        # `addmm` and its spellings followed on 2026-10-21 for a *wrong value*
+        # defect with the same root as the non-contiguous `mm` below: every
+        # small-shape `nn.Linear` on this device is `addmm(x, W.t())`, a weight
+        # whose second operand is a transposed view (stride (1, K)), and the
+        # `_iluvatar` kernels read that operand without resolving or masking
+        # its layout. Measured on u180 (BI-V150, FlagGems 5.4.0) at
+        # M, K, N = (1,4,2), (4,4,8), (8,8,8): `F.linear` disagrees with the CPU
+        # reference by 3.2 / 1.7 / 9.8, the same call with a contiguous weight
+        # matches to 3e-8, and (32,64,16) and (64,128,32) are clean -- so the
+        # defect is shape- and layout-dependent, not a dtype question, and a
+        # FlagGems `linear`/`mm` measured correct here can move back.
+        "addmm",
+        "addmm.out",
+        "addmm.dtype",
+        "addmm.dtype_out",
+        "addmm_",
+        "mm",
+        "mm.out",
+        # K < 16: FlagGems' generic bmm compiles with a BLOCK_SIZE_K below
+        # FlagTree's min_dot_size[2] and tl.dot raises "Input shapes should
+        # have M >= 1, N >= 1 and K >= 16" before any kernel runs -- measured
+        # on the CI lane 2026-10-20 as the last 15 main-op failures of #570
+        # (bmm 1-1-1-1 and every SDPA/matmul-backward case, which reaches bmm
+        # through FlagGems' own SDPA). FlagGems 5.4.0 does not pad K; K padding
+        # only landed in 5.6. `bmm` itself takes the native ixblas kernel (it
+        # moved out of the FlagGems .inc with this change); the out=/dtype=/
+        # dtype_out= spellings have no native kernel and reach cpu_fallback.
+        # (`addmm` used to be described here as kept on FlagGems; it moved with
+        # the rest of the gemm family on 2026-10-21 -- see its own entry.)
+        "bmm",
+        "bmm.out",
+        "bmm.dtype",
+        "bmm.dtype_out",
+        # wrong values: assumes a contiguous grad_output
+        "slice_backward",
+        # the out= contract (see the MUSA entry for where.self_out)
+        "where.self_out",
         # Triton compile / structural defects
         "norm.Scalar",
         "norm.ScalarOpt_dim",
@@ -1927,7 +2118,16 @@ NATIVE_TRITON_GAPS = {
 # Move a vendor here if its Triton stack is immature and unverified routes cause
 # regressions. Failures for specific ops go in NATIVE_TRITON_GAPS above with their
 # diagnosis; this set is for blanket "prefer native until measured" policies.
-NATIVE_KERNEL_PREFERRED = set()
+#
+# Iluvatar joins for one op, `_conj`: register.cc's USE_ILUVATAR arm republishes
+# ATen's metadata implementation there (see EXTRA_NATIVE), and that registration
+# has to be named in exactly one place. Preferring native removes `_conj` from
+# py_here, which both stops the FlagGems slot from being subtracted as a rival
+# native kernel -- leaving the route `none`, which a view op cannot fall back
+# from -- and drops the gap entry from NATIVE_TRITON_GAPS["iluvatar"] as
+# redundant. FlagGems coverage is unaffected (the .inc is generated from the
+# FlagGems set, and only `none`/`iluvatar` ops are in it).
+NATIVE_KERNEL_PREFERRED = {"iluvatar"}
 
 # Platforms whose build can compile the TileOPs slot (Backend::kTileOps). The
 # shims are Triton kernels needing an SM90 device plus the `tileops` package, and

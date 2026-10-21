@@ -45,7 +45,16 @@ BACKENDS_DIR = ATEN_DIR / "backends"
 # Ops registered straight from register.cc rather than an ``.inc``, invisible
 # to the ``m.impl`` scan. Mirrors ``EXTRA_NATIVE`` / ``EXTRA_ROUTED`` in
 # ``scripts/codegen/gen_vendor_confs.py``.
-EXTRA_NATIVE = {"ascend": {"matmul", "matmul_backward"}}
+EXTRA_NATIVE = {
+    "ascend": {"matmul", "matmul_backward"},
+    "iluvatar": {
+        "_conj",
+        "view_as_real",
+        "add_.Tensor",
+        "add_.Scalar",
+        "div_.Tensor",
+    },
+}
 EXTRA_ROUTED = {"scaled_dot_product_attention"}
 
 # Platform -> registration ``.inc`` set that ``csrc/aten/register.cc`` compiles
@@ -408,8 +417,9 @@ def _derived_iluvatar_counts() -> dict[str, int]:
     cohort changes, so the counts are derived from what the platform actually
     registers instead. The FlagGems ``.inc`` claims the ``flaggems`` routes; the
     native ``.inc`` claims the ``iluvatar`` routes, and because FlagGems wins any
-    overlap the native set is the native-minus-FlagGems difference; every other
-    op the conf lists is ``none``. A conf that disagrees with the registrations
+    overlap the native set is the native-minus-FlagGems difference; the ops
+    register.cc claims directly (EXTRA_NATIVE, e.g. ``_conj``) belong to that
+    same native slot; every other op the conf lists is ``none``. A conf that disagrees with the registrations
     is caught by test_vendor_routes_are_registered / _accelerated_routes_are_
     registered / test_registered_ops_are_never_left_at_none above.
     """
@@ -420,7 +430,7 @@ def _derived_iluvatar_counts() -> dict[str, int]:
     native = _registered_ops(
         ATEN_DIR / "backends/iluvatar/generated/iluvatar_register.inc"
     )
-    iluvatar = native - flaggems
+    iluvatar = (native | EXTRA_NATIVE["iluvatar"]) - flaggems
     return {
         "flaggems": len(flaggems),
         "iluvatar": len(iluvatar),
@@ -483,10 +493,12 @@ def test_conf_route_counts_are_stable():
         # pinned: the native cohort is a moving measurement -- the first landing
         # is _convolution, convolution, native_batch_norm, the ops that route
         # `none` today and have an ixdnn/ixblas kernel, and it grows as coverage
-        # is measured. Ops FlagGems already registers (mm/bmm/addmm, the
+        # is measured. Ops FlagGems already registers (the
         # _native_batch_norm_legit* variants) stay `flaggems` and are kept out of
         # the native .inc, since a second m.impl in the same PrivateUse1 body is a
-        # duplicate-registration error. See _derived_iluvatar_counts().
+        # duplicate-registration error; mm/bmm/addmm left that group with the
+        # issue-#570 gaps and are native routes now. See
+        # _derived_iluvatar_counts().
         "iluvatar": _derived_iluvatar_counts(),
         # MPS is a native vendor backend at stage 4: the codegen'd
         # mps_register.inc claims the MPSGraph kernels registered for the
@@ -495,14 +507,14 @@ def test_conf_route_counts_are_stable():
         # ``embedding``, ``index_select``, ``gather``, ``div``, ``div_scalar``,
         # ``reciprocal``, ``take``, ``layer_norm``, ``batch_norm``, ``sigmoid``,
         # ``exp``, ``log``, ``rsqrt``, ``sqrt``, ``tanh``, ``erf``, ``where``
-        # and ``cat`` categories (35 ops so far), so the conf
+        # ``cat`` and ``masked_fill`` categories (37 ops so far), so the conf
         # routes those to
         # ``mps`` and every other op to ``none``. The ``softmax`` category is registered
         # under ``_softmax`` alone because ``softmax.int`` is
         # CompositeImplicitAutograd and never reaches a backend key, and the
         # ``conv`` category under ``convolution_overrideable`` alone for the same
         # reason about ``aten.convolution``; see scripts/codegen/codegen_mps.py.
-        "mps": {"mps": 35, "none": 2002},
+        "mps": {"mps": 37, "none": 2000},
         "tsingmicro": {"flaggems": 51, "flagos_python": 2, "tsingmicro": 14},
     }
     for platform, exp in expected.items():

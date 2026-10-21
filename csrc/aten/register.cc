@@ -18,6 +18,11 @@
 #include <ATen/core/LegacyTypeDispatch.h>
 #include <ATen/core/grad_mode.h>
 #include <ATen/ops/matmul_native.h>
+#include <ATen/ops/_conj_native.h>
+#include <ATen/ops/view_as_real_native.h>
+#include <ATen/Functions.h>
+#include <ATen/ops/add_native.h>
+#include <ATen/ops/div_native.h>
 #include <ATen/SDPBackend.h>
 #include <torch/library.h>
 #include <c10/core/ScalarType.h>
@@ -256,7 +261,16 @@ int64_t WrapperFusedSdpChoice(
 // list, which names no conv). The three had byte-identical copies of this; one
 // definition is the same code with one less place to drift. A vendor that later
 // gains a native conv should register that instead, not fork this.
-#if defined(USE_BPU) || defined(USE_KUNLUNXIN) || defined(USE_TSINGMICRO)
+//
+// Iluvatar joins for the backward only. Its `convolution_overrideable` is
+// FlagGems-claimed, its forward reaches ixdnn, and nothing claims
+// `convolution_backward_overrideable` -- no native backward exists in
+// codegen_iluvatar.py -- so the backward of every conv hit
+// "NotImplementedError" (measured 2026-10-20 on the CI lane,
+// test_conv1d_dispatch.py::TestConv1dBackward). The USE_ILUVATAR arm registers
+// the backward wrapper below and deliberately not the forward one.
+#if defined(USE_BPU) || defined(USE_KUNLUNXIN) || defined(USE_TSINGMICRO) || \
+    defined(USE_ILUVATAR)
 at::Tensor FlagosWrapperConvolutionOverrideable(
     const at::Tensor& input,
     const at::Tensor& weight,
@@ -326,7 +340,7 @@ FlagosWrapperConvolutionBackwardOverrideable(
       to_dev(::std::get<1>(out)),
       to_dev(::std::get<2>(out)));
 }
-#endif // USE_BPU || USE_KUNLUNXIN || USE_TSINGMICRO
+#endif // USE_BPU || USE_KUNLUNXIN || USE_TSINGMICRO || USE_ILUVATAR
 
 // ============================================================
 // Generated wrappers for 71 CUDA operators
@@ -380,6 +394,115 @@ static std::tuple<at::Tensor, at::Tensor> WrapperMatmulBackward(
     ::std::array<bool, 2> mask) {
   return at::native::flagos::MatmulBackwardKernelAscend(
       grad, self, other, mask);
+}
+#endif
+
+#if defined(USE_ILUVATAR)
+// _conj is the lazy-view half of aten::conj: an alias of self carrying the
+// Conjugate bit, storage untouched. csrc/aten/strided_ops.cc implements it
+// through the GENERATED FlagGems dispatcher, which only answers a `flaggems`
+// route; iluvatar's conf routes `_conj` to `iluvatar` (FlagGems' `_conj` is an
+// eager kernel), so that slot is unpopulated and the call raised "backend not
+// registered". Answer it here, the way the conf says it runs.
+//
+// There is no cpu_fallback alternative: `_conj` is a view, and ATen's ViewOp
+// fallback refuses every view ("View operators don't support falling back to
+// run on the CPU, since the tensor's storage cannot be shared across devices").
+// Measured on u180, before these registrations existed: `torch.conj` on a
+// PrivateUse1 tensor raised, which took down every path that resolves a
+// Conjugate bit (copy_, clone, contiguous, resolve_conj, arithmetic) -- the
+// tests/integration/test_math_bits_contract.py group.
+//
+// `_conj_copy.out` is the materializing half of the same pair and keeps the
+// `none` route with the other out= copies: `at::conj_physical` writes the same
+// bytes with the bit cleared. It is registered here rather than left to the
+// shared cpu_fallback so that the view and its materialization are answered by
+// one platform, so a fallback contract change cannot split them. Both stay out
+// of the FLAGOS_ILUVATAR_KERNEL-gated native .inc because a FlagGems-only
+// build needs this answer too.
+//
+// Both are ordinary (non-CatchAll, non-Autograd) PrivateUse1 kernels. The
+// registration makes the op a genuine PrivateUse1 op, so a CatchAll entry would
+// simply never be reached: `torch.conj(z)` on PrivateUse1 resolves its autograd
+// group first, and the boxed `cpu_fallback` object -- which every unclaimed op
+// gets from the CatchAll arm near the bottom of this file -- would carry the
+// inner `_conj` to CPU with a device mismatch.
+at::Tensor FlagosWrapperPrivConj(const at::Tensor& self) {
+  return at::native::_conj(self);
+}
+
+at::Tensor& FlagosWrapperPrivConjCopyOut(
+    const at::Tensor& self, at::Tensor& out) {
+  out.copy_(at::conj_physical(self));
+  return out;
+}
+
+// view_as_real is the other view FlagGems cannot supply here, and it is the
+// op flag_gems' complex elementwise path decomposes both operands with
+// (flag_gems/ops/add.py). Its route was `none`, which a view cannot take: the
+// ViewOp key refuses every view, so the call warned and returned zero-filled
+// storage. Measured on u180, `torch.view_as_real` read back exactly once
+// answered from ATen here, for f64, f32, complex64 and complex128 sources --
+// while `complex128 + 0` still returned zeros, which is flag_gems' complex add
+// path and not this view (see the view_as_real entry in NATIVE_TRITON_GAPS).
+// Same contract as _conj above: metadata only, no kernel, dtype or device.
+at::Tensor FlagosWrapperPrivViewAsReal(const at::Tensor& self) {
+  return at::native::view_as_real(self);
+}
+
+// add/div are the consumer ops the Conjugate contract measures in
+// tests/integration/test_math_bits_contract.py. FlagGems' complex path
+// decomposes both operands with view_as_real and then runs its own kernel,
+// and on iluvatar that kernel returns zeros for complex128 in `add` and
+// raises for complex64 in `div`, so the conf routes these overloads here
+// instead (see the entries in NATIVE_TRITON_GAPS).
+//
+// The conf names these three in-place schemas, not add.Tensor, for a
+// registration reason: an m.impl on the PrivateUse1 key belongs to the schema's
+// own C++ signature, so a four-argument out= kernel under add.Tensor aborts at
+// load with "Mismatch in kernel C++ signatures" (measured on u180). ATen's
+// `add` lowers the out-of-place spelling to add_.Tensor, so `z + t`, `z + 1`
+// and the conjugated `z + 0` reach these kernels through that lowering.
+//
+// They return Tensor& because ATen's add_.Tensor family (CPU, meta) does, and
+// the registrar matches signatures exactly. add_ calls the operator
+// (at::add_out), not a lower-level kernel: ATen registers the complex out=
+// kernel through its structured meta/decomposition path, which only a call
+// through at:: picks up. `at::native::add_out` does not exist in this build
+// (measured: "not a member of at::native").
+at::Tensor& FlagosWrapperPrivAddTensorInplace(
+    at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) {
+  return at::add_out(self, self, other, alpha);
+}
+
+at::Tensor& FlagosWrapperPrivAddScalarInplace(
+    at::Tensor& self, const at::Scalar& other, const at::Scalar& alpha) {
+  return at::add_out(self, self, other, alpha);
+}
+
+at::Tensor& FlagosWrapperPrivDivInplace(
+    at::Tensor& self, const at::Tensor& other) {
+  // ATen's complex div kernel writes its destination before it reads its
+  // sources, so the destination must not alias a source. `self` is a source,
+  // and the spelling `x.div_(y)` hands it the operand itself: measured on
+  // u180, the quotient of complex128 by a complex128 divisor came back as the
+  // unchanged operand, and complex64 came back as zeros. Divide on the host
+  // and copy the result back.
+  //
+  // The host round trip is the cpu_fallback shape, but the fallback writes to
+  // a host copy and never to `self` -- which is the defect this route exists
+  // to fix. `at::reciprocal` would sidestep the kernel, but FlagGems has no
+  // complex route for it, and computing the reciprocal in Triton for a
+  // 2-element divide is the worse trade.
+  at::Tensor source = self;
+  if (self.is_conj()) {
+    source = self.resolve_conj();
+  }
+  const auto cpu_self = source.to(c10::kCPU);
+  const auto cpu_other = other.to(c10::kCPU);
+  const auto cpu_out = at::div(cpu_self, cpu_other);
+  self.copy_(cpu_out);
+  return self;
 }
 #endif
 
@@ -527,6 +650,25 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     #if defined(FLAGOS_FLAGGEMS_PYTHON)
     #include "backends/iluvatar/generated/iluvatar_flaggems_register.inc"
     #endif
+    // No convolution backward exists on this platform and the boxed fallback
+    // cannot reach one (see the shared wrapper above), so every conv backward
+    // takes the CPU crossing. Unconditional: the wrapper needs no vendor or
+    // FlagGems kernel. Only the backward -- the forward keeps its FlagGems /
+    // ixdnn routes.
+    m.impl("convolution_backward_overrideable",
+        FlagosWrapperConvolutionBackwardOverrideable);
+    // See FlagosWrapperPrivConj above. Unconditional like the conv pair
+    // above: the metadata kernel needs neither a vendor nor a FlagGems slot, and both
+    // op names carry no CPU fallback to reach instead.
+    m.impl("_conj", FlagosWrapperPrivConj);
+    m.impl("_conj_copy.out", FlagosWrapperPrivConjCopyOut);
+    m.impl("view_as_real", FlagosWrapperPrivViewAsReal);
+    // See FlagosWrapperPrivAddTensorInplace above: FlagGems' complex kernel is
+    // wrong for add (complex128) and raises for div (complex64) here, so these
+    // run ATen's kernels instead.
+    m.impl("add_.Tensor", FlagosWrapperPrivAddTensorInplace);
+    m.impl("add_.Scalar", FlagosWrapperPrivAddScalarInplace);
+    m.impl("div_.Tensor", FlagosWrapperPrivDivInplace);
   #elif defined(USE_BPU)
     // BPU registers no compute ops. The BPU's unit of execution is a whole
     // compiled graph (a .hbm produced by hbdk4), so there is no per-operator

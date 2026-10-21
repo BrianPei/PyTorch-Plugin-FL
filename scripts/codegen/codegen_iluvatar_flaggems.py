@@ -89,6 +89,29 @@ INC_HEADER = """\
 // the old FAILED count, and no op newly failed between the runs. The remaining 21
 // are survey synthesis limits and stay here.
 //
+// 2026-10-20: `mean`, `mean.dim`, `mm` and `mm.out` joined the gap set from the
+// CI lane's own measurements rather than a survey run (issue #570) -- the
+// keepdim mean returns wrong values, and the mm tuning perf model rejects
+// float64 -- so the list is now 41 and this file registers 599. Two more
+// joined later the same day from the lane's "vendor backend, main ops" group
+// (`slice_backward`, whose FlagGems kernel assumes a contiguous grad_output,
+// and `where.self_out`, the out= contract): 43 gapped, 597 registered.
+//
+// `mm` left the gap-exclusion path and moved to the native `.inc` on this same
+// date, for the duplicate-registration reason below: it is gapped *and* the
+// native `.inc` now claims it. Its `flaggems` conf route went to `none` in the
+// same step, so nothing dispatches to a FlagGems `mm` slot that is not here.
+//
+// 2026-10-21: `add.Tensor`, `add.Scalar`, `add_.Tensor`, `add_.Scalar` and
+// `div_.Tensor` joined the gap set for issue #570 -- FlagGems' complex `add`
+// returns zeros for complex128 and its complex `div` raises for complex64 --
+// and the three in-place spellings are answered by `csrc/aten/register.cc`.
+// The gap set is now 59. This file registers 585, which is the 640-op FlagGems
+// ceiling minus the 59 gaps minus the 11 native slots plus the 8 ops that are
+// both gapped and natively claimed (the exclusion is a union, not a sum). The
+// "603" above is the opening paragraph's snapshot at the first survey and is
+// kept for provenance; the registrations are this file's `m.impl` lines.
+//
 // Re-measure and move entries in or out of that set only from BI-V150 results,
 // never by assumption -- and note the DCU precedent: most of the 37 are the
 // device-name mismatch that _ALIGNED_VENDORS

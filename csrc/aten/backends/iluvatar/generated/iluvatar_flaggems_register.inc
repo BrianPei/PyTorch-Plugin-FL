@@ -24,6 +24,29 @@
 // the old FAILED count, and no op newly failed between the runs. The remaining 21
 // are survey synthesis limits and stay here.
 //
+// 2026-10-20: `mean`, `mean.dim`, `mm` and `mm.out` joined the gap set from the
+// CI lane's own measurements rather than a survey run (issue #570) -- the
+// keepdim mean returns wrong values, and the mm tuning perf model rejects
+// float64 -- so the list is now 41 and this file registers 599. Two more
+// joined later the same day from the lane's "vendor backend, main ops" group
+// (`slice_backward`, whose FlagGems kernel assumes a contiguous grad_output,
+// and `where.self_out`, the out= contract): 43 gapped, 597 registered.
+//
+// `mm` left the gap-exclusion path and moved to the native `.inc` on this same
+// date, for the duplicate-registration reason below: it is gapped *and* the
+// native `.inc` now claims it. Its `flaggems` conf route went to `none` in the
+// same step, so nothing dispatches to a FlagGems `mm` slot that is not here.
+//
+// 2026-10-21: `add.Tensor`, `add.Scalar`, `add_.Tensor`, `add_.Scalar` and
+// `div_.Tensor` joined the gap set for issue #570 -- FlagGems' complex `add`
+// returns zeros for complex128 and its complex `div` raises for complex64 --
+// and the three in-place spellings are answered by `csrc/aten/register.cc`.
+// The gap set is now 59. This file registers 585, which is the 640-op FlagGems
+// ceiling minus the 59 gaps minus the 11 native slots plus the 8 ops that are
+// both gapped and natively claimed (the exclusion is a union, not a sum). The
+// "603" above is the opening paragraph's snapshot at the first survey and is
+// kept for provenance; the registrations are this file's `m.impl` lines.
+//
 // Re-measure and move entries in or out of that set only from BI-V150 results,
 // never by assumption -- and note the DCU precedent: most of the 37 are the
 // device-name mismatch that _ALIGNED_VENDORS
@@ -31,13 +54,32 @@
 // adding iluvatar there is the way most of them come back.
 // Excluded ops, left to cpu_fallback:
 //   - _batch_norm_no_update
+//   - _conj_copy.out
 //   - _native_batch_norm_legit.no_stats
+//   - add.Scalar
+//   - add.Tensor
+//   - add_.Scalar
+//   - add_.Tensor
+//   - addmm
+//   - addmm.dtype
+//   - addmm.dtype_out
+//   - addmm.out
+//   - addmm_
+//   - bmm
+//   - bmm.dtype
+//   - bmm.dtype_out
+//   - bmm.out
+//   - div_.Tensor
 //   - gcd_
 //   - histc
 //   - i0
 //   - i0.out
 //   - linalg_matrix_exp.out
 //   - masked_scatter_backward
+//   - mean
+//   - mean.dim
+//   - mm
+//   - mm.out
 //   - mse_loss_backward
 //   - nansum.out
 //   - native_batch_norm
@@ -47,6 +89,7 @@
 //   - randint_like
 //   - randperm
 //   - range
+//   - slice_backward
 //   - soft_margin_loss
 //   - special_chebyshev_polynomial_u
 //   - special_chebyshev_polynomial_v
@@ -67,8 +110,10 @@
 //   - sum.out
 //   - unique_consecutive
 //   - upsample_bicubic2d
+//   - view_as_real
+//   - where.self_out
 //
-// Total: 603 ops registered here, 1 further FlagGems ops already claimed by iluvatar_register.inc.
+// Total: 585 ops registered here, 7 further FlagGems ops already claimed by iluvatar_register.inc.
 
   m.impl("_adaptive_avg_pool2d", WrapperPrivAdaptiveAvgPool2d);
   m.impl("_adaptive_avg_pool2d_backward", WrapperPrivAdaptiveAvgPool2dBackward);
@@ -78,8 +123,6 @@
   m.impl("_cholesky_solve_helper", WrapperPrivCholeskySolveHelper);
   m.impl("_compute_linear_combination", WrapperPrivComputeLinearCombination);
   m.impl("_compute_linear_combination.out", WrapperPrivComputeLinearCombinationOut);
-  m.impl("_conj", WrapperPrivConj);
-  m.impl("_conj_copy.out", WrapperPrivConjCopyOut);
   m.impl("_conv_depthwise2d", WrapperPrivConvDepthwise2d);
   m.impl("_convert_weight_to_int4pack", WrapperPrivConvertWeightToInt4pack);
   m.impl("_dirichlet_grad", WrapperPrivDirichletGrad);
@@ -134,19 +177,12 @@
   m.impl("adaptive_max_pool2d", WrapperAdaptiveMaxPool2d);
   m.impl("adaptive_max_pool2d_backward", WrapperAdaptiveMaxPool2dBackward);
   m.impl("adaptive_max_pool3d", WrapperAdaptiveMaxPool3d);
-  m.impl("add.Tensor", WrapperAddTensor);
-  m.impl("add_.Tensor", WrapperAddInplaceTensor);
   m.impl("addbmm", WrapperAddbmm);
   m.impl("addbmm_", WrapperAddbmmInplace);
   m.impl("addcdiv", WrapperAddcdiv);
   m.impl("addcdiv_", WrapperAddcdivInplace);
   m.impl("addcmul", WrapperAddcmul);
   m.impl("addcmul_", WrapperAddcmulInplace);
-  m.impl("addmm", WrapperAddmm);
-  m.impl("addmm.dtype", WrapperAddmmDtype);
-  m.impl("addmm.dtype_out", WrapperAddmmDtypeOut);
-  m.impl("addmm.out", WrapperAddmmOut);
-  m.impl("addmm_", WrapperAddmmInplace);
   m.impl("addmv", WrapperAddmv);
   m.impl("addmv.out", WrapperAddmvOut);
   m.impl("addmv_", WrapperAddmvInplace);
@@ -212,8 +248,6 @@
   m.impl("bitwise_xor_.Tensor", WrapperBitwiseXorInplaceTensor);
   m.impl("blackman_window", WrapperBlackmanWindow);
   m.impl("blackman_window.periodic", WrapperBlackmanWindowPeriodic);
-  m.impl("bmm", WrapperBmm);
-  m.impl("bmm.out", WrapperBmmOut);
   m.impl("bucketize.Tensor", WrapperBucketizeTensor);
   m.impl("cat", WrapperCat);
   m.impl("ceil", WrapperCeil);
@@ -270,7 +304,6 @@
   m.impl("div.out", WrapperDivOut);
   m.impl("div_.Scalar", WrapperDivInplaceScalar);
   m.impl("div_.Scalar_mode", WrapperDivInplaceScalarMode);
-  m.impl("div_.Tensor", WrapperDivInplaceTensor);
   m.impl("div_.Tensor_mode", WrapperDivInplaceTensorMode);
   m.impl("dot", WrapperDot);
   m.impl("elu", WrapperElu);
@@ -467,8 +500,6 @@
   m.impl("max_pool3d_with_indices", WrapperMaxPool3dWithIndices);
   m.impl("max_pool3d_with_indices_backward", WrapperMaxPool3dWithIndicesBackward);
   m.impl("max_unpool2d", WrapperMaxUnpool2d);
-  m.impl("mean", WrapperMean);
-  m.impl("mean.dim", WrapperMeanDim);
   m.impl("median", WrapperMedian);
   m.impl("median.dim", WrapperMedianDim);
   m.impl("min", WrapperMin);
@@ -477,8 +508,6 @@
   m.impl("miopen_batch_norm_backward", WrapperMiopenBatchNormBackward);
   m.impl("mish", WrapperMish);
   m.impl("mish_", WrapperMishInplace);
-  m.impl("mm", WrapperMm);
-  m.impl("mm.out", WrapperMmOut);
   m.impl("mode", WrapperMode);
   m.impl("mse_loss", WrapperMseLoss);
   m.impl("multinomial", WrapperMultinomial);
@@ -600,7 +629,6 @@
   m.impl("sinh", WrapperSinh);
   m.impl("sinh_", WrapperSinhInplace);
   m.impl("slice.Tensor", WrapperSliceTensor);
-  m.impl("slice_backward", WrapperSliceBackward);
   m.impl("soft_margin_loss_backward", WrapperSoftMarginLossBackward);
   m.impl("softplus", WrapperSoftplus);
   m.impl("softplus_backward", WrapperSoftplusBackward);
@@ -661,7 +689,6 @@
   m.impl("vdot", WrapperVdot);
   m.impl("view_as_complex", WrapperViewAsComplex);
   m.impl("where.self", WrapperWhereSelf);
-  m.impl("where.self_out", WrapperWhereSelfOut);
   m.impl("xlogy.OutScalar_Other", WrapperXlogyOutscalarOther);
   m.impl("xlogy.OutScalar_Self", WrapperXlogyOutscalarSelf);
   m.impl("xlogy.OutTensor", WrapperXlogyOuttensor);
