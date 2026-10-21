@@ -21,7 +21,7 @@ setup_platform: musa
 # Keep the previously running MUSA 5.1 image until the runner driver is
 # upgraded for MUSA 5.2 and that image can be pulled within the job budget.
 # Its torch_musa is isolated from the CPU PyTorch 2.10 build environment.
-ci_image: registry.mthreads.com/mcconline/musa-pytorch-release-public@sha256:13f7375aab77a4ace7084558eb939a977467330f558a3c2a185c6c6d31ec8935
+ci_image: harbor.baai.ac.cn/flagos-dev/torch-fl:20261021-musa-dev
 
 runner_labels:
   - mt-8g-cicd-pytorch
