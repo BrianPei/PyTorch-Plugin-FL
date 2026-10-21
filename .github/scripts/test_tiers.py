@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LEVELS = {f"L{number}": number for number in range(5)}
 REQUIREMENTS = {"accelerator", "model_directory"}
+EXECUTION_MODES = {"parallel", "exclusive"}
 
 
 def policy(root=ROOT):
@@ -40,6 +41,7 @@ def policy(root=ROOT):
         profiles = case.get("profiles")
         requires = case.get("requires")
         resources = case.get("resources")
+        execution = case.get("execution")
         if (
             not isinstance(profiles, list)
             or not profiles
@@ -56,6 +58,8 @@ def policy(root=ROOT):
             or not 1 <= resources["min_accelerators"] <= 1024
         ):
             raise ValueError(f"invalid profiles, requirements or resources for {name}")
+        if execution is not None and execution not in EXECUTION_MODES:
+            raise ValueError(f"invalid execution mode for {name}")
     return document
 
 
@@ -109,6 +113,9 @@ def select(groups, ids, profile, platform, document):
             "selection_reason": f"profile:{profile}",
             **case,
         }
+        item["execution"] = case.get(
+            "execution", "parallel" if case["level"] in {"L2", "L3"} else "exclusive"
+        )
         item["command"] = item["command"].replace(
             "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1", "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
         )
@@ -140,6 +147,10 @@ def select(groups, ids, profile, platform, document):
                     "min_passed": 1,
                     "selection_reason": f"profile:{profile}",
                     **case,
+                    "execution": case.get(
+                        "execution",
+                        "parallel" if case["level"] in {"L2", "L3"} else "exclusive",
+                    ),
                     "environment": {
                         "FLAGCICD_PROFILE": profile,
                         "FLAGCICD_STABILITY_SECONDS": str(

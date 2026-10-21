@@ -16,7 +16,11 @@
 
 import importlib.util
 import json
+import os
 import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -80,6 +84,15 @@ def test_per_test_environment_validation(monkeypatch, environment, message):
     monkeypatch.setenv("INTEGRATION_ENVIRONMENT", "{}")
 
     with pytest.raises(SystemExit, match=message):
+        _RUNNER.load_configuration(allow_empty=False)
+
+
+def test_execution_mode_validation(monkeypatch):
+    tests = [{"name": "test", "command": "true", "execution": "overlap"}]
+    monkeypatch.setenv("INTEGRATION_TESTS", json.dumps(tests))
+    monkeypatch.setenv("INTEGRATION_ENVIRONMENT", "{}")
+
+    with pytest.raises(SystemExit, match="execution must be one of"):
         _RUNNER.load_configuration(allow_empty=False)
 
 
@@ -255,3 +268,216 @@ def test_resource_requirements_use_recorded_hardware_and_keep_a_ledger(
     assert record["duration_seconds"] >= 0 and record["finished"] >= record["started"]
     assert record["resources"] == {"min_accelerators": minimum}
     assert ledger["complete"] is (not blocked)
+
+
+def test_declared_parallel_groups_start_together_and_keep_ledger_order(
+    monkeypatch, tmp_path
+):
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "hardware-cuda.json").write_text(json.dumps({"accelerator_count": 1}))
+    tests = [
+        {
+            "name": "first shared group",
+            "command": (
+                "touch first.started; "
+                "while [[ ! -f second.started ]]; do sleep 0.01; done; "
+                "touch first.done"
+            ),
+            "platform": "cuda",
+            "level": "L2",
+            "execution": "parallel",
+            "resources": {"min_accelerators": 1},
+        },
+        {
+            "name": "second shared group",
+            "command": (
+                "touch second.started; "
+                "while [[ ! -f first.started ]]; do sleep 0.01; done; "
+                "touch second.done"
+            ),
+            "platform": "cuda",
+            "level": "L2",
+            "execution": "parallel",
+            "resources": {"min_accelerators": 1},
+        },
+    ]
+    monkeypatch.setenv("FLAGCICD_REPORT_DIR", str(reports))
+    monkeypatch.setenv("FLAGCICD_MAX_PARALLEL", "2")
+
+    assert _run_main(monkeypatch, tmp_path, tests) == 0
+    assert (tmp_path / "first.done").exists()
+    assert (tmp_path / "second.done").exists()
+    ledger = json.loads((reports / "groups.json").read_text())
+    assert ledger["complete"] is True
+    assert [group["name"] for group in ledger["groups"]] == [
+        "first shared group",
+        "second shared group",
+    ]
+    assert all(group["status"] == "passed" for group in ledger["groups"])
+    assert all(group["execution"] == "parallel" for group in ledger["groups"])
+
+
+def _reports(monkeypatch, tmp_path, accelerators=1):
+    """A report directory holding recorded hardware for the cuda fixtures."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "hardware-cuda.json").write_text(
+        json.dumps({"accelerator_count": accelerators})
+    )
+    monkeypatch.setenv("FLAGCICD_REPORT_DIR", str(reports))
+    return reports
+
+
+def _group(name, command, level="L2", execution="parallel", minimum=1):
+    return {
+        "name": name,
+        "command": command,
+        "platform": "cuda",
+        "level": level,
+        "execution": execution,
+        "resources": {"min_accelerators": minimum},
+    }
+
+
+def test_execution_plan_never_overlaps_an_exclusive_or_multi_device_group():
+    tests = [
+        _group("a", "true"),
+        _group("b", "true"),
+        _group("compile", "true", execution="exclusive"),
+        _group("c", "true"),
+        _group("d", "true", level="L3"),
+        _group("two-card", "true", level="L3", minimum=2),
+        _group("e", "true", level="L3"),
+        _group("f", "true", level="L3"),
+        _group("soak", "true", level="L4"),
+    ]
+    assert _RUNNER.execution_plan(tests) == [
+        (True, [0, 1]),
+        (False, [2]),
+        (True, [3]),
+        (True, [4]),
+        (False, [5]),
+        (True, [6, 7]),
+        (False, [8]),
+    ]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "two", "", "1.5"])
+def test_invalid_worker_bound_is_rejected(value):
+    with pytest.raises(SystemExit, match="FLAGCICD_MAX_PARALLEL"):
+        _RUNNER.max_parallel_workers({"FLAGCICD_MAX_PARALLEL": value})
+
+
+def test_worker_bound_limits_concurrent_shared_groups(monkeypatch, tmp_path):
+    # Each group holds a lock directory while it runs; a second holder means
+    # two groups overlapped although only one worker was allowed.
+    command = (
+        "mkdir held || { touch overlapped; exit 0; }; sleep 0.05; rmdir held; "
+        "touch {name}.done"
+    )
+    tests = [_group(name, command.replace("{name}", name)) for name in "abc"]
+    _reports(monkeypatch, tmp_path)
+    monkeypatch.setenv("FLAGCICD_MAX_PARALLEL", "1")
+
+    assert _run_main(monkeypatch, tmp_path, tests) == 0
+    assert not (tmp_path / "overlapped").exists()
+    assert all((tmp_path / f"{name}.done").exists() for name in "abc")
+
+
+def test_shared_failure_keeps_running_evidence_and_blocks_later_groups(
+    monkeypatch, tmp_path, capfd
+):
+    reports = _reports(monkeypatch, tmp_path)
+    tests = [
+        _group(
+            "slow",
+            "touch slow.started; while [[ ! -f fast.failed ]]; do sleep 0.01; done; "
+            "sleep 0.05; touch slow.done",
+        ),
+        _group(
+            "fast",
+            "while [[ ! -f slow.started ]]; do sleep 0.01; done; "
+            "touch fast.failed; exit 7",
+        ),
+        _group("queued", "touch queued.ran"),
+        _group("isolated", "touch isolated.ran", execution="exclusive"),
+        _group("later", "touch later.ran", level="L3"),
+    ]
+    monkeypatch.setenv("FLAGCICD_MAX_PARALLEL", "2")
+
+    with pytest.raises(SystemExit) as error:
+        _run_main(monkeypatch, tmp_path, tests)
+
+    assert error.value.code == 7
+    # The group already running finishes; nothing new starts after a failure.
+    assert (tmp_path / "slow.done").exists()
+    for name in ("queued", "isolated", "later"):
+        assert not (tmp_path / f"{name}.ran").exists()
+    ledger = json.loads((reports / "groups.json").read_text())
+    assert ledger["complete"] is False
+    assert [group["name"] for group in ledger["groups"]] == ledger["expected"]
+    assert [group["status"] for group in ledger["groups"]] == [
+        "passed",
+        "failed",
+        "not_run",
+        "not_run",
+        "not_run",
+    ]
+    assert "Integration test 'fast' failed with exit code 7" in capfd.readouterr().out
+
+
+def test_cancelling_a_shared_batch_kills_every_running_group(tmp_path):
+    """SIGINT reaches only the runner; it must still stop worker commands."""
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "hardware-cuda.json").write_text(json.dumps({"accelerator_count": 1}))
+    tests = [
+        _group(name, f"touch {name}.started; sleep 30; touch {name}.survived")
+        for name in ("a", "b")
+    ]
+    env = {
+        **os.environ,
+        "INTEGRATION_TESTS": json.dumps(tests),
+        "INTEGRATION_WORKDIR": str(tmp_path),
+        "FLAGCICD_REPORT_DIR": str(reports),
+        "FLAGCICD_MAX_PARALLEL": "2",
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(_RUNNER_PATH)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 10
+    while not all((tmp_path / f"{n}.started").exists() for n in "ab"):
+        assert time.monotonic() < deadline, "shared groups did not start"
+        time.sleep(0.02)
+    process.send_signal(signal.SIGINT)
+    assert process.wait(timeout=10) != 0
+    time.sleep(0.2)
+    survivors = subprocess.run(
+        ["pgrep", "-f", f"touch {tmp_path}"], capture_output=True, text=True
+    )
+    assert not (tmp_path / "a.survived").exists()
+    assert not survivors.stdout.strip()
+    ledger = json.loads((reports / "groups.json").read_text())
+    assert ledger["complete"] is False
+
+
+def test_blocked_shared_group_is_recorded_without_a_pass(monkeypatch, tmp_path):
+    reports = _reports(monkeypatch, tmp_path)
+    tests = [
+        _group("one-card", "touch one.ran"),
+        {**_group("blocked", "touch blocked.ran"), "blocked_reason": "no model"},
+    ]
+
+    with pytest.raises(SystemExit, match="'blocked' is blocked: no model"):
+        _run_main(monkeypatch, tmp_path, tests)
+
+    assert not (tmp_path / "blocked.ran").exists()
+    ledger = json.loads((reports / "groups.json").read_text())
+    statuses = {group["name"]: group["status"] for group in ledger["groups"]}
+    assert statuses["blocked"] == "blocked"
+    assert statuses["one-card"] in ("passed", "not_run")
+    assert ledger["complete"] is False

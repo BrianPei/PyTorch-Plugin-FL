@@ -25,7 +25,7 @@ setup_platform: cuda
 # vendor-agnostic workflows, which also need Python and git in the image.
 # set_env_cuda.sh checks the image glibc before installing FlagTree, so a future
 # rebuild on an older userland fails naming the requirement.
-ci_image: harbor.baai.ac.cn/flagos-dev/pytorch-plugin-fl@sha256:eea3302ee25e0e3390aef4aa1a603dfe03aa93ab043f1571cb86f7a2a3026e02
+ci_image: harbor.baai.ac.cn/flagos-dev/torch-fl:20261021-cuda-dev
 
 runner_labels:
   - torch-fl-nv

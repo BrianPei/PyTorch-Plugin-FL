@@ -336,6 +336,51 @@ def test_all_profiled_commands_disable_legacy_crash_tolerance():
     assert doc["release"]["stability_seconds"] >= 3600
 
 
+def test_execution_modes_default_shared_groups_and_isolate_sensitive_groups():
+    from test_tiers import select
+
+    document = policy()
+    selected = select(
+        [
+            {"name": "Factory", "command": "true"},
+            {"name": "Environment", "command": "true"},
+        ],
+        ["factory_ops", "environment"],
+        "nightly",
+        "cuda",
+        document,
+    )
+    modes = {group["id"]: group["execution"] for group in selected}
+    assert modes["factory_ops"] == "parallel"
+    assert modes["l4_endurance"] == "exclusive"
+    # Preflights gate the suites after them, and device tracers are
+    # process-wide: neither may overlap another group.
+    assert modes["environment"] == "exclusive"
+    for case_id in (
+        "musa_runtime",
+        "iluvatar_runtime",
+        "profiler_contract",
+        "profiler_parity",
+        "multi_device_contracts",
+        "native_comm_bridge",
+        "torch_compile",
+        "inference",
+        "training",
+        "l3_installed_contract",
+        "l3_lifecycle",
+        "l3_performance",
+        "l4_models",
+    ):
+        assert document["cases"][case_id]["execution"] == "exclusive", case_id
+    # Shared groups must fit on one accelerator; the runner rejects others.
+    for case_id, case in document["cases"].items():
+        if case.get("execution", "parallel") == "parallel" and case["level"] in (
+            "L2",
+            "L3",
+        ):
+            assert case["resources"]["min_accelerators"] == 1, case_id
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -347,6 +392,7 @@ def test_all_profiled_commands_disable_legacy_crash_tolerance():
         ("resources", {"min_accelerators": True}),
         ("resources", {"min_accelerators": 0}),
         ("resources", {"min_accelerators": 1, "unverified": 42}),
+        ("execution", "overlap"),
     ],
 )
 def test_invalid_case_requirements_fail_before_dispatch(tmp_path, field, value):
@@ -354,7 +400,12 @@ def test_invalid_case_requirements_fail_before_dispatch(tmp_path, field, value):
     doc["cases"]["environment"][field] = value
     (tmp_path / ".flagcicd").mkdir()
     (tmp_path / ".flagcicd/test-tiers.json").write_text(json.dumps(doc))
-    with pytest.raises(ValueError, match="profiles, requirements or resources"):
+    message = (
+        "invalid execution mode"
+        if field == "execution"
+        else "profiles, requirements or resources"
+    )
+    with pytest.raises(ValueError, match=message):
         policy(tmp_path)
 
 

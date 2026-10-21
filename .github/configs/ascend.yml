@@ -30,7 +30,7 @@ setup_stage: build
 # flagtree/FlagGems from the FlagOS index -- so the image only has to supply
 # python3.11 + CANN + a compiler. No vendor torch is baked in and torch_npu is
 # explicitly forbidden.
-ci_image: harbor.baai.ac.cn/flagtree/flagtree-ascend3.5-910c-py311-cann9.0.0-ubuntu22.04-aarch64:202608-torch2.10.0-vllm0.20.2
+ci_image: harbor.baai.ac.cn/flagos-dev/torch-fl:20261021-ascend-dev
 
 # Self-hosted Huawei (Ascend) runner registered by the teacher. The job is
 # dispatched only to a runner carrying this label.

@@ -39,7 +39,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "autoload_contract": {
       "level": "L2",
@@ -74,7 +75,8 @@
       ],
       "resources": {
         "min_accelerators": 2
-      }
+      },
+      "execution": "exclusive"
     },
     "musa_runtime": {
       "level": "L2",
@@ -92,7 +94,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "iluvatar_runtime": {
       "level": "L2",
@@ -110,7 +113,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "portable_top_level_contracts": {
       "level": "L2",
@@ -290,7 +294,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "profiler_parity": {
       "level": "L2",
@@ -308,7 +313,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "torch_compile": {
       "level": "L2",
@@ -326,7 +332,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "inference": {
       "level": "L2",
@@ -344,7 +351,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "training": {
       "level": "L2",
@@ -362,7 +370,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "native_comm_bridge": {
       "level": "L3",
@@ -379,7 +388,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "musa_dispatch": {
       "level": "L2",
@@ -412,7 +422,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "runtime_conformance": {
       "level": "L2",
@@ -465,7 +476,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "l3_lifecycle": {
       "level": "L3",
@@ -482,7 +494,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "l4_endurance": {
       "level": "L4",
@@ -498,7 +511,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "l4_models": {
       "level": "L4",
@@ -515,7 +529,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "l3_performance": {
       "level": "L3",
@@ -532,7 +547,8 @@
       ],
       "resources": {
         "min_accelerators": 1
-      }
+      },
+      "execution": "exclusive"
     },
     "backend_ops": {
       "level": "L2",

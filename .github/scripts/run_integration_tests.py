@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import argparse
+import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -50,6 +52,19 @@ _SUMMARY_FAILURE_RE = re.compile(r"\b(?:failed|errors?|xfailed|xpassed|no tests 
 _FATAL_SIGNALS = {signal.SIGABRT, signal.SIGSEGV, signal.SIGBUS, signal.SIGILL}
 
 _TEARDOWN_CRASH_ENV = "INTEGRATION_ALLOW_TEARDOWN_CRASH"
+_EXECUTION_MODES = {"parallel", "exclusive"}
+_DEFAULT_MAX_PARALLEL = 2
+
+# Group commands run in their own sessions, so a cancelled runner does not
+# reach them through its process group. Shared batches run commands on worker
+# threads, where KeyboardInterrupt never arrives; the main thread kills every
+# registered command instead, and a command started after cancellation is
+# killed as soon as it registers.
+_ACTIVE_PROCESSES = set()
+_ACTIVE_LOCK = threading.Lock()
+_CANCELLED = threading.Event()
+# Serializes ledger record updates with the ledger's JSON snapshot.
+_LEDGER_LOCK = threading.Lock()
 
 
 def parse_args():
@@ -88,6 +103,12 @@ def load_configuration(allow_empty):
         if not isinstance(command, str) or not command.strip() or "\0" in command:
             raise SystemExit(
                 f"integration_tests[{index}].command must be a non-empty string"
+            )
+        execution = test.get("execution")
+        if execution is not None and execution not in _EXECUTION_MODES:
+            raise SystemExit(
+                f"integration_tests[{index}].execution must be one of "
+                f"{', '.join(sorted(_EXECUTION_MODES))}"
             )
         validate_environment(
             test_environment,
@@ -196,7 +217,7 @@ def required_mpirun(command, test_environment):
     )
 
 
-def run_command(command, test_environment, workdir):
+def run_command(command, test_environment, workdir, output_prefix="", output_lock=None):
     """Run one group command, streaming its output live while capturing it.
 
     Streaming (not print-at-end) keeps long hardware groups observable and
@@ -214,13 +235,15 @@ def run_command(command, test_environment, workdir):
         cwd=workdir,
         start_new_session=True,
     )
+    with _ACTIVE_LOCK:
+        _ACTIVE_PROCESSES.add(process)
+        cancelled = _CANCELLED.is_set()
+    if cancelled:
+        kill_process_group(process)
 
     def expire():
         timed_out.set()
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_process_group(process)
 
     timer = threading.Timer(
         float(test_environment.get("FLAGCICD_CASE_TIMEOUT", "1800")), expire
@@ -230,19 +253,123 @@ def run_command(command, test_environment, workdir):
     try:
         lines = []
         for line in process.stdout:
-            sys.stdout.write(line)
+            # Shared groups interleave whole, prefixed lines; a lone group's
+            # output is written untouched.
+            with output_lock or contextlib.nullcontext():
+                sys.stdout.write(output_prefix + line)
+                if output_lock:
+                    sys.stdout.flush()
             lines.append(line)
         sys.stdout.flush()
         returncode = process.wait()
     except KeyboardInterrupt:
         # A cancelled runner must not leave a pytest process writing to the
         # report directory or to a retry's workspace.
-        os.killpg(process.pid, signal.SIGKILL)
+        kill_process_group(process)
         process.wait()
         raise
     finally:
         timer.cancel()
+        with _ACTIVE_LOCK:
+            _ACTIVE_PROCESSES.discard(process)
     return (124 if timed_out.is_set() else returncode), "".join(lines)
+
+
+def kill_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def kill_active_processes():
+    """Stop every running group command and refuse to start new ones."""
+    with _ACTIVE_LOCK:
+        _CANCELLED.set()
+        processes = list(_ACTIVE_PROCESSES)
+    for process in processes:
+        kill_process_group(process)
+
+
+def max_parallel_workers(environment):
+    """Bound on concurrently running shared groups; 1 restores a serial run."""
+    value = environment.get("FLAGCICD_MAX_PARALLEL", str(_DEFAULT_MAX_PARALLEL))
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise SystemExit("FLAGCICD_MAX_PARALLEL must be a positive integer")
+    return int(value)
+
+
+def execution_mode(test):
+    """Return the declared mode; ``sequential`` marks a legacy, unplanned run."""
+    return test.get("execution", "sequential")
+
+
+def shareable(test):
+    """Only declared single-accelerator L2/L3 groups may run side by side."""
+    resources = test.get("resources")
+    return (
+        execution_mode(test) == "parallel"
+        and test.get("level") in ("L2", "L3")
+        and isinstance(resources, dict)
+        and resources.get("min_accelerators") == 1
+    )
+
+
+def execution_plan(tests):
+    """Split the manifest into ordered steps of ``(shared, indexes)``.
+
+    Consecutive shareable groups of one level form a shared batch; every
+    other group is its own step. An exclusive group therefore never overlaps
+    anything, the manifest's level order (L2, L3, L4) is kept, and so is the
+    order of groups across an exclusive boundary.
+    """
+    plan = []
+    for index, test in enumerate(tests):
+        shared = shareable(test)
+        if (
+            shared
+            and plan
+            and plan[-1][0]
+            and tests[plan[-1][1][-1]].get("level") == test.get("level")
+        ):
+            plan[-1][1].append(index)
+        else:
+            plan.append((shared, [index]))
+    return plan
+
+
+def run_batch(indexes, workers, run_group):
+    """Run one shared batch; return the first failure in manifest order.
+
+    A failure stops further groups of the batch from starting, while groups
+    already running finish so their evidence is complete. Ctrl-C/cancellation
+    kills every running group before re-raising.
+    """
+    failures = {}
+    stop = threading.Event()
+
+    def guarded(index):
+        if stop.is_set() or _CANCELLED.is_set():
+            return None
+        status = run_group(index)
+        if status is not None:
+            stop.set()
+        return status
+
+    executor = ThreadPoolExecutor(max_workers=min(workers, len(indexes)))
+    try:
+        futures = {executor.submit(guarded, index): index for index in indexes}
+        for future in as_completed(futures):
+            status = future.result()
+            if status is not None:
+                failures[futures[future]] = status
+    except BaseException:
+        stop.set()
+        kill_active_processes()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True)
+    return failures[min(failures)] if failures else None
 
 
 def resource_block(test, environment):
@@ -271,6 +398,131 @@ def resource_block(test, environment):
     return ""
 
 
+def make_record(test):
+    """Create the stable, ordered ledger entry for one configured group."""
+    return {
+        "name": test["name"],
+        "id": test.get("id", test["name"]),
+        "level": test.get("level", "L2"),
+        "category": test.get("category", "functional"),
+        "command": test["command"],
+        "requires_pytest": "pytest" in test["command"]
+        or "run_unit_tests.py" in test["command"],
+        "status": "pending",
+        "execution": execution_mode(test),
+        "min_passed": test.get("min_passed", 0),
+        "requires": test.get("requires", []),
+        "resources": test.get("resources", {}),
+        "selection_reason": test.get("selection_reason", "configured_group"),
+        "log_url": (
+            os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            + "/"
+            + os.environ.get("GITHUB_REPOSITORY", "")
+            + "/actions/runs/"
+            + os.environ.get("GITHUB_RUN_ID", "")
+        )
+        if os.environ.get("GITHUB_RUN_ID")
+        else "",
+    }
+
+
+def prepare_test_environment(test, command_environment):
+    """Apply group-specific variables without mutating the shared environment."""
+    test_environment = command_environment.copy()
+    for key, value in test.get("environment", {}).items():
+        test_environment[key] = os.path.expandvars(value)
+    if test_environment.get("FLAGCICD_REPORT_DIR"):
+        test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
+    test_environment["FLAGCICD_CASE_TIMEOUT"] = str(test.get("timeout_seconds", 1800))
+    return test_environment
+
+
+def execute_group(
+    test, record, banner, command_environment, workdir, save, output_lock=None
+):
+    """Execute one group, recording its outcome in its ledger entry.
+
+    Returns ``None`` on success, otherwise the ``SystemExit`` status for the
+    failure: the command's return code, or a message when the group could not
+    start. Shared batches call this from worker threads, so every ledger
+    update holds ``_LEDGER_LOCK`` and only an ``output_lock`` caller gets the
+    per-line group prefix; serial output stays byte-identical, which keeps
+    workflow commands such as ``::error::`` working.
+    """
+
+    def report(message):
+        with output_lock or contextlib.nullcontext():
+            print(message, flush=True)
+
+    def finish(status, returncode, reason=""):
+        finished = time.time()
+        with _LEDGER_LOCK:
+            record.update(
+                status=status,
+                returncode=returncode,
+                finished=finished,
+                duration_seconds=finished - record["started"],
+            )
+            if reason:
+                record["reason"] = reason
+        save()
+
+    report(f"===== {banner} =====")
+    with _LEDGER_LOCK:
+        record.update(status="running", started=time.time())
+    save()
+    test_environment = prepare_test_environment(test, command_environment)
+    reason = resource_block(test, test_environment)
+    if reason:
+        finish("blocked", 1, reason)
+        return f"Integration group {test['name']!r} is blocked: {reason}"
+    allow_crash = (
+        teardown_crash_allowed(test_environment) if not test.get("level") else False
+    )
+    try:
+        returncode, output = run_command(
+            test["command"],
+            test_environment,
+            workdir,
+            output_prefix=f"[{test['name']}] " if output_lock else "",
+            output_lock=output_lock,
+        )
+    except (OSError, SystemExit) as error:
+        finish("failed", 1, str(error))
+        return error.code if isinstance(error, SystemExit) else str(error)
+    ok, tolerated = classify_command_result(returncode, output, allow_crash)
+    finish(
+        "passed" if ok else ("timeout" if returncode == 124 else "failed"), returncode
+    )
+    if tolerated:
+        report(
+            f"Integration test '{test['name']}' passed ({clean_summary(output)}), "
+            f"then the command died with signal {signal_number(returncode)} during "
+            f"teardown ({_TEARDOWN_CRASH_ENV} is set for this group; see this "
+            "script's header comment)"
+        )
+    if ok:
+        return None
+    report(f"Integration test '{test['name']}' failed with exit code {returncode}")
+    return returncode
+
+
+def mark_not_run(records, reason):
+    """Make unstarted work visible without claiming it passed."""
+    now = time.time()
+    with _LEDGER_LOCK:
+        for record in records:
+            if record["status"] == "pending":
+                record.update(
+                    status="not_run",
+                    reason=reason,
+                    returncode=1,
+                    started=now,
+                    finished=now,
+                    duration_seconds=0.0,
+                )
+
+
 def main():
     args = parse_args()
     tests, environment = load_configuration(args.allow_empty)
@@ -296,93 +548,72 @@ def main():
 
     def save():
         if ledger_path:
-            ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            ledger_path.write_text(json.dumps(ledger, indent=2) + "\n")
+            with _LEDGER_LOCK:
+                text = json.dumps(ledger, indent=2) + "\n"
+                ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                ledger_path.write_text(text)
 
+    def banner(index):
+        return f"[{index + 1}/{len(tests)}] {tests[index]['name']}"
+
+    # Test fixtures and external callers that predate execution modes keep the
+    # original fail-fast serial run, whose ledger grows as groups start. The
+    # tier selector gives every composed group a mode, so CI takes the
+    # planned path below.
+    if not any("execution" in test for test in tests):
+        for index, test in enumerate(tests):
+            record = make_record(test)
+            ledger["groups"].append(record)
+            status = execute_group(
+                test, record, banner(index), command_environment, workdir, save
+            )
+            if status is not None:
+                raise SystemExit(status)
+        ledger["complete"] = True
+        save()
+        return 0
+
+    # Every planned group is in the ledger, in manifest order, before anything
+    # starts; a failure turns the groups that never started into `not_run`.
+    records = [make_record(test) for test in tests]
+    ledger["groups"] = records
     save()
-    for index, test in enumerate(tests, start=1):
-        record = {
-            "name": test["name"],
-            "id": test.get("id", test["name"]),
-            "level": test.get("level", "L2"),
-            "category": test.get("category", "functional"),
-            "command": test["command"],
-            "requires_pytest": "pytest" in test["command"]
-            or "run_unit_tests.py" in test["command"],
-            "status": "running",
-            "min_passed": test.get("min_passed", 0),
-            "requires": test.get("requires", []),
-            "resources": test.get("resources", {}),
-            "started": time.time(),
-            "selection_reason": test.get("selection_reason", "configured_group"),
-            "log_url": (
-                os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-                + "/"
-                + os.environ.get("GITHUB_REPOSITORY", "")
-                + "/actions/runs/"
-                + os.environ.get("GITHUB_RUN_ID", "")
-            )
-            if os.environ.get("GITHUB_RUN_ID")
-            else "",
-        }
-        ledger["groups"].append(record)
-        save()
-        print(
-            f"===== [{index}/{len(tests)}] {test['name']} =====",
-            flush=True,
+    workers = max_parallel_workers(command_environment)
+    output_lock = threading.Lock()
+
+    def run_group(index):
+        return execute_group(
+            tests[index],
+            records[index],
+            banner(index),
+            command_environment,
+            workdir,
+            save,
+            output_lock,
         )
-        test_environment = command_environment.copy()
-        for key, value in test.get("environment", {}).items():
-            test_environment[key] = os.path.expandvars(value)
-        if test_environment.get("FLAGCICD_REPORT_DIR"):
-            test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
-        test_environment["FLAGCICD_CASE_TIMEOUT"] = str(
-            test.get("timeout_seconds", 1800)
-        )
-        reason = resource_block(test, test_environment)
-        if reason:
-            record.update(
-                status="blocked", reason=reason, returncode=1, finished=time.time()
-            )
-            record["duration_seconds"] = record["finished"] - record["started"]
-            save()
-            raise SystemExit(f"Integration group {test['name']!r} is blocked: {reason}")
-        allow_crash = (
-            teardown_crash_allowed(test_environment) if not test.get("level") else False
-        )
-        try:
-            returncode, output = run_command(test["command"], test_environment, workdir)
-        except (OSError, SystemExit) as error:
-            record.update(
-                status="failed", reason=str(error), returncode=1, finished=time.time()
-            )
-            record["duration_seconds"] = record["finished"] - record["started"]
-            save()
-            raise
-        ok, tolerated = classify_command_result(returncode, output, allow_crash)
-        record.update(
-            returncode=returncode,
-            status="passed" if ok else ("timeout" if returncode == 124 else "failed"),
-            finished=time.time(),
-        )
-        record["duration_seconds"] = record["finished"] - record["started"]
-        save()
-        if tolerated:
+
+    for shared, indexes in execution_plan(tests):
+        if shared and len(indexes) > 1:
             print(
-                f"Integration test '{test['name']}' passed "
-                f"({clean_summary(output)}), then the command died with "
-                f"signal {signal_number(returncode)} during teardown "
-                f"({_TEARDOWN_CRASH_ENV} is set for this group; see this "
-                f"script's header comment)",
+                f"===== {tests[indexes[0]]['level']} shared batch: "
+                f"{len(indexes)} group(s), at most {workers} at a time =====",
                 flush=True,
             )
-            continue
-        if not ok:
-            print(
-                f"Integration test '{test['name']}' failed with exit code {returncode}",
-                flush=True,
+            status = run_batch(indexes, workers, run_group)
+        else:
+            index = indexes[0]
+            status = execute_group(
+                tests[index],
+                records[index],
+                banner(index),
+                command_environment,
+                workdir,
+                save,
             )
-            raise SystemExit(returncode)
+        if status is not None:
+            mark_not_run(records, "not_run_after_failure")
+            save()
+            raise SystemExit(status)
     ledger["complete"] = True
     save()
     return 0

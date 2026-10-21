@@ -34,8 +34,23 @@ matching, including when successful platform results survive a failed-job rerun.
 
 L0 validates configuration, lint and the explicit test file inventory. L1 runs
 the existing agnostic, codegen and hardware-free wheel checks. Hardware jobs
-depend on all of them. L2 cases precede L3 cases, and L3 precedes L4; the runner
-stops on the first failure and retains already produced evidence. The existing
+depend on all of them. L2 cases precede L3 cases, and L3 precedes L4.
+
+Setup, build, preflight and wheel installation run once per hardware job; only
+the test groups after them run concurrently. Consecutive single-accelerator
+L2/L3 groups declared `parallel` form a shared batch with at most
+`FLAGCICD_MAX_PARALLEL` (default 2, set by the workflow; 1 restores a serial
+run) groups at a time, each in its own process with whole, `[group]`-prefixed
+output lines. An `exclusive` group, a group needing more than one accelerator
+and every L4 group runs alone, so it never overlaps another group and the
+manifest order across it is kept. Environment and runtime preflights,
+profiler suites (device tracers are process-wide), multi-device and
+communication suites, compile, inference, training, installed-wheel,
+lifecycle, performance and model cases are exclusive. After a failure no new
+group starts: groups already running finish and keep their evidence, every
+unstarted group is recorded as `not_run`, and the job exits with the first
+failing group's status in manifest order. Cancellation kills every running
+group. The existing
 DCU source-contract sweep is diagnostic source testing; it does not establish
 installed-wheel compatibility by itself and is excluded from candidate release
 acceptance. Legacy unprofiled callers preserve
@@ -95,7 +110,11 @@ increase a threshold to make a regression pass.
 ## Collection completeness
 
 Each stable case ID has a level, explicit `profiles`, `requires`,
-`resources.min_accelerators` and `timeout_seconds` in `test-tiers.json`.
+`resources.min_accelerators`, `timeout_seconds` and an optional `execution`
+mode in `test-tiers.json`. L2/L3 cases default to `parallel`; L4 cases default
+to `exclusive`. A case that holds device-wide or host-wide state (a tracer,
+several devices, a model, a cache it measures) declares `exclusive`
+explicitly.
 Commands remain solely in the integration manifest (acceptance commands are
 assembled by the existing tier selector). Requirements currently cover an
 accelerator and a model directory. The composer reads the existing
@@ -125,7 +144,8 @@ Manual entries also require a disposition. The 31 existing gaps remain
 reason; the plan lists them separately and the summary records their count.
 
 At runtime, `groups.json` records the expected sequence, commands, levels,
-categories and return codes, including groups that never started. The pytest
+categories, execution modes and return codes, including groups that never
+started. The pytest
 plugin records selected node IDs; merging requires a corresponding test result
 for every selected item, a nonempty selection and a session for every pytest
 group. Empty collection, missing reports, aborted sessions and unstarted groups
