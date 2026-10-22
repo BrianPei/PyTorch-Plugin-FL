@@ -23,7 +23,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LEVELS = {f"L{number}": number for number in range(5)}
-REQUIREMENTS = {"accelerator", "model_directory"}
+REQUIREMENTS = {
+    "accelerator",
+    "model_directory",
+    "metrics_directory",
+    "primary_device",
+}
 EXECUTION_MODES = {"parallel", "exclusive"}
 
 
@@ -53,9 +58,11 @@ def policy(root=ROOT):
             or any(r not in REQUIREMENTS for r in requires)
             or len(requires) != len(set(requires))
             or not isinstance(resources, dict)
-            or set(resources) != {"min_accelerators"}
+            or "min_accelerators" not in resources
+            or set(resources) - {"min_accelerators", "shared"}
             or type(resources["min_accelerators"]) is not int
             or not 1 <= resources["min_accelerators"] <= 1024
+            or ("shared" in resources and type(resources["shared"]) is not bool)
         ):
             raise ValueError(f"invalid profiles, requirements or resources for {name}")
         if execution is not None and execution not in EXECUTION_MODES:
@@ -69,6 +76,12 @@ def policy(root=ROOT):
             for platform, reason in unsupported.items()
         ):
             raise ValueError(f"invalid unsupported platforms for {name}")
+        if LEVELS[case["level"]] in (2, 3) and execution is None:
+            raise ValueError(
+                f"L2/L3 case {name} must declare an execution mode explicitly"
+            )
+        if execution == "parallel" and resources.get("shared") is not True:
+            raise ValueError(f"parallel case {name} must declare resources.shared=true")
     return document
 
 
@@ -124,9 +137,9 @@ def select(groups, ids, profile, platform, document):
             "selection_reason": f"profile:{profile}",
             **case,
         }
-        item["execution"] = case.get(
-            "execution", "parallel" if case["level"] in {"L2", "L3"} else "exclusive"
-        )
+        # Unclassified cases are isolated by default.  Shared execution must
+        # be an explicit policy decision validated above.
+        item["execution"] = case.get("execution", "exclusive")
         item["command"] = item["command"].replace(
             "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1", "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
         )
@@ -158,10 +171,7 @@ def select(groups, ids, profile, platform, document):
                     "min_passed": 1,
                     "selection_reason": f"profile:{profile}",
                     **case,
-                    "execution": case.get(
-                        "execution",
-                        "parallel" if case["level"] in {"L2", "L3"} else "exclusive",
-                    ),
+                    "execution": case.get("execution", "exclusive"),
                     "environment": {
                         "FLAGCICD_PROFILE": profile,
                         "FLAGCICD_STABILITY_SECONDS": str(
@@ -175,6 +185,7 @@ def select(groups, ids, profile, platform, document):
                             document["release"]["max_retained_bytes"]
                         ),
                     },
+                    "stream_output": True,
                 }
             )
     if not selected or len({g["id"] for g in selected}) != len(selected):

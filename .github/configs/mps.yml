@@ -86,6 +86,7 @@ integration_build_tools:
   - python -m pip install --upgrade build
 
 timeout_minutes: 60
+integration_timeout_minutes: 720
 wheel_artifact_name: wheel-mps
 
 # What this platform's environment has to look like before any test runs, read

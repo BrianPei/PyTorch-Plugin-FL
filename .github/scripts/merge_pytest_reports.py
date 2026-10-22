@@ -48,7 +48,12 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
             sessions.append(session)
             continue
         selected = session.get("selected_nodeids")
-        if selected is None and (Path(directory) / "groups.json").exists():
+        # A group name is the marker that this session came from a FlagCICD
+        # invocation.  The integration runner writes groups.json, but the
+        # acceptance and wheel-only entry points can run pytest directly and
+        # still use the reporting plugin.  Requiring groups.json here would
+        # make their missing collection inventory silently pass.
+        if session.get("group") and selected is None:
             incomplete.append(session["report"])
             session["collection_error"] = "selected test inventory is missing"
         if selected is not None:

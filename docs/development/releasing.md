@@ -56,6 +56,46 @@ tag, reads vendor lanes from the platform table, prefers an available direct or
 proxy route, and retries bounded transient transport failures. Already published
 versions are skipped. The package index does not overwrite an existing version.
 
+The current publishing lanes and representative 2.10.0 filenames are:
+
+| Platform | Lane | Example wheel |
+| --- | --- | --- |
+| cuda | `flagos-pypi-nvidia` | `torch_fl-2.10.0+cuda13.3-cp312-cp312-linux_x86_64.whl` |
+| dcu | `flagos-pypi-hygon` | `torch_fl-2.10.0+dtk2604-cp310-cp310-linux_x86_64.whl` |
+| gcu | `flagos-pypi-enflame` | `torch_fl-2.10.0+tops1.9.10-cp312-cp312-linux_x86_64.whl` |
+| musa | `flagos-pypi-mthreads` | `torch_fl-2.10.0+musa5.2.0-cp310-cp310-linux_x86_64.whl` |
+| ppu | `flagos-pypi-thead` | `torch_fl-2.10.0+ppu2.0.0-cp312-cp312-linux_x86_64.whl` |
+| ascend | `flagos-pypi-ascend` | `torch_fl-2.10.0+cann9.0.0-cp311-cp311-linux_aarch64.whl` |
+| metax | `flagos-pypi-metax` | `torch_fl-2.10.0+maca3.8.1.3-cp312-cp312-linux_x86_64.whl` |
+
+TsingMicro and BPU do not publish. Publication stays on vendor runners for a
+measured network reason: a 2.35 GB artifact set took 59m47s to cross from the
+GitHub artifact store to Nexus at about 0.13 MB/s, while the same route from a
+runner in China measured about 13–23 MB/s. The build artifact hop is not the
+bottleneck; the final package-index upload is.
+
+Each upload defaults to a 900-second socket timeout, retries once on a bounded
+transient failure, and is capped by a 20-minute workflow step. Pass
+`--upload-timeout` for a deliberately different limit. The route probe selects
+direct or proxy access to `resource.flagos.net`; set
+`TORCH_FL_PROXY_ROUTE=direct` or `TORCH_FL_PROXY_ROUTE=proxy` when a runner
+needs an explicit route. A dry run exercises lane and filename resolution
+without credentials:
+
+```bash
+python3 .github/scripts/publish_wheels.py \
+  --wheels /tmp/wheels --tag v2.10.0 --dry-run
+```
+
+Adding a publishing platform requires all four pieces to move together:
+
+1. Add `pypi_lane` to `cmake/flagos_platforms.json`.
+2. Add `.github/configs/<platform>.yml` with its build, acceptance and timeout contract.
+3. Add the platform to the build, acceptance and publish matrices.
+4. Supply an owned model workload, performance reference and real hardware evidence.
+
+The release tests reject a lane that is present in only one of these places.
+
 ## Recovering a failed release
 
 Inspect the failed stage and its `acceptance-<platform>`, pytest and wheel

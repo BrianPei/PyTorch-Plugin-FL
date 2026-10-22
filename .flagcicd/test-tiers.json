@@ -57,8 +57,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "multi_device_contracts": {
       "unsupported_platforms": {
@@ -134,8 +136,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "vendor_ops": {
       "level": "L2",
@@ -152,8 +156,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "flaggems_ops": {
       "level": "L2",
@@ -170,8 +176,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "musa_flaggems_hybrid": {
       "level": "L2",
@@ -188,8 +196,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "rng": {
       "level": "L2",
@@ -206,8 +216,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "factory_ops": {
       "level": "L2",
@@ -224,8 +236,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "soft_lowp_matrix": {
       "level": "L2",
@@ -242,8 +256,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "amp_contract": {
       "level": "L2",
@@ -260,8 +276,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "math_bits_contract": {
       "level": "L2",
@@ -278,8 +296,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "profiler_contract": {
       "level": "L2",
@@ -409,8 +429,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "unit_tests_per_file": {
       "level": "L3",
@@ -443,8 +465,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "flaggems_conformance": {
       "level": "L2",
@@ -461,8 +485,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "l3_installed_contract": {
       "level": "L3",
@@ -493,7 +519,8 @@
         "release"
       ],
       "requires": [
-        "accelerator"
+        "accelerator",
+        "primary_device"
       ],
       "resources": {
         "min_accelerators": 1
@@ -510,7 +537,9 @@
         "release"
       ],
       "requires": [
-        "accelerator"
+        "accelerator",
+        "primary_device",
+        "metrics_directory"
       ],
       "resources": {
         "min_accelerators": 1
@@ -528,7 +557,9 @@
       ],
       "requires": [
         "accelerator",
-        "model_directory"
+        "model_directory",
+        "primary_device",
+        "metrics_directory"
       ],
       "resources": {
         "min_accelerators": 1
@@ -546,7 +577,9 @@
         "release"
       ],
       "requires": [
-        "accelerator"
+        "accelerator",
+        "primary_device",
+        "metrics_directory"
       ],
       "resources": {
         "min_accelerators": 1
@@ -568,8 +601,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     },
     "mps_runtime": {
       "level": "L2",
@@ -586,8 +621,10 @@
         "accelerator"
       ],
       "resources": {
-        "min_accelerators": 1
-      }
+        "min_accelerators": 1,
+        "shared": true
+      },
+      "execution": "parallel"
     }
   },
   "release": {

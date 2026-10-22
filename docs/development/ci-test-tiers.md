@@ -38,7 +38,8 @@ depend on all of them. L2 cases precede L3 cases, and L3 precedes L4.
 
 Setup, build, preflight and wheel installation run once per hardware job; only
 the test groups after them run concurrently. Consecutive single-accelerator
-L2/L3 groups declared `parallel` form a shared batch with at most
+L2/L3 groups that explicitly declare `execution: parallel` and
+`resources.shared: true` form a shared batch with at most
 `FLAGCICD_MAX_PARALLEL` (default 2, set by the workflow; 1 restores a serial
 run) groups at a time, each in its own process with whole, `[group]`-prefixed
 output lines. An `exclusive` group, a group needing more than one accelerator
@@ -47,10 +48,10 @@ manifest order across it is kept. Environment and runtime preflights,
 profiler suites (device tracers are process-wide), multi-device and
 communication suites, compile, inference, training, installed-wheel,
 lifecycle, performance and model cases are exclusive. After a failure no new
-group starts: groups already running finish and keep their evidence, every
-unstarted group is recorded as `not_run`, and the job exits with the first
-failing group's status in manifest order. Cancellation kills every running
-group. The existing
+group starts: in-flight commands in that shared batch are terminated and keep
+their terminal evidence, every unstarted group is recorded as `not_run`, and
+the job exits with the first observed root failure rather than a sibling's
+fail-fast `SIGKILL`. Cancellation kills every running group. The existing
 DCU source-contract sweep is diagnostic source testing; it does not establish
 installed-wheel compatibility by itself and is excluded from candidate release
 acceptance. Legacy unprofiled callers preserve
@@ -110,26 +111,34 @@ increase a threshold to make a regression pass.
 ## Collection completeness
 
 Each stable case ID has a level, explicit `profiles`, `requires`,
-`resources.min_accelerators`, `timeout_seconds` and an optional `execution`
-mode in `test-tiers.json`. L2/L3 cases default to `parallel`; L4 cases default
-to `exclusive`. A case that holds device-wide or host-wide state (a tracer,
-several devices, a model, a cache it measures) declares `exclusive`
-explicitly.
+`resources.min_accelerators`, `timeout_seconds` and an explicit `execution`
+mode in `test-tiers.json`. L2/L3 cases must declare either `parallel` with
+`resources.shared: true` or `exclusive`; L4 cases are exclusive. A case that
+holds device-wide or host-wide state (a tracer, several devices, a model, a
+cache it measures) declares `exclusive` explicitly.
 Commands remain solely in the integration manifest (acceptance commands are
 assembled by the existing tier selector). Requirements currently cover an
-accelerator and a model directory. The composer reads the existing
+accelerator, a model directory, a metrics directory and the primary device.
+The composer reads the existing
 `environment_check` contract; it does not create a second platform support map.
 An undeclared required model directory or an insufficient exact device count
 is recorded as blocked, with the group still required by the plan. Other
 device counts require runtime verification, rather than being claimed as
 measured hardware. Multi-device groups require two devices; existing L2 groups
 and the DCU native bridge's world-size-one packaging/runtime contract require
-one. Resource budgets follow the actual workload, rather than its category.
+one. Performance/endurance/model acceptance groups require
+`FLAGCICD_METRICS_DIR` and recorded `current_device == 0`; the runner records
+that actual current device in the hardware identity and blocks when the
+requirement is absent or mismatched. Resource budgets follow the actual
+workload, rather than its category.
 
 The runner checks `hardware-<platform>.json` before executing each profiled
 group. Missing, invalid or insufficient hardware evidence blocks the group and
-retains its reason in `groups.json`; it never turns into a passing skip. The
-platform report preserves these details as an infrastructure failure. Summary
+retains its reason in `groups.json`; it never turns into a passing skip. A
+missing metrics directory or a non-primary current device is handled the same
+way. Acceptance extras stream through the same runner with a group prefix so
+long model/performance commands remain visible. The platform report preserves
+these details as an infrastructure failure. Summary
 artifacts include platform decisions and a reference to the complete plan
 artifact, where all per-case exclusion and capability decisions are retained.
 

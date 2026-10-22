@@ -15,12 +15,14 @@
 
 """Record hardware identity for L2+ runs.
 
-ci-test-tiers.md line 13: "有硬件运行时，记录机器型号、SDK 版本和加速卡数量"
+When hardware is available, record the machine model, SDK version and
+accelerator count.
 
 Emits hardware-<platform>.json with:
 - machine_model: from /proc/cpuinfo model name or platform.machine()
 - sdk_version: from installed wheel's compatibility.json build.sdk_version
 - accelerator_count: from torch_fl.flagos.device_count()
+- current_device: from torch_fl.flagos.current_device(), when available
 
 Called after wheel install in integration-tests.yml; travels with pytest artifact.
 """
@@ -65,6 +67,23 @@ def get_accelerator_count():
         return 0
 
 
+def get_current_device():
+    """Record the runtime's active device index for cases that use flagos:0."""
+    try:
+        import torch_fl.flagos
+
+        return int(torch_fl.flagos.current_device())
+    except (
+        ImportError,
+        AttributeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Record hardware identity")
     parser.add_argument("--platform", required=True, help="Platform name")
@@ -75,6 +94,7 @@ def main():
         "machine_model": get_machine_model(),
         "sdk_version": get_sdk_version(),
         "accelerator_count": get_accelerator_count(),
+        "current_device": get_current_device(),
     }
 
     output_path = Path(args.output)

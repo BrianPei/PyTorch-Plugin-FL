@@ -283,6 +283,28 @@ def test_real_pytest_collection_detects_lost_case(tmp_path):
     ]
 
 
+def test_missing_selected_inventory_without_runner_ledger_is_incomplete(tmp_path):
+    """Direct acceptance pytest sessions still require collection evidence."""
+    (tmp_path / "acceptance.pending").write_text(
+        json.dumps({"group": "l3_performance", "args": ["test_performance.py"]})
+    )
+    (tmp_path / "acceptance.json").write_text(
+        json.dumps(
+            {
+                "summary": {"passed": 1},
+                "tests": [
+                    {"nodeid": "test_performance.py::test_fixed_workload_performance"}
+                ],
+                "exitcode": 0,
+                "duration": 0.1,
+            }
+        )
+    )
+    merged = merge_reports(tmp_path, "cuda", "success", "repo", "sha")
+    assert merged["flagcicd"]["complete"] is False
+    assert merged["flagcicd"]["incomplete_sessions"] == ["acceptance.json"]
+
+
 def test_timeout_is_not_success_and_unstarted_groups_remain_visible(tmp_path):
     groups = [
         {
@@ -380,6 +402,7 @@ def test_execution_modes_default_shared_groups_and_isolate_sensitive_groups():
             "L3",
         ):
             assert case["resources"]["min_accelerators"] == 1, case_id
+            assert case["resources"].get("shared") is True, case_id
 
 
 @pytest.mark.parametrize(
@@ -410,6 +433,24 @@ def test_invalid_case_requirements_fail_before_dispatch(tmp_path, field, value):
         policy(tmp_path)
 
 
+def test_l2_l3_case_requires_explicit_execution_mode(tmp_path):
+    doc = policy()
+    doc["cases"]["factory_ops"].pop("execution")
+    (tmp_path / ".flagcicd").mkdir()
+    (tmp_path / ".flagcicd/test-tiers.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="must declare an execution mode"):
+        policy(tmp_path)
+
+
+def test_parallel_case_requires_declared_shared_resource(tmp_path):
+    doc = policy()
+    doc["cases"]["factory_ops"]["resources"].pop("shared")
+    (tmp_path / ".flagcicd").mkdir()
+    (tmp_path / ".flagcicd/test-tiers.json").write_text(json.dumps(doc))
+    with pytest.raises(ValueError, match="resources.shared=true"):
+        policy(tmp_path)
+
+
 @pytest.mark.parametrize(
     "platform", sorted(p.stem for p in (ROOT / ".github/configs").glob("*.yml"))
 )
@@ -437,7 +478,9 @@ def test_case_metadata_does_not_rewrite_existing_l2_commands(platform):
         for g in expected
     ]
     assert all(
-        g["requires"] == ["accelerator"] and g["resources"]["min_accelerators"] == 1
+        g["requires"] == ["accelerator"]
+        and g["resources"]["min_accelerators"] == 1
+        and (g["execution"] != "parallel" or g["resources"].get("shared") is True)
         for g in selected
     )
     assert all(

@@ -257,7 +257,7 @@ def run_command(command, test_environment, workdir, output_prefix="", output_loc
             # output is written untouched.
             with output_lock or contextlib.nullcontext():
                 sys.stdout.write(output_prefix + line)
-                if output_lock:
+                if output_lock or output_prefix:
                     sys.stdout.flush()
             lines.append(line)
         sys.stdout.flush()
@@ -268,6 +268,12 @@ def run_command(command, test_environment, workdir, output_prefix="", output_loc
         kill_process_group(process)
         process.wait()
         raise
+    except (OSError, ValueError):
+        # The timeout/cancellation path closes the parent's pipe explicitly;
+        # a descendant that escaped with setsid() must not keep this reader
+        # waiting for EOF.  The process return code still determines the
+        # group's verdict below.
+        returncode = process.wait()
     finally:
         timer.cancel()
         with _ACTIVE_LOCK:
@@ -276,16 +282,78 @@ def run_command(command, test_environment, workdir, output_prefix="", output_loc
 
 
 def kill_process_group(process):
+    descendants = set(descendant_pids(process.pid))
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
+    # A vendor launcher can call setsid() and leave the process group.  Kill
+    # the descendants captured on both sides of the group kill as well,
+    # otherwise one escaped child can keep the report pipe open after timeout.
+    descendants.update(descendant_pids(process.pid))
+    for pid in descendants:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    stream = process.stdout
+    if stream and not stream.closed:
+        stream.close()
+
+
+def descendant_pids(root_pid):
+    """Return descendants using procfs, with a portable ps fallback."""
+    children = {}
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for task in proc_root.glob("*/task/*/children"):
+            try:
+                parent = int(task.parts[2])
+                values = task.read_text().split()
+                children.setdefault(parent, []).extend(int(value) for value in values)
+            except (OSError, ValueError):
+                continue
+    else:
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid=,ppid="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            result = None
+        if result and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) == 2:
+                    try:
+                        children.setdefault(int(fields[1]), []).append(int(fields[0]))
+                    except ValueError:
+                        continue
+    found = []
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.append(pid)
+        pending.extend(children.get(pid, ()))
+    return found
 
 
 def kill_active_processes():
     """Stop every running group command and refuse to start new ones."""
     with _ACTIVE_LOCK:
         _CANCELLED.set()
+        processes = list(_ACTIVE_PROCESSES)
+    for process in processes:
+        kill_process_group(process)
+
+
+def cancel_batch_processes():
+    """Stop only the commands in the failed shared batch."""
+    with _ACTIVE_LOCK:
         processes = list(_ACTIVE_PROCESSES)
     for process in processes:
         kill_process_group(process)
@@ -305,13 +373,14 @@ def execution_mode(test):
 
 
 def shareable(test):
-    """Only declared single-accelerator L2/L3 groups may run side by side."""
+    """Only explicitly shared single-accelerator L2/L3 groups may overlap."""
     resources = test.get("resources")
     return (
         execution_mode(test) == "parallel"
         and test.get("level") in ("L2", "L3")
         and isinstance(resources, dict)
         and resources.get("min_accelerators") == 1
+        and resources.get("shared") is True
     )
 
 
@@ -339,13 +408,15 @@ def execution_plan(tests):
 
 
 def run_batch(indexes, workers, run_group):
-    """Run one shared batch; return the first failure in manifest order.
+    """Run one shared batch and return the first observed failure.
 
-    A failure stops further groups of the batch from starting, while groups
-    already running finish so their evidence is complete. Ctrl-C/cancellation
-    kills every running group before re-raising.
+    A failure stops further groups of the batch from starting and terminates
+    commands already running in that batch. Their terminal records remain in
+    the ledger, while groups that have not started are recorded as ``not_run``.
+    Ctrl-C/cancellation kills every running group before re-raising.
     """
     failures = {}
+    first_failure = None
     stop = threading.Event()
 
     def guarded(index):
@@ -354,6 +425,7 @@ def run_batch(indexes, workers, run_group):
         status = run_group(index)
         if status is not None:
             stop.set()
+            cancel_batch_processes()
         return status
 
     executor = ThreadPoolExecutor(max_workers=min(workers, len(indexes)))
@@ -363,19 +435,30 @@ def run_batch(indexes, workers, run_group):
             status = future.result()
             if status is not None:
                 failures[futures[future]] = status
+                # A sibling killed by fail-fast reports SIGKILL.  Do not let
+                # that cancellation mask the group that caused the batch to
+                # stop if its future completes first.
+                if first_failure is None or (
+                    first_failure == -signal.SIGKILL and status != -signal.SIGKILL
+                ):
+                    first_failure = status
     except BaseException:
         stop.set()
         kill_active_processes()
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     executor.shutdown(wait=True)
-    return failures[min(failures)] if failures else None
+    return first_failure
 
 
 def resource_block(test, environment):
     """Check recorded hardware before running a group; never skip it as a pass."""
     if test.get("blocked_reason"):
         return test["blocked_reason"]
+    if "metrics_directory" in test.get("requires", []):
+        metrics = environment.get("FLAGCICD_METRICS_DIR", "")
+        if not metrics or not Path(metrics).is_dir():
+            return "metrics directory is unavailable: FLAGCICD_METRICS_DIR"
     resources = test.get("resources")
     if resources is None:
         return ""
@@ -391,6 +474,14 @@ def resource_block(test, environment):
         count = hardware["accelerator_count"]
         if type(count) is not int or count < 0:
             raise ValueError("invalid accelerator count")
+        if "primary_device" in test.get("requires", []):
+            current = hardware.get("current_device")
+            if type(current) is not int:
+                raise ValueError("current device evidence is unavailable")
+            if current != 0:
+                return (
+                    f"requires primary device 0; recorded current device is {current}"
+                )
     except (KeyError, OSError, ValueError, TypeError) as error:
         return f"hardware resource evidence is unavailable: {error}"
     if count < minimum:
@@ -484,7 +575,9 @@ def execute_group(
             test["command"],
             test_environment,
             workdir,
-            output_prefix=f"[{test['name']}] " if output_lock else "",
+            output_prefix=(
+                f"[{test['name']}] " if output_lock or test.get("stream_output") else ""
+            ),
             output_lock=output_lock,
         )
     except (OSError, SystemExit) as error:

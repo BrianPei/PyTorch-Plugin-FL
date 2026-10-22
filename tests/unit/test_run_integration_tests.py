@@ -270,6 +270,88 @@ def test_resource_requirements_use_recorded_hardware_and_keep_a_ledger(
     assert ledger["complete"] is (not blocked)
 
 
+def test_acceptance_requirements_need_metrics_and_primary_device_evidence(
+    monkeypatch, tmp_path
+):
+    reports = _reports(monkeypatch, tmp_path)
+    environment = {
+        "FLAGCICD_REPORT_DIR": str(reports),
+        "FLAGCICD_METRICS_DIR": str(tmp_path / "missing-metrics"),
+    }
+    metrics_group = _group("performance", "true", execution="exclusive")
+    metrics_group["requires"] = ["accelerator", "metrics_directory"]
+    assert "metrics directory is unavailable" in _RUNNER.resource_block(
+        metrics_group, environment
+    )
+
+    primary_group = _group("models", "true", execution="exclusive")
+    primary_group["requires"] = ["accelerator", "primary_device"]
+    (reports / "hardware-cuda.json").write_text(
+        json.dumps({"accelerator_count": 1, "current_device": 1})
+    )
+    assert "primary device 0" in _RUNNER.resource_block(primary_group, environment)
+
+
+def test_timeout_kills_a_setsid_grandchild(tmp_path):
+    """An escaped launcher child must not survive the group timeout."""
+    process_tree_available = Path("/proc").is_dir()
+    if not process_tree_available:
+        try:
+            process_tree_available = (
+                subprocess.run(
+                    ["ps", "-eo", "pid=,ppid="],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).returncode
+                == 0
+            )
+        except OSError:
+            process_tree_available = False
+    if not process_tree_available:
+        pytest.skip("the host does not expose a process-tree inspection API")
+    child = tmp_path / "child.py"
+    marker = tmp_path / "escaped-child-survived"
+    child.write_text(
+        "import pathlib, time\n"
+        "time.sleep(0.5)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('survived')\n"
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, sys.argv[1]], start_new_session=True)\n"
+        "time.sleep(30)\n"
+    )
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "hardware-cuda.json").write_text(
+        json.dumps({"accelerator_count": 1, "current_device": 0})
+    )
+    group = _group(
+        "escaped-launcher",
+        f"{sys.executable} {parent} {child}",
+        execution="exclusive",
+    )
+    group["timeout_seconds"] = 0.1
+    env = {
+        **os.environ,
+        "INTEGRATION_TESTS": json.dumps([group]),
+        "INTEGRATION_WORKDIR": str(tmp_path),
+        "FLAGCICD_REPORT_DIR": str(reports),
+    }
+    result = subprocess.run(
+        [sys.executable, str(_RUNNER_PATH)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 124
+    time.sleep(0.8)
+    assert not marker.exists()
+
+
 def test_declared_parallel_groups_start_together_and_keep_ledger_order(
     monkeypatch, tmp_path
 ):
@@ -287,7 +369,7 @@ def test_declared_parallel_groups_start_together_and_keep_ledger_order(
             "platform": "cuda",
             "level": "L2",
             "execution": "parallel",
-            "resources": {"min_accelerators": 1},
+            "resources": {"min_accelerators": 1, "shared": True},
         },
         {
             "name": "second shared group",
@@ -299,7 +381,7 @@ def test_declared_parallel_groups_start_together_and_keep_ledger_order(
             "platform": "cuda",
             "level": "L2",
             "execution": "parallel",
-            "resources": {"min_accelerators": 1},
+            "resources": {"min_accelerators": 1, "shared": True},
         },
     ]
     monkeypatch.setenv("FLAGCICD_REPORT_DIR", str(reports))
@@ -323,7 +405,7 @@ def _reports(monkeypatch, tmp_path, accelerators=1):
     reports = tmp_path / "reports"
     reports.mkdir()
     (reports / "hardware-cuda.json").write_text(
-        json.dumps({"accelerator_count": accelerators})
+        json.dumps({"accelerator_count": accelerators, "current_device": 0})
     )
     monkeypatch.setenv("FLAGCICD_REPORT_DIR", str(reports))
     return reports
@@ -336,7 +418,10 @@ def _group(name, command, level="L2", execution="parallel", minimum=1):
         "platform": "cuda",
         "level": level,
         "execution": execution,
-        "resources": {"min_accelerators": minimum},
+        "resources": {
+            "min_accelerators": minimum,
+            **({"shared": True} if execution == "parallel" else {}),
+        },
     }
 
 
@@ -385,7 +470,7 @@ def test_worker_bound_limits_concurrent_shared_groups(monkeypatch, tmp_path):
     assert all((tmp_path / f"{name}.done").exists() for name in "abc")
 
 
-def test_shared_failure_keeps_running_evidence_and_blocks_later_groups(
+def test_shared_failure_cancels_inflight_groups_and_blocks_later_groups(
     monkeypatch, tmp_path, capfd
 ):
     reports = _reports(monkeypatch, tmp_path)
@@ -410,15 +495,16 @@ def test_shared_failure_keeps_running_evidence_and_blocks_later_groups(
         _run_main(monkeypatch, tmp_path, tests)
 
     assert error.value.code == 7
-    # The group already running finishes; nothing new starts after a failure.
-    assert (tmp_path / "slow.done").exists()
+    # The sibling is terminated as soon as the first failure is observed;
+    # nothing new starts after that failure.
+    assert not (tmp_path / "slow.done").exists()
     for name in ("queued", "isolated", "later"):
         assert not (tmp_path / f"{name}.ran").exists()
     ledger = json.loads((reports / "groups.json").read_text())
     assert ledger["complete"] is False
     assert [group["name"] for group in ledger["groups"]] == ledger["expected"]
     assert [group["status"] for group in ledger["groups"]] == [
-        "passed",
+        "failed",
         "failed",
         "not_run",
         "not_run",
@@ -479,5 +565,5 @@ def test_blocked_shared_group_is_recorded_without_a_pass(monkeypatch, tmp_path):
     ledger = json.loads((reports / "groups.json").read_text())
     statuses = {group["name"]: group["status"] for group in ledger["groups"]}
     assert statuses["blocked"] == "blocked"
-    assert statuses["one-card"] in ("passed", "not_run")
+    assert statuses["one-card"] in ("failed", "passed", "not_run")
     assert ledger["complete"] is False
