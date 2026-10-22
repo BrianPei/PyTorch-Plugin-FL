@@ -26,7 +26,11 @@ environments), but the pin wiring is fully visible in their source.
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
+from email.parser import Parser
 from functools import lru_cache
 from pathlib import Path
 
@@ -207,15 +211,130 @@ def test_flag_gems_is_declared_everywhere_at_the_pinned_version():
         assert f"flag_gems=={version}" in _declared(platform), platform
 
 
-def test_flagcx_is_declared_exactly_where_the_pin_file_has_a_version():
+def test_flagcx_is_required_on_pinned_vendors_except_cuda():
     pins = _pins()
     for platform in _platforms_in_the_table():
         declared = [r for r in _declared(platform) if r.startswith("flagcx")]
         version = pins.get(f"FLAGCX_VERSION_{platform}")
-        if version:
+        if version and platform != "cuda":
             assert declared == [f"flagcx=={version}"], platform
         else:
             assert declared == [], platform
+
+
+def test_cuda_communication_extra_uses_the_pinned_flagcx():
+    text = (REPO_ROOT / "pyproject.toml").read_text()
+    extra = re.search(r'^cuda-comm = \["([^"]+)"\]', text, re.M)
+    assert extra is not None
+    assert extra.group(1) == f"flagcx=={_pins()['FLAGCX_VERSION_cuda']}"
+
+
+def test_cuda_package_metadata_and_pip_check_allow_no_flagcx(tmp_path):
+    """Validate actual setuptools metadata and pip's optional-dependency rules."""
+    from packaging.requirements import Requirement
+
+    output = tmp_path / "metadata"
+    output.mkdir()
+    done = subprocess.run(
+        [sys.executable, "setup.py", "egg_info", "--egg-base", str(output)],
+        cwd=REPO_ROOT,
+        env={**os.environ, "FLAGOS_ACCELERATOR": "cuda"},
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    metadata_path = next(output.glob("*.egg-info/PKG-INFO"))
+    metadata_text = metadata_path.read_text()
+    metadata = Parser().parsestr(metadata_text)
+    requirements = [Requirement(raw) for raw in metadata.get_all("Requires-Dist", [])]
+    flagcx = [req for req in requirements if req.name == "flagcx"]
+    assert len(flagcx) == 1
+    assert not flagcx[0].marker.evaluate({"extra": ""})
+    assert flagcx[0].marker.evaluate({"extra": "cuda-comm"})
+    assert str(flagcx[0].specifier) == f"=={_pins()['FLAGCX_VERSION_cuda']}"
+    assert "cuda-comm" in metadata.get_all("Provides-Extra", [])
+
+    # A metadata-only installation needs no native runtime or network. Hide the
+    # host's distributions from pip check so only this synthetic environment is
+    # inspected; optional FlagCX is deliberately absent.
+    site = tmp_path / "site"
+    site.mkdir()
+    package = site / "torch_fl-2.10.0.dist-info"
+    package.mkdir()
+    (package / "METADATA").write_text(metadata_text)
+    required = [req for req in requirements if not req.marker or req.marker.evaluate()]
+    for req in required:
+        version = next(
+            (s.version for s in req.specifier if s.operator in ("==", ">=")), "99.0"
+        )
+        dependency = site / f"{req.name.replace('-', '_')}-{version}.dist-info"
+        dependency.mkdir()
+        (dependency / "METADATA").write_text(
+            f"Metadata-Version: 2.3\nName: {req.name}\nVersion: {version}\n"
+        )
+    check = (
+        "import sys; import pip._internal.cli.main; "
+        "sys.path[:] = [sys.argv[1]] + "
+        "[p for p in sys.path if 'site-packages' not in p and 'dist-packages' not in p]; "
+        "raise SystemExit(pip._internal.cli.main.main(['check']))"
+    )
+    checked = subprocess.run(
+        [sys.executable, "-c", check, str(site)], capture_output=True, text=True
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    dependency_metadata = next(site.glob("flagtree-*.dist-info/METADATA"))
+    dependency_metadata.unlink()
+    rejected = subprocess.run(
+        [sys.executable, "-c", check, str(site)], capture_output=True, text=True
+    )
+    assert rejected.returncode != 0
+    assert "requires flagtree" in rejected.stdout
+
+
+@pytest.mark.parametrize(
+    ("enabled", "cuda_version", "expected_code"),
+    [("0", "13.0.88", 0), ("0", "13.3.0", 0), ("1", "13.3.0", 0), ("1", "13.0.88", 1)],
+)
+def test_cuda_flagcx_provisioning_requires_explicit_compatible_opt_in(
+    enabled, cuda_version, expected_code, tmp_path
+):
+    hook = (HOOKS_DIR / "set_env_cuda.sh").read_text()
+    branch = hook.split("# CUDA functional CI", 1)[1].split(
+        "# Install the published FlagGems wheel", 1
+    )[0]
+    branch = "# CUDA functional CI" + branch
+    script = (
+        'set -euo pipefail\nsource "$1"\npip_retry() { printf "INSTALL %s\\n" "$*"; }\n'
+        + branch
+        + "\nexport_ci_env FLAGCX_TORCH_BACKEND\n"
+        + '\nprintf "AUTOLOAD=%s TLE=%s\\n" "${TORCH_DEVICE_BACKEND_AUTOLOAD:-}" "${USE_TLE_DIST:-}"\n'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "cuda-test", str(SCRIPTS_DIR / "lib/set_env_common.sh")],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "TORCH_FL_CUDA_FLAGCX_WHEEL": enabled,
+            "CUDA_VERSION": cuda_version,
+            "VENV_PYTHON": sys.executable,
+            "FLAGGEMS_INDEX_URL": "https://example.invalid/simple",
+            "FLAGCX_VERSION": _pins()["FLAGCX_VERSION_cuda"],
+            "GITHUB_ENV": str(tmp_path / "github-env"),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == expected_code, result.stdout + result.stderr
+    if enabled == "0":
+        assert "INSTALL" not in result.stdout
+        assert "FlagCX communication is not validated" in result.stdout
+        assert "TLE=0" in result.stdout
+        assert (tmp_path / "github-env").read_text() == "FLAGCX_TORCH_BACKEND=vendor\n"
+    elif expected_code == 0:
+        assert f"flagcx==={_pins()['FLAGCX_VERSION_cuda']}" in result.stdout
+        assert "AUTOLOAD=0" in result.stdout
+    else:
+        assert "INSTALL" not in result.stdout
+        assert "CUDA 13.3" in result.stderr
 
 
 def test_triton_is_declared_only_where_no_flagtree_build_is_pinned():

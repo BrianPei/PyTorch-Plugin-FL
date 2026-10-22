@@ -209,6 +209,21 @@ def test_build_env_checks_actual_distributions(manifest, monkeypatch):
     assert any("flagcx build version is" in error for error in errors)
 
 
+def test_functional_cuda_manifest_allows_missing_optional_flagcx(manifest, monkeypatch):
+    manifest["build"]["distributions"]["flagcx"] = None
+    versions = {**manifest["build"]["distributions"], "packaging": "26.0"}
+    monkeypatch.setattr(preflight, "installed_version", versions.get)
+    errors, _ = preflight.check_environment(
+        manifest, check_installed=True, check_build_env=True, strict_tested=True
+    )
+    assert errors == []
+    versions["flag_gems"] = None
+    errors, _ = preflight.check_environment(
+        manifest, check_installed=True, check_build_env=True, strict_tested=True
+    )
+    assert any("flag_gems" in error for error in errors)
+
+
 def test_runtime_uses_declared_ranges_and_warns_on_unverified_abi(
     manifest, monkeypatch
 ):

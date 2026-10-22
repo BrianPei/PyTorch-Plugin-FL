@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 
-def test_installed_candidate_and_dependencies():
+def test_installed_candidate_and_dependencies(record_property):
     import torch_fl
     import torch
 
@@ -33,7 +33,11 @@ def test_installed_candidate_and_dependencies():
     )
     record = package.parent / "compatibility.json"
     assert record.is_file(), "installed wheel has no compatibility record"
-    assert json.loads(record.read_text())
+    compatibility = json.loads(record.read_text())
+    assert compatibility
+    if compatibility.get("platform") == "cuda":
+        record_property("flagcx_communication", "not_validated")
+        print("CUDA functional scope: FlagCX communication is not validated")
     assert importlib.metadata.version("torch_fl")
     assert torch.__version__
     subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=120)

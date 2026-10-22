@@ -1293,6 +1293,8 @@ _CUDA_RUNTIME_DEPS = [
 # every import in the Python layer is guarded -- but the result is a flagos device
 # that routes no operator and a distributed path staged through the host, so the
 # wheel declares the exact versions it was built and measured against.
+# CUDA keeps FlagCX in the explicit cuda-comm extra because its base functional
+# workloads do not exercise collective communication.
 #
 # The versions come from .github/version-pins.env, the file the CI setup scripts
 # source, rather than a second copy here. Two things that file settles and a
@@ -1395,9 +1397,11 @@ def _flagos_sibling_requires() -> list:
         raise RuntimeError(f"{VERSION_PINS} defines no FLAGGEMS_VERSION_DEFAULT")
     reqs.append(f"flag_gems=={flag_gems}")
     flagcx = pins.get(f"FLAGCX_VERSION_{FLAGOS_ACCELERATOR}")
-    if flagcx:
+    if flagcx and FLAGOS_ACCELERATOR != "cuda":
         # Only the platforms whose vendor runtime FlagCX has a build for. The
         # others fall back to the NCCL-shaped path, so there is nothing to pin.
+        # CUDA functional workloads do not require collective communication;
+        # its pinned FlagCX dependency is opt-in via the cuda-comm extra.
         reqs.append(f"flagcx=={flagcx}")
     return reqs
 

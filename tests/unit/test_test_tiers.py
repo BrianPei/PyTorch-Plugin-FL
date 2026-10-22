@@ -559,7 +559,52 @@ def test_acceptance_initializes_backend_before_torch(monkeypatch, tmp_path, file
     with pytest.raises(
         RuntimeError, match="torch reached after backend initialization"
     ):
-        target()
+        if filename == "test_installed_contract.py":
+            target(lambda *args: None)
+        else:
+            target()
+
+
+def test_cuda_installed_acceptance_reports_scope_and_keeps_dependency_checks(
+    monkeypatch, tmp_path
+):
+    import sys
+    import types
+
+    spec = importlib.util.spec_from_file_location(
+        "installed_acceptance", ROOT / "tests/acceptance/test_installed_contract.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    package = tmp_path / "installed/torch_fl"
+    package.mkdir(parents=True)
+    (package / "compatibility.json").write_text('{"platform": "cuda"}')
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_fl",
+        types.SimpleNamespace(__file__=str(package / "__init__.py")),
+    )
+    monkeypatch.setitem(
+        sys.modules, "torch", types.SimpleNamespace(__version__="2.10.0")
+    )
+    monkeypatch.setattr(module.importlib.metadata, "version", lambda _: "2.10.0")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "checkout"))
+    monkeypatch.setenv("FLAGCICD_PROFILE", "pr-risk")
+    commands = []
+    monkeypatch.setattr(
+        module.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd)
+    )
+    properties = {}
+    module.test_installed_candidate_and_dependencies(properties.__setitem__)
+    assert properties == {"flagcx_communication": "not_validated"}
+    assert commands[0] == [sys.executable, "-m", "pip", "check"]
+    assert commands[1] == [
+        "torch-fl-preflight",
+        "--installed",
+        "--check-installed",
+        "--check-build-env",
+        "--strict-tested",
+    ]
 
 
 def test_performance_uses_published_device_properties_and_writes_evidence(

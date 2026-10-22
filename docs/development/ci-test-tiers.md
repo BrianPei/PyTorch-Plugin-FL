@@ -7,6 +7,14 @@ test command inventory. Common workflows do not select chips in shell code.
 
 ## Profiles and scheduling
 
+CUDA functional jobs do not require the optional `cuda-comm` extra. Installed
+acceptance still checks base dependency integrity and native loading, and
+records FlagCX communication as `not_validated`. Multi-device placement tests
+do not imply collective-communication acceptance. The CUDA setup hook requires
+explicit `TORCH_FL_CUDA_FLAGCX_WHEEL=1` provisioning in a matching environment;
+FlagCX communication must be validated by separate communication workloads.
+Other vendors keep their current dependency requirements.
+
 | Profile | Trigger | Selection |
 | --- | --- | --- |
 | `pr` | PR or push | Fixed L0/L1, then L2 on affected PR platforms or all push platforms |
