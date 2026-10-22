@@ -6,7 +6,7 @@
       "owner": "Torch-FL CI maintainers",
       "reason": "Installed candidate tier acceptance.",
       "entrypoints": [
-        ".github/scripts/test_tiers.py"
+        ".flagcicd/release-acceptance.json"
       ],
       "selector": "tests/acceptance/test_endurance.py"
     },
@@ -15,7 +15,7 @@
       "owner": "Torch-FL CI maintainers",
       "reason": "Installed candidate tier acceptance.",
       "entrypoints": [
-        ".github/scripts/test_tiers.py"
+        ".flagcicd/release-acceptance.json"
       ],
       "selector": "tests/acceptance/test_installed_contract.py"
     },
@@ -24,7 +24,7 @@
       "owner": "Torch-FL CI maintainers",
       "reason": "Installed candidate tier acceptance.",
       "entrypoints": [
-        ".github/scripts/test_tiers.py"
+        ".flagcicd/release-acceptance.json"
       ],
       "selector": "tests/acceptance/test_lifecycle.py"
     },
@@ -33,7 +33,7 @@
       "owner": "Torch-FL CI maintainers",
       "reason": "Installed candidate tier acceptance.",
       "entrypoints": [
-        ".github/scripts/test_tiers.py"
+        ".flagcicd/release-acceptance.json"
       ],
       "selector": "tests/acceptance/test_models.py"
     },
@@ -42,7 +42,7 @@
       "owner": "Torch-FL CI maintainers",
       "reason": "Fixed workload performance samples and approved release threshold.",
       "entrypoints": [
-        ".github/scripts/test_tiers.py"
+        ".flagcicd/release-acceptance.json"
       ],
       "selector": "tests/acceptance/test_performance.py"
     },
@@ -1501,6 +1501,15 @@
       ],
       "selector": "tests/unit/test_conf_registration_consistency.py"
     },
+    "tests/unit/test_contract_consistency.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Project contract, workflow catalog and run gate must agree.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_contract_consistency.py"
+    },
     "tests/unit/test_cuda_alias_guard.py": {
       "lane": "L3",
       "owner": "Torch-FL CI maintainers",
@@ -1626,6 +1635,15 @@
         ".github/workflows/agnostic-checks.yml"
       ],
       "selector": "tests/unit/test_env_registry.py"
+    },
+    "tests/unit/test_flagcicd_compat.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Replays the recorded adapter output so data moves cannot change decisions.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_flagcicd_compat.py"
     },
     "tests/unit/test_flagcicd_coverage.py": {
       "lane": "L1",

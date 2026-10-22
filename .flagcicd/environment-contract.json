@@ -1,0 +1,23 @@
+{
+  "schema_version": "flagcicd.environment/v1",
+  "source": "environment_check and recorded hardware identity",
+  "requirement_rules": {
+    "model_directory": {
+      "path": "model_dir",
+      "condition": "is_true",
+      "reason": "model directory is not declared by environment_check.model_dir"
+    }
+  },
+  "device_bounds": {
+    "path": "flagos_devices",
+    "exact_key": "exactly",
+    "reason": "requires {minimum} accelerators; environment declares exactly {exact}"
+  },
+  "command_substitutions": {
+    "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1": "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
+  },
+  "forced_environment": {
+    "INTEGRATION_ALLOW_TEARDOWN_CRASH": "0",
+    "UNIT_TESTS_ALLOW_TEARDOWN_CRASH": "0"
+  }
+}

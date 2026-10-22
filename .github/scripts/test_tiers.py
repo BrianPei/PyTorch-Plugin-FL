@@ -30,6 +30,93 @@ REQUIREMENTS = {
     "primary_device",
 }
 EXECUTION_MODES = {"parallel", "exclusive"}
+# The adapter files this module reads.  Kept here because the module is stdlib only
+# and cannot parse the YAML contract that documents the same paths; a contract test
+# keeps the two in step.
+ADAPTER = {
+    "tiers": ".flagcicd/test-tiers.json",
+    "environment": ".flagcicd/environment-contract.json",
+    "acceptance": ".flagcicd/release-acceptance.json",
+    "inventory": ".flagcicd/test-inventory.json",
+}
+
+
+def _adapter(root, name):
+    return Path(root) / ADAPTER[name]
+
+
+def environment_contract(root=ROOT):
+    """Read the resource rules a repository answers with its own platform config."""
+    document = json.loads(_adapter(root, "environment").read_text())
+    if document.get("schema_version") != "flagcicd.environment/v1":
+        raise ValueError("unsupported environment contract schema")
+    if not isinstance(document.get("source"), str) or not document["source"].strip():
+        raise ValueError("environment contract has no evidence source")
+    rules = document.get("requirement_rules")
+    if not isinstance(rules, dict) or any(
+        name not in REQUIREMENTS
+        or not isinstance(rule, dict)
+        or not isinstance(rule.get("path"), str)
+        or rule.get("condition") != "is_true"
+        or not isinstance(rule.get("reason"), str)
+        for name, rule in rules.items()
+    ):
+        raise ValueError("invalid environment requirement rules")
+    bounds = document.get("device_bounds")
+    if (
+        not isinstance(bounds, dict)
+        or not isinstance(bounds.get("path"), str)
+        or not isinstance(bounds.get("exact_key"), str)
+        or not isinstance(bounds.get("reason"), str)
+    ):
+        raise ValueError("invalid environment device bounds")
+    substitutions = document.get("command_substitutions")
+    if not isinstance(substitutions, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in substitutions.items()
+    ):
+        raise ValueError("invalid environment command substitutions")
+    forced = document.get("forced_environment")
+    if not isinstance(forced, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in forced.items()
+    ):
+        raise ValueError("invalid forced environment")
+    return document
+
+
+def acceptance_policy(root=ROOT):
+    """Read the acceptance tests this repository adds above the manifest."""
+    document = json.loads(_adapter(root, "acceptance").read_text())
+    if document.get("schema_version") != "flagcicd.acceptance/v1":
+        raise ValueError("unsupported acceptance schema")
+    extras = document.get("extras")
+    if not isinstance(extras, list) or not extras:
+        raise ValueError("acceptance contract has no extras")
+    for entry in extras:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("id"), str)
+            or not isinstance(entry.get("path"), str)
+            or entry.get("when_level") not in (*LEVELS, None)
+            or not isinstance(entry.get("path"), str)
+            or not entry["path"].strip()
+        ):
+            raise ValueError(f"invalid acceptance extra: {entry}")
+    return document
+
+
+def risk_patterns(root=ROOT):
+    """Read the changed paths that make a diff risk bearing."""
+    document = json.loads(_adapter(root, "tiers").read_text())
+    patterns = document.get("risk_profile", {}).get("patterns")
+    if (
+        not isinstance(patterns, list)
+        or not patterns
+        or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+    ):
+        raise ValueError("invalid risk profile patterns")
+    return patterns
 
 
 def policy(root=ROOT):
@@ -95,31 +182,40 @@ def exclusion_reason(case_id, case, profile, document, platform=None):
     return ""
 
 
-def requirement_evidence(case, config):
-    """Use the existing environment contract, without inventing device support."""
+def requirement_evidence(case, config, contract=None):
+    """Use the repository's environment contract, without inventing device support."""
+    contract = environment_contract() if contract is None else contract
     environment = config.get("environment_check", {})
     blocked = []
-    if (
-        "model_directory" in case["requires"]
-        and environment.get("model_dir") is not True
-    ):
-        blocked.append("model directory is not declared by environment_check.model_dir")
-    bounds = environment.get("flagos_devices", {})
+    for requirement in case["requires"]:
+        rule = contract["requirement_rules"].get(requirement)
+        if rule is not None and environment.get(rule["path"]) is not True:
+            blocked.append(rule["reason"])
+    bounds = environment.get(contract["device_bounds"]["path"], {})
     minimum = case["resources"]["min_accelerators"]
-    exact = bounds.get("exactly")
+    exact = bounds.get(contract["device_bounds"]["exact_key"])
     if type(exact) is int and exact < minimum:
         blocked.append(
-            f"requires {minimum} accelerators; environment declares exactly {exact}"
+            contract["device_bounds"]["reason"].format(minimum=minimum, exact=exact)
         )
     return {
         "status": "blocked" if blocked else "requires_runtime_verification",
         "reasons": blocked,
-        "source": "environment_check and recorded hardware identity",
+        "source": contract["source"],
     }
 
 
-def select(groups, ids, profile, platform, document):
+def _lookup(document, path):
+    value = document
+    for name in path.split("."):
+        value = value[name]
+    return value
+
+
+def select(groups, ids, profile, platform, document, acceptance=None, contract=None):
     """Classify every group before filtering; unknown groups are errors."""
+    contract = environment_contract() if contract is None else contract
+    acceptance = acceptance_policy() if acceptance is None else acceptance
     selected = []
     definition = document["profiles"][profile]
     if profile == "release" and platform not in document["release"]["model_platforms"]:
@@ -140,33 +236,32 @@ def select(groups, ids, profile, platform, document):
         # Unclassified cases are isolated by default.  Shared execution must
         # be an explicit policy decision validated above.
         item["execution"] = case.get("execution", "exclusive")
-        item["command"] = item["command"].replace(
-            "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1", "UNIT_TESTS_ALLOW_TEARDOWN_CRASH=0"
-        )
+        for original, replacement in contract["command_substitutions"].items():
+            item["command"] = item["command"].replace(original, replacement)
         # No profile may silently turn a process crash into a passing test.
         item["environment"] = {
             **item.get("environment", {}),
-            "INTEGRATION_ALLOW_TEARDOWN_CRASH": "0",
-            "UNIT_TESTS_ALLOW_TEARDOWN_CRASH": "0",
+            **contract["forced_environment"],
         }
         selected.append(item)
-    extras = [
-        ("l3_installed_contract", "tests/acceptance/test_installed_contract.py"),
-        ("l3_lifecycle", "tests/acceptance/test_lifecycle.py"),
-        ("l3_performance", "tests/acceptance/test_performance.py"),
-    ]
-    if definition["max_level"] == "L4":
-        extras.append(("l4_endurance", "tests/acceptance/test_endurance.py"))
-        if platform in document["release"]["model_platforms"]:
-            extras.append(("l4_models", "tests/acceptance/test_models.py"))
-    for case_id, path in extras:
+    for extra in acceptance["extras"]:
+        case_id = extra["id"]
         case = document["cases"][case_id]
+        if (
+            extra.get("when_level")
+            and LEVELS[definition["max_level"]] < LEVELS[extra["when_level"]]
+        ):
+            continue
+        if "platforms_source" in extra and platform not in _lookup(
+            document, extra["platforms_source"]
+        ):
+            continue
         if not exclusion_reason(case_id, case, profile, document, platform):
             selected.append(
                 {
                     "id": case_id,
                     "name": case_id,
-                    "command": f"python -m pytest {path} -v --tb=short",
+                    "command": f"python -m pytest {extra['path']} -v --tb=short",
                     "platform": platform,
                     "min_passed": 1,
                     "selection_reason": f"profile:{profile}",
@@ -193,22 +288,8 @@ def select(groups, ids, profile, platform, document):
     return selected
 
 
-def risk_profile(changed):
-    patterns = (
-        "csrc/*",
-        "cmake/*",
-        "torch_fl/*",
-        "setup.py",
-        "requirements*",
-        "constraints*",
-        ".github/version-pins.env",
-        ".github/constraints.txt",
-        "scripts/tools/torch-fl-preflight",
-        ".github/scripts/hooks/*",
-        ".github/configs/*",
-        ".flagcicd/*",
-        "tests/acceptance/*",
-    )
+def risk_profile(changed, root=ROOT):
+    patterns = risk_patterns(root)
     return (
         "pr-risk"
         if changed is None

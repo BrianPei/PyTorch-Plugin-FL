@@ -155,3 +155,10 @@ jobs:
 
       - name: Check tier policy and inventory regressions
         run: python -m pytest tests/unit/test_test_tiers.py -v --tb=short -p no:cacheprovider
+
+      - name: Check the project contract against the workflows it names
+        run: |
+          python -m pytest \
+            tests/unit/test_contract_consistency.py \
+            tests/unit/test_flagcicd_compat.py \
+            -v --tb=short -p no:cacheprovider

@@ -3,30 +3,93 @@ repository: Torch-FL
 entry_workflow: .github/workflows/flagcicd-entry.yml
 platform_config_glob: .github/configs/*.yml
 
+# Everything a repository decides for itself lives behind these paths.  The core
+# reads the paths, never a Torch-FL file name.
+adapter:
+  tiers: .flagcicd/test-tiers.json
+  environment: .flagcicd/environment-contract.json
+  acceptance: .flagcicd/release-acceptance.json
+  inventory: .flagcicd/test-inventory.json
+  manifest: .github/integration-manifest.yml
+
+# Every gate the entry workflow can run.  `job` is the job inside `workflow`;
+# `entry_job` is the name the run summary reports it under.  `levels` are the plan
+# levels at which the gate must succeed.  `tests/unit/test_contract_consistency.py`
+# keeps this catalog, the workflows and the run summary from drifting apart.
+checks:
+  request:
+    workflow: .github/workflows/flagcicd-entry.yml
+    job: plan
+    entry_job: plan
+    levels: [L0, L1, L2, L3]
+    description: Resolve the request into a plan and expected platforms.
+  platform-config:
+    workflow: .github/workflows/load-platform-config.yml
+    job: configuration
+    entry_job: preflight
+    levels: [L0, L1, L2, L3]
+    description: Validate every platform configuration before any hardware is used.
+  lint:
+    workflow: .github/workflows/lint.yml
+    job: lint
+    entry_job: lint
+    levels: [L0, L1, L2, L3]
+    description: Ruff and the test inventory gate.
+  agnostic-tests:
+    workflow: .github/workflows/agnostic-checks.yml
+    job: agnostic-checks
+    entry_job: agnostic
+    levels: [L1, L2, L3]
+    description: Hardware-free unit and contract tests.
+  codegen-checks:
+    workflow: .github/workflows/codegen-checks.yml
+    job: codegen-checks
+    entry_job: codegen
+    levels: [L1, L2, L3]
+    description: Generated operator sources match the generator.
+  wheel-checks:
+    workflow: .github/workflows/wheel-checks.yml
+    job: wheel-checks
+    entry_job: wheel-checks
+    levels: [L1, L2, L3]
+    description: Build-environment and release-table validation.
+  platform-pipeline:
+    workflow: .github/workflows/integration-tests.yml
+    job: integration-tests
+    entry_job: platforms
+    levels: [L2, L3]
+    description: Installed-wheel integration tests on the requested platforms.
+
 levels:
   L0:
     support: supported
     scope: preflight
-    checks: [request, platform-config, integration-manifest, lint]
+    checks: [request, platform-config, lint]
   L1:
     support: supported
     scope: platform_agnostic
-    checks: [L0, agnostic-checks, codegen-checks, wheel-checks]
+    checks: [request, platform-config, lint, agnostic-tests, codegen-checks, wheel-checks]
   L2:
     support: supported
     scope: installed_wheel_integration
-    checks: [L1, build, wheel-validation, install, integration-tests]
+    checks:
+      [request, platform-config, lint, agnostic-tests, codegen-checks, wheel-checks, platform-pipeline]
   L3:
     support: supported
     readiness: requires_hardware_validation
     scope: installed_wheel_compatibility_and_runtime
-    checks: [L2, compatibility, resource-lifecycle, distributed-contracts]
+    checks:
+      [request, platform-config, lint, agnostic-tests, codegen-checks, wheel-checks, platform-pipeline]
   L4:
     support: supported
     readiness: requires_platform_models_and_approved_performance_references
     scope: candidate_release_acceptance
+    # Not wired: the release workflow runs on its own trigger and does not read this
+    # contract.  Kept here so the missing link is visible rather than implied.
     entry_workflow: .github/workflows/release.yml
-    checks: [L0, L1, candidate-L2, candidate-L3, models, endurance, complete-evidence]
+    # The run summary requires every gate at L4, exactly as at L2/L3.
+    checks:
+      [request, platform-config, lint, agnostic-tests, codegen-checks, wheel-checks, platform-pipeline]
 
 risk_rules:
   version: v1

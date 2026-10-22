@@ -1,0 +1,28 @@
+{
+  "schema_version": "flagcicd.acceptance/v1",
+  "extras": [
+    {
+      "id": "l3_installed_contract",
+      "path": "tests/acceptance/test_installed_contract.py"
+    },
+    {
+      "id": "l3_lifecycle",
+      "path": "tests/acceptance/test_lifecycle.py"
+    },
+    {
+      "id": "l3_performance",
+      "path": "tests/acceptance/test_performance.py"
+    },
+    {
+      "id": "l4_endurance",
+      "path": "tests/acceptance/test_endurance.py",
+      "when_level": "L4"
+    },
+    {
+      "id": "l4_models",
+      "path": "tests/acceptance/test_models.py",
+      "when_level": "L4",
+      "platforms_source": "release.model_platforms"
+    }
+  ]
+}

@@ -643,5 +643,22 @@
     "stability_seconds": 3600,
     "weekly_stability_seconds": 600,
     "max_retained_bytes": 16777216
+  },
+  "risk_profile": {
+    "patterns": [
+      "csrc/*",
+      "cmake/*",
+      "torch_fl/*",
+      "setup.py",
+      "requirements*",
+      "constraints*",
+      ".github/version-pins.env",
+      ".github/constraints.txt",
+      "scripts/tools/torch-fl-preflight",
+      ".github/scripts/hooks/*",
+      ".github/configs/*",
+      ".flagcicd/*",
+      "tests/acceptance/*"
+    ]
   }
 }
