@@ -26,6 +26,7 @@
 // This file is Objective-C++ and builds without ARC, like the Metal runtime.
 
 #include "../../../generated/ops.h"
+#include "../../../strided_ops.h"
 #include <ATen/ExpandUtils.h>
 #include <ATen/TensorIndexing.h>
 #include <ATen/core/Tensor.h>
@@ -37,8 +38,8 @@
 #include <ATen/ops/cumsum.h>
 #include <ATen/ops/convolution.h>
 #include <ATen/ops/cos.h>
-#include <ATen/ops/eq.h>
 #include <ATen/ops/div.h>
+#include <ATen/ops/eq.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/embedding.h>
 #include <ATen/ops/gather.h>
@@ -3081,4 +3082,92 @@ REGISTER_IMPL_TO_DISPATCHER(CatFn, cat_dispatcher, Backend::kMps, CatKernelMps)
 }
 
 REGISTER_IMPL_TO_DISPATCHER(NativeBatchNormFn, native_batch_norm_dispatcher, Backend::kMps, NativeBatchNormKernelMps)
+
+
+at::Tensor PrivUnsafeViewKernelMps(const at::Tensor & self, at::IntArrayRef size) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::unsafe_view(self, size);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(PrivUnsafeViewFn, priv_unsafe_view_dispatcher, Backend::kMps, PrivUnsafeViewKernelMps)
+
+
+at::Tensor SelectIntKernelMps(const at::Tensor & self, int64_t dim, int64_t index) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::select_int(self, dim, index);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SelectIntFn, select_int_dispatcher, Backend::kMps, SelectIntKernelMps)
+
+
+at::Tensor SliceTensorKernelMps(const at::Tensor & self, int64_t dim, ::std::optional<int64_t> start, ::std::optional<int64_t> end, int64_t step) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::slice_tensor(self, dim, start, end, step);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SliceTensorFn, slice_tensor_dispatcher, Backend::kMps, SliceTensorKernelMps)
+
+
+at::Tensor SqueezeKernelMps(const at::Tensor & self) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::squeeze(self);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SqueezeFn, squeeze_dispatcher, Backend::kMps, SqueezeKernelMps)
+
+
+at::Tensor SqueezeDimKernelMps(const at::Tensor & self, int64_t dim) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::squeeze_dim(self, dim);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SqueezeDimFn, squeeze_dim_dispatcher, Backend::kMps, SqueezeDimKernelMps)
+
+
+at::Tensor TKernelMps(const at::Tensor & self) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::t(self);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(TFn, t_dispatcher, Backend::kMps, TKernelMps)
+
+
+at::Tensor TransposeIntKernelMps(const at::Tensor & self, int64_t dim0, int64_t dim1) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::transpose_int(self, dim0, dim1);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(TransposeIntFn, transpose_int_dispatcher, Backend::kMps, TransposeIntKernelMps)
+
+
+at::Tensor UnsqueezeKernelMps(const at::Tensor & self, int64_t dim) {
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::unsqueeze(self, dim);
+}
+
+REGISTER_IMPL_TO_DISPATCHER(UnsqueezeFn, unsqueeze_dispatcher, Backend::kMps, UnsqueezeKernelMps)
 } // namespace at::native::flagos

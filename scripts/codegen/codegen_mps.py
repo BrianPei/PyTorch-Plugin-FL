@@ -44,7 +44,9 @@ from pathlib import Path
 # REGISTER_IMPL_TO_DISPATCHER(FnType, dispatcher, ...) matches the
 # DECLARE_DISPATCHER in generated/ops.h exactly (otherwise the build won't link).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from codegen_ops import schema_to_cpp_name
+from codegen_ops import args_decl, call_args, parse_native_yaml, schema_to_cpp_name
+from codegen_ops import unified_sig
+from torchgen import local
 
 REPO = Path(__file__).resolve().parent.parent.parent
 OUT_MM = REPO / "csrc/aten/backends/mps/generated/mps_kernels.mm"
@@ -492,6 +494,22 @@ OPS = {
     # with the unbiased batch variance and no graph node writes a caller's
     # buffer. See T_BATCH_NORM.
     "native_batch_norm": "batch_norm",
+}
+
+# View operations update only tensor metadata: sizes, strides and storage
+# offset. Their kernels live in csrc/aten/strided_ops.cc because MPSGraph would
+# copy the operand into new storage. The entries here add the PrivateUse1
+# claims and conf routes, while T_METADATA_VIEW generates one guarded kernel per
+# operation and delegates to those native metadata helpers.
+METADATA_VIEW_OPS = {
+    "_unsafe_view": "unsafe_view",
+    "select.int": "select_int",
+    "slice.Tensor": "slice_tensor",
+    "squeeze": "squeeze",
+    "squeeze.dim": "squeeze_dim",
+    "t": "t",
+    "transpose.int": "transpose_int",
+    "unsqueeze": "unsqueeze",
 }
 
 # The aten op a kernel falls back to on the CPU for a case the MPSGraph path does
@@ -3920,6 +3938,18 @@ at::Tensor {kernel}(const at::Tensor& self, const at::Tensor& other) {{
 REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
 """
 
+T_METADATA_VIEW = """\
+at::Tensor {kernel}({args}) {{
+  ::torch_fl_mps::DrainAll();
+  // MpsRunGraph hands an operand's storage without an allocation record for
+  // asynchronous graph work. Finish queued work before the returned view can
+  // release the last owner of an operand such as an expanded weight.
+  return at::native::flagos::{helper}({call_args});
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
 T_WHERE = """\
 at::Tensor {kernel}(
     const at::Tensor& condition,
@@ -4705,6 +4735,7 @@ CATEGORIES = {
     "batch_norm": T_BATCH_NORM,
     "compare_scalar": T_COMPARE_SCALAR,
     "compare_tensor": T_COMPARE_TENSOR,
+    "metadata_view": T_METADATA_VIEW,
 }
 
 FILE_HEADER = """\
@@ -4736,6 +4767,7 @@ FILE_HEADER = """\
 // This file is Objective-C++ and builds without ARC, like the Metal runtime.
 
 #include "../../../generated/ops.h"
+#include "../../../strided_ops.h"
 #include <ATen/ExpandUtils.h>
 #include <ATen/TensorIndexing.h>
 #include <ATen/core/Tensor.h>
@@ -4747,8 +4779,8 @@ FILE_HEADER = """\
 #include <ATen/ops/cumsum.h>
 #include <ATen/ops/convolution.h>
 #include <ATen/ops/cos.h>
-#include <ATen/ops/eq.h>
 #include <ATen/ops/div.h>
+#include <ATen/ops/eq.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/embedding.h>
 #include <ATen/ops/gather.h>
@@ -4828,6 +4860,13 @@ def render():
     set. Raises on an op with no wrapper, so a stale register.inc fails loudly
     instead of emitting a file that will not link."""
     wrappers = wrapper_map()
+    import torchgen
+
+    root = Path(torchgen.__file__).parent / "packaged" / "ATen" / "native"
+    native = parse_native_yaml(
+        str(root / "native_functions.yaml"), str(root / "tags.yaml")
+    )
+    native_functions = {str(func.func.name): func for func in native.native_functions}
     bodies = []
     covered = []
     for op, category in OPS.items():
@@ -4891,6 +4930,35 @@ def render():
             )
         )
         covered.append((op, category))
+
+    for op, helper in METADATA_VIEW_OPS.items():
+        wrapper = wrappers.get(op)
+        if wrapper is None:
+            raise SystemExit(
+                f"error: {op} has no wrapper in {REGISTER_INC.relative_to(REPO)}; "
+                "run scripts/codegen/codegen_ops.py first"
+            )
+        fn, disp = schema_to_cpp_name(op)
+        native_function = native_functions.get(op)
+        if native_function is None:
+            raise SystemExit(f"error: {op} is absent from native_functions.yaml")
+        with local.parametrize(
+            use_const_ref_for_mutable_tensors=False,
+            use_ilistref_for_tensor_lists=False,
+        ):
+            _, ret, args = unified_sig(native_function)
+        kernel = fn[:-2] + "KernelMps"
+        bodies.append(
+            CATEGORIES["metadata_view"].format(
+                kernel=kernel,
+                fn=fn,
+                disp=disp,
+                args=args_decl(args),
+                call_args=call_args(args),
+                helper=helper,
+            )
+        )
+        covered.append((op, "metadata_view"))
 
     return (
         FILE_HEADER + "\n\n".join(bodies) + FILE_FOOTER,
