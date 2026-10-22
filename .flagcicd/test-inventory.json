@@ -235,6 +235,15 @@
       ],
       "selector": "tests/integration/"
     },
+    "tests/integration/ops/test_dtype_cast_copy.py": {
+      "lane": "L3",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Manifest selection; platform and marker restrictions remain in the command.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/"
+    },
     "tests/integration/ops/test_dtype_route_fallback.py": {
       "lane": "L3",
       "owner": "Torch-FL runtime maintainers",
@@ -693,6 +702,15 @@
         ".github/integration-manifest.yml"
       ],
       "selector": "tests/integration/"
+    },
+    "tests/integration/ops/test_mps_views.py": {
+      "lane": "L2",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Native MPS operator suite selected by the mps marker.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops -m mps"
     },
     "tests/integration/ops/test_mps_where.py": {
       "lane": "L2",
@@ -1860,6 +1878,15 @@
         ".github/workflows/agnostic-checks.yml"
       ],
       "selector": "tests/unit/test_integration_workdir.py"
+    },
+    "tests/unit/test_kunlunxin_libcudart_preload.py": {
+      "lane": "L3",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "DCU source-contract diagnostic sweep; does not establish installed-wheel support.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "python .github/scripts/run_unit_tests.py"
     },
     "tests/unit/test_kunlunxin_triton_stream.py": {
       "lane": "L3",

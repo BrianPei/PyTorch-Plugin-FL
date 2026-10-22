@@ -14,6 +14,7 @@
 // this file does not register.
 
   m.impl("_softmax", WrapperPrivSoftmax);
+  m.impl("_unsafe_view", WrapperPrivUnsafeView);
   m.impl("abs", WrapperAbs);
   m.impl("add.Scalar", WrapperAddScalar);
   m.impl("add.Tensor", WrapperAddTensor);
@@ -51,16 +52,23 @@
   m.impl("pow.Tensor_Scalar", WrapperPowTensorScalar);
   m.impl("reciprocal", WrapperReciprocal);
   m.impl("rsqrt", WrapperRsqrt);
+  m.impl("select.int", WrapperSelectInt);
   m.impl("sigmoid", WrapperSigmoid);
   m.impl("silu", WrapperSilu);
   m.impl("silu_backward", WrapperSiluBackward);
   m.impl("sin", WrapperSin);
+  m.impl("slice.Tensor", WrapperSliceTensor);
   m.impl("softplus", WrapperSoftplus);
   m.impl("sqrt", WrapperSqrt);
+  m.impl("squeeze", WrapperSqueeze);
+  m.impl("squeeze.dim", WrapperSqueezeDim);
   m.impl("sub.Scalar", WrapperSubScalar);
   m.impl("sub.Tensor", WrapperSubTensor);
   m.impl("sum.dim_IntList", WrapperSumDimIntlist);
+  m.impl("t", WrapperT);
   m.impl("take", WrapperTake);
   m.impl("tanh", WrapperTanh);
+  m.impl("transpose.int", WrapperTransposeInt);
   m.impl("triu", WrapperTriu);
+  m.impl("unsqueeze", WrapperUnsqueeze);
   m.impl("where.self", WrapperWhereSelf);
