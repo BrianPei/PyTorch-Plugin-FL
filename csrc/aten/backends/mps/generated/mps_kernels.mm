@@ -34,12 +34,16 @@
 #include <ATen/ops/add.h>
 #include <ATen/ops/bmm.h>
 #include <ATen/ops/cat.h>
+#include <ATen/ops/cumsum.h>
 #include <ATen/ops/convolution.h>
+#include <ATen/ops/cos.h>
+#include <ATen/ops/eq.h>
 #include <ATen/ops/div.h>
 #include <ATen/ops/empty.h>
 #include <ATen/ops/embedding.h>
 #include <ATen/ops/gather.h>
 #include <ATen/ops/index_select.h>
+#include <ATen/ops/le.h>
 #include <ATen/ops/masked_fill.h>
 #include <ATen/ops/mean.h>
 #include <ATen/ops/mm.h>
@@ -47,9 +51,11 @@
 #include <ATen/ops/native_batch_norm.h>
 #include <ATen/ops/native_layer_norm.h>
 #include <ATen/ops/neg.h>
+#include <ATen/ops/ne.h>
 #include <ATen/ops/pow.h>
 #include <ATen/ops/reciprocal.h>
 #include <ATen/ops/rsqrt.h>
+#include <ATen/ops/sin.h>
 #include <ATen/ops/silu.h>
 #include <ATen/ops/silu_backward.h>
 #include <ATen/ops/sub.h>
@@ -1003,6 +1009,117 @@ at::Tensor IndexTensorKernelMps(
 REGISTER_IMPL_TO_DISPATCHER(IndexTensorFn, index_tensor_dispatcher, Backend::kMps, IndexTensorKernelMps)
 
 
+at::Tensor CumsumKernelMps(
+    const at::Tensor& self,
+    int64_t dim,
+    std::optional<at::ScalarType> dtype) {
+  if (!mps::MpsSupportsCumsumDtype(self.scalar_type(), dtype)) {
+    return at::cumsum(self.cpu(), dim, dtype).to(self.device());
+  }
+  const at::ScalarType result_dtype = dtype.value_or(self.scalar_type());
+  int64_t axis = 0;
+  if (!mps::MpsCumsumAxis(self, dim, &axis)) {
+    return at::cumsum(self.cpu(), dim, dtype).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  if (self_c.numel() == 0) {
+    return at::cumsum(self.cpu(), dim, dtype).to(self.device());
+  }
+  if (result_dtype != self_c.scalar_type()) {
+    self_c = self_c.to(result_dtype);
+  }
+  at::Tensor out = at::empty(
+      self_c.sizes(), self_c.options().dtype(result_dtype));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("cumsum", axis),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph cumulativeSumWithTensor:args[0]
+                                          axis:axis
+                                     exclusive:NO
+                                       reverse:NO
+                                          name:nil];
+      });
+  if (!ran) {
+    return at::cumsum(self.cpu(), dim, dtype).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(CumsumFn, cumsum_dispatcher, Backend::kMps, CumsumKernelMps)
+
+
+at::Tensor SoftplusKernelMps(
+    const at::Tensor& self,
+    const at::Scalar& beta,
+    const at::Scalar& threshold) {
+  if (!mps::MpsSupportsSoftplusDtype(self.scalar_type(), beta, threshold)) {
+    return at::softplus(self.cpu(), beta, threshold).to(self.device());
+  }
+  if (beta.toDouble() <= 0.0) {
+    return at::softplus(self.cpu(), beta, threshold).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("softplus", beta, threshold),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        MPSDataType data_type = MPSDataTypeFloat32;
+        if (!mps::MpsDataTypeOf(self_c.scalar_type(), &data_type)) {
+          return nil;
+        }
+        MPSGraphTensor* beta_value =
+            [graph constantWithScalar:beta.toDouble()
+                                shape:mps::MpsFlatShape(1)
+                             dataType:data_type];
+        MPSGraphTensor* threshold_value =
+            [graph constantWithScalar:threshold.toDouble()
+                                shape:mps::MpsFlatShape(1)
+                             dataType:data_type];
+        MPSGraphTensor* scaled = [graph multiplicationWithPrimaryTensor:args[0]
+                                                      secondaryTensor:beta_value
+                                                                 name:nil];
+        MPSGraphTensor* predicate = [graph greaterThanWithPrimaryTensor:scaled
+                                                       secondaryTensor:threshold_value
+                                                                  name:nil];
+        if (scaled == nil || predicate == nil) {
+          return nil;
+        }
+        MPSGraphTensor* exponent = [graph exponentWithTensor:scaled name:nil];
+        MPSGraphTensor* one_value =
+            [graph constantWithScalar:1.0
+                                shape:mps::MpsFlatShape(1)
+                             dataType:data_type];
+        MPSGraphTensor* shifted = [graph additionWithPrimaryTensor:exponent
+                                                  secondaryTensor:one_value
+                                                             name:nil];
+        MPSGraphTensor* curved = [graph logarithmWithTensor:shifted name:nil];
+        curved = [graph divisionWithPrimaryTensor:curved
+                                  secondaryTensor:beta_value
+                                             name:nil];
+        MPSGraphTensor* linear = [graph divisionWithPrimaryTensor:args[0]
+                                                  secondaryTensor:beta_value
+                                                             name:nil];
+        return [graph selectWithPredicateTensor:predicate
+                            truePredicateTensor:linear
+                           falsePredicateTensor:curved
+                                           name:nil];
+      });
+  if (!ran) {
+    return at::softplus(self.cpu(), beta, threshold).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SoftplusFn, softplus_dispatcher, Backend::kMps, SoftplusKernelMps)
+
+
 at::Tensor PrivSoftmaxKernelMps(
     const at::Tensor& self,
     int64_t dim,
@@ -1057,6 +1174,56 @@ at::Tensor NegKernelMps(const at::Tensor& self) {
 }
 
 REGISTER_IMPL_TO_DISPATCHER(NegFn, neg_dispatcher, Backend::kMps, NegKernelMps)
+
+
+at::Tensor SinKernelMps(const at::Tensor& self) {
+  if (!mps::MpsSupportsTrigDtype(self.scalar_type())) {
+    return at::sin(self.cpu()).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("sin"),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph sinWithTensor:args[0] name:nil];
+      });
+  if (!ran) {
+    return at::sin(self.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(SinFn, sin_dispatcher, Backend::kMps, SinKernelMps)
+
+
+at::Tensor CosKernelMps(const at::Tensor& self) {
+  if (!mps::MpsSupportsTrigDtype(self.scalar_type())) {
+    return at::cos(self.cpu()).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  if (out.numel() == 0) {
+    return out;
+  }
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("cos"),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph cosWithTensor:args[0] name:nil];
+      });
+  if (!ran) {
+    return at::cos(self.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(CosFn, cos_dispatcher, Backend::kMps, CosKernelMps)
 
 
 at::Tensor PowTensorScalarKernelMps(const at::Tensor& self, const at::Scalar& other) {
@@ -2519,6 +2686,89 @@ at::Tensor MaskedFillTensorKernelMps(
 }
 
 REGISTER_IMPL_TO_DISPATCHER(MaskedFillTensorFn, masked_fill_tensor_dispatcher, Backend::kMps, MaskedFillTensorKernelMps)
+
+
+at::Tensor EqScalarKernelMps(const at::Tensor& self, const at::Scalar& other) {
+  if (!mps::MpsSupportsScalarDtype(self.scalar_type(), other)) {
+    return at::eq(self.cpu(), other).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options().dtype(at::kBool));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("eq.Scalar", other),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        MPSGraphTensor* other_t =
+            mps::MpsConstant(graph, other, self_c.scalar_type());
+        if (other_t == nil) {
+          return nil;
+        }
+        return [graph equalWithPrimaryTensor:args[0] secondaryTensor:other_t name:nil];
+      });
+  if (!ran) {
+    return at::eq(self.cpu(), other).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(EqScalarFn, eq_scalar_dispatcher, Backend::kMps, EqScalarKernelMps)
+
+
+at::Tensor LeTensorKernelMps(const at::Tensor& self, const at::Tensor& other) {
+  if (!mps::MpsSupportsBinaryDtype(self.scalar_type(), other.scalar_type())) {
+    return at::le(self.cpu(), other.cpu()).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor other_c = other.contiguous();
+  std::vector<int64_t> out_shape;
+  try {
+    out_shape = at::infer_size(self_c.sizes(), other_c.sizes());
+  } catch (const std::exception&) {
+    return at::le(self.cpu(), other.cpu()).to(self.device());
+  }
+  at::Tensor out = at::empty(out_shape, self_c.options().dtype(at::kBool));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("le.Tensor"),
+      {self_c, other_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        return [graph lessThanOrEqualToWithPrimaryTensor:args[0] secondaryTensor:args[1] name:nil];
+      });
+  if (!ran) {
+    return at::le(self.cpu(), other.cpu()).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(LeTensorFn, le_tensor_dispatcher, Backend::kMps, LeTensorKernelMps)
+
+
+at::Tensor NeScalarKernelMps(const at::Tensor& self, const at::Scalar& other) {
+  if (!mps::MpsSupportsScalarDtype(self.scalar_type(), other)) {
+    return at::ne(self.cpu(), other).to(self.device());
+  }
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options().dtype(at::kBool));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("ne.Scalar", other),
+      {self_c},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {
+        MPSGraphTensor* other_t =
+            mps::MpsConstant(graph, other, self_c.scalar_type());
+        if (other_t == nil) {
+          return nil;
+        }
+        return [graph notEqualWithPrimaryTensor:args[0] secondaryTensor:other_t name:nil];
+      });
+  if (!ran) {
+    return at::ne(self.cpu(), other).to(self.device());
+  }
+  return out;
+}
+
+REGISTER_IMPL_TO_DISPATCHER(NeScalarFn, ne_scalar_dispatcher, Backend::kMps, NeScalarKernelMps)
 
 
 at::Tensor CatKernelMps(const at::ITensorListRef& tensors, int64_t dim) {
