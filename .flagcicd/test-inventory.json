@@ -460,6 +460,15 @@
       ],
       "selector": "tests/integration/ops -m mps"
     },
+    "tests/integration/ops/test_mps_cumsum.py": {
+      "lane": "L2",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Native MPS operator suite selected by the mps marker.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops -m mps"
+    },
     "tests/integration/ops/test_mps_div.py": {
       "lane": "L2",
       "owner": "Torch-FL runtime maintainers",
@@ -586,6 +595,15 @@
       ],
       "selector": "tests/integration/"
     },
+    "tests/integration/ops/test_mps_rotary_and_compare.py": {
+      "lane": "L2",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Native MPS operator suite selected by the mps marker.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops -m mps"
+    },
     "tests/integration/ops/test_mps_rsqrt.py": {
       "lane": "L2",
       "owner": "Torch-FL runtime maintainers",
@@ -621,6 +639,15 @@
         ".github/integration-manifest.yml"
       ],
       "selector": "tests/integration/"
+    },
+    "tests/integration/ops/test_mps_softplus.py": {
+      "lane": "L2",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Native MPS operator suite selected by the mps marker.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops -m mps"
     },
     "tests/integration/ops/test_mps_sqrt.py": {
       "lane": "L2",
