@@ -9,17 +9,11 @@
 # no scan of the shared op list here -- the op set below IS the coverage set, and
 # every entry has a body written out once.
 #
-# This tree carries stages 1 and 2 of
-# docs/superpowers/specs/2026-10-14-apple-mps-native-backend-design.md section 7
-# -- the `unary` category, the elementwise `binary` and `binary_scalar` families,
-# and the `reduce` family -- plus four stage-3 increments: the `gemm` category
-# (`mm` and `bmm`), the `softmax` category (`_softmax`), the elementwise `neg`
-# and `pow.Tensor_Scalar`, and the `conv` category (`convolution_overrideable`),
-# each matching the CPU reference within tolerance.
-# and the `reduce` family -- plus three stage-3 increments: the `gemm` category
-# (`mm` and `bmm`), the `softmax` category (`_softmax`) and the elementwise
-# `neg` and `pow.Tensor_Scalar`, each matching the CPU reference within tolerance.
-# The rest of stage 3 (conv) is still open.#
+# This tree carries the original unary, binary, reduce, matmul and softmax
+# stages plus the Qwen3.5 paths added incrementally here. Each category owns
+# its dtype gate and graph body; the generated `.inc` is the source the conf
+# generator reads, so the config cannot advertise an unregistered route.
+#
 # Two consequences worth stating up front, mirroring codegen_kunlunxin.py:
 #
 #   * There is no conf writer. torch_fl/configs/backends_mps.conf is generated
@@ -86,6 +80,24 @@ OPS = {
     "mul.Scalar": "binary_scalar",
     "sum.dim_IntList": "reduce",
     "mean.dim": "reduce",
+    "all": "all",
+    "all.dim": "all_dim",
+    "all.dims": "all_dims",
+    # The fixed causal mask the model reads selects one triangle of the operand.
+    # The graph uses MPSGraph's row and column coordinates. See T_TRIU.
+    "triu": "triu",
+    "argmax": "argmax",
+    # Qwen3.5's GatedDeltaNet solves a batched triangular system. MPSGraph has
+    # no triangular-solve selector on the hosted SDK, so the body builds a
+    # forward or back substitution: the result is updated one row or column at
+    # a time inside the graph, without reading coefficients on the host. See
+    # T_SOLVE_TRIANGULAR.
+    "linalg_solve_triangular": "SOLVE_TRIANGULAR",
+    # `index.Tensor` covers scalar, broadcasting and separated coordinates.
+    # The reference validates their metadata on the host and builds one source
+    # address per result element; the graph gathers the source values on Metal.
+    # See T_INDEX and MpsGatherIndex.
+    "index.Tensor": "index",
     # `softmax` is the third stage-3 lane and the op a small model calls between
     # the matmuls: one per attention block, over the (batch, heads, seq, seq)
     # scores. MPSGraph has the whole operation behind one selector,
@@ -477,6 +489,13 @@ AT_OP = {
     "mul.Scalar": "mul",
     "sum.dim_IntList": "sum",
     "mean.dim": "mean",
+    "all": "all",
+    "all.dim": "all",
+    "all.dims": "all",
+    "triu": "triu",
+    "argmax": "argmax",
+    "linalg_solve_triangular": "linalg_solve_triangular",
+    "index.Tensor": "index",
     "_softmax": "_softmax",
     "neg": "neg",
     "pow.Tensor_Scalar": "pow",
@@ -609,6 +628,13 @@ SUPPORTS = {
     "binary": "MpsSupportsBinaryDtype",
     "binary_scalar": "MpsSupportsScalarDtype",
     "reduce": "MpsSupportsReduceDtype",
+    "all": "MpsSupportsAllDtype",
+    "all_dim": "MpsSupportsAllDtype",
+    "all_dims": "MpsSupportsAllDtype",
+    "triu": "MpsSupportsTriuDtype",
+    "argmax": "MpsSupportsArgmaxDtype",
+    "SOLVE_TRIANGULAR": "MpsSupportsTriangularSolveDtype",
+    "index": "",
     "gemm": "MpsSupportsGemmDtype",
     "softmax": "MpsSupportsSoftmaxDtype",
     "pow_scalar": "MpsSupportsPowDtype",
@@ -747,6 +773,15 @@ CALLS = {
     "mul.Scalar": "multiplicationWithPrimaryTensor:",
     "sum.dim_IntList": "reductionSumWithTensor:",
     "mean.dim": "reductionSumWithTensor:",
+    # `all` and `triu` build their comparison and select in the body.
+    "all": "",
+    "all.dim": "",
+    "all.dims": "",
+    "triu": "",
+    "argmax": "",
+    # `index.Tensor` builds its gather and coordinate arithmetic in the body.
+    "linalg_solve_triangular": "",
+    "index.Tensor": "",
     # One selector for both ops: it broadcasts, so the batched rank-3 pair bmm
     # takes is the same node as the rank-2 pair mm takes.
     "mm": "matrixMultiplicationWithPrimaryTensor:",
@@ -908,6 +943,15 @@ KEY_PARTS = {
     "mul.Scalar": ", other",
     "sum.dim_IntList": ", axes",
     "mean.dim": ", axes",
+    "all": "",
+    "all.dim": ", dimension, keepdim",
+    "all.dims": ", axis_key, axes, keepdim",
+    "triu": ", diagonal",
+    "argmax": ", axis, keepdim",
+    # The three host flags choose the substitution direction and which side of
+    # the system B covers. They cannot be inferred from tensor signatures.
+    "linalg_solve_triangular": ", upper, left, unitriangular",
+    "index.Tensor": "",
     # Which of the two operands the graph has to transpose: see T_GEMM.
     "mm": ", self_transposed, mat2_transposed",
     "bmm": ", self_transposed, mat2_transposed",
@@ -1273,6 +1317,466 @@ at::Tensor {kernel}(
     return at::{at_op}(self.cpu(), dim, keepdim, dtype).to(self.device());
   }}
   return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+# `all` returns bool for every input width, so it cannot share T_REDUCE: the
+# reduction is over `x != zero`, and the result is allocated as bool. The three
+# schemas have different host signatures: the bare form reduces every axis, and
+# the two dim forms differ only in whether the axis is one integer or a list.
+T_ALL = """\
+at::Tensor {kernel}(const at::Tensor& self) {{
+  if (!mps::{supports}(self.scalar_type())) {{
+    return at::{at_op}(self.cpu()).to(self.device());
+  }}
+  std::vector<int64_t> axes;
+  if (!mps::MpsAllAxes(self.sizes(), std::nullopt, &axes)) {{
+    return at::{at_op}(self.cpu()).to(self.device());
+  }}
+  at::Tensor self_c = self.contiguous();
+  if (self_c.numel() == 0 || self_c.dim() <= 2) {{
+    // MPSNDArray's all-reduction requires a float source and float
+    // destination. Rank one and two small conjuncts keep the host reference.
+    return at::{at_op}(self.cpu()).to(self.device());
+  }}
+  at::Tensor out = at::empty(
+      mps::MpsAllOutShape(self_c.sizes(), std::nullopt, axes, false),
+      self_c.options().dtype(at::kBool));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("{op}", axes),
+      {{self_c}},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        MPSGraphTensor* y = args[0];
+        if (self_c.scalar_type() != at::kBool) {{
+          MPSGraphTensor* zero =
+              mps::MpsConstant(graph, 0, self_c.scalar_type());
+          if (zero == nil) {{
+            return nil;
+          }}
+          y = [graph notEqualWithPrimaryTensor:y
+                                secondaryTensor:zero
+                                           name:nil];
+        }}
+        return [graph reductionAndWithTensor:y
+                                        axes:mps::MpsAxesArray(axes)
+                                        name:nil];
+      }});
+  if (!ran) {{
+    return at::{at_op}(self.cpu()).to(self.device());
+  }}
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+T_ALL_DIM = """\
+at::Tensor {kernel}(
+    const at::Tensor& self,
+    int64_t dim,
+    bool keepdim) {{
+  if (!mps::{supports}(self.scalar_type())) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  std::vector<int64_t> axes;
+  if (!mps::MpsAllAxes(self.sizes(), dim, &axes)) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  const int64_t dimension = axes.empty() ? 0 : axes[0];
+  at::Tensor self_c = self.contiguous();
+  if (self_c.numel() == 0) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  at::Tensor out = at::empty(
+      mps::MpsAllOutShape(self_c.sizes(), dim, axes, keepdim),
+      self_c.options().dtype(at::kBool));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("{op}", dimension, keepdim),
+      {{self_c}},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        MPSGraphTensor* y = args[0];
+        if (self_c.scalar_type() != at::kBool) {{
+          MPSGraphTensor* zero =
+              mps::MpsConstant(graph, 0, self_c.scalar_type());
+          if (zero == nil) {{
+            return nil;
+          }}
+          y = [graph notEqualWithPrimaryTensor:y
+                                secondaryTensor:zero
+                                           name:nil];
+        }}
+        return [graph reductionAndWithTensor:y
+                                       axis:dimension
+                                       name:nil];
+      }});
+  if (!ran) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+T_ALL_DIMS = """\
+at::Tensor {kernel}(
+    const at::Tensor& self,
+    at::OptionalIntArrayRef dim,
+    bool keepdim) {{
+  if (!mps::{supports}(self.scalar_type())) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  std::vector<int64_t> axes;
+  if (!mps::MpsAllAxes(self.sizes(), dim, &axes)) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  at::Tensor self_c = self.contiguous();
+  if (self_c.numel() == 0 || self_c.dim() == 0 || axes.empty()) {{
+    // An empty reduction is true. A scalar is already its own answer, and an
+    // explicit empty axis list leaves every element in place.
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  at::Tensor out = at::empty(
+      mps::MpsAllOutShape(self_c.sizes(), dim, axes, keepdim),
+      self_c.options().dtype(at::kBool));
+  const int64_t axis_key = axes.size() == 1 ? axes[0] : -1;
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("{op}", axis_key, axes, keepdim),
+      {{self_c}},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        MPSGraphTensor* y = args[0];
+        if (self_c.scalar_type() != at::kBool) {{
+          MPSGraphTensor* zero =
+              mps::MpsConstant(graph, 0, self_c.scalar_type());
+          if (zero == nil) {{
+            return nil;
+          }}
+          y = [graph notEqualWithPrimaryTensor:y
+                                secondaryTensor:zero
+                                           name:nil];
+        }}
+        return [graph reductionAndWithTensor:y
+                                        axes:mps::MpsAxesArray(axes)
+                                        name:nil];
+      }});
+  if (!ran) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+T_TRIU = r"""at::Tensor {kernel}(const at::Tensor& self, int64_t diagonal) {{
+  if (!mps::{supports}(self.scalar_type())) {{
+    return at::{at_op}(self.cpu(), diagonal).to(self.device());
+  }}
+  if (self.dim() < 2 || self.size(-1) == 0 || self.size(-2) == 0) {{
+    return at::{at_op}(self.cpu(), diagonal).to(self.device());
+  }}
+  at::Tensor self_c = self.contiguous();
+  at::Tensor out = at::empty(self_c.sizes(), self_c.options());
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("{op}", diagonal),
+      {{self_c}},
+      out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        MPSShape* shape = mps::MpsShapeOf(self_c.sizes());
+        MPSGraphTensor* column =
+            [graph coordinateAlongAxis:-1 withShape:shape name:nil];
+        MPSGraphTensor* row =
+            [graph coordinateAlongAxis:-2 withShape:shape name:nil];
+        MPSGraphTensor* difference =
+            [graph subtractionWithPrimaryTensor:column
+                                secondaryTensor:row
+                                           name:nil];
+        // Coordinates are int32. Cast the offset before comparing: a scalar
+        // constant in int64 is not broadcastable against an int32 tensor on
+        // this SDK, and the graph compiler aborts on that mismatch.
+        MPSGraphTensor* diagonal_t =
+            mps::MpsConstant(graph, diagonal, at::kInt);
+        MPSGraphTensor* offset = diagonal_t == nil ? nil :
+            [graph broadcastTensor:diagonal_t
+                           toShape:shape
+                              name:nil];
+        MPSGraphTensor* upper =
+            [graph greaterThanOrEqualToWithPrimaryTensor:difference
+                                         secondaryTensor:offset
+                                                    name:nil];
+        MPSGraphTensor* zero =
+            mps::MpsConstant(graph, 0, self_c.scalar_type());
+        if (upper == nil || zero == nil) {{
+          return nil;
+        }}
+        return [graph selectWithPredicateTensor:upper
+                            truePredicateTensor:args[0]
+                           falsePredicateTensor:zero
+                                           name:nil];
+      }});
+  if (!ran) {{
+    return at::{at_op}(self.cpu(), diagonal).to(self.device());
+  }}
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+# aten argmax takes the first maximum, with a later NaN replacing an earlier
+# one. MPSGraph's reduceArgMax tie rule is undocumented, so this graph compares
+# every position against a NaN-aware maximum and reduces the matching
+# coordinates.
+T_ARGMAX = """\
+at::Tensor {kernel}(
+    const at::Tensor& self,
+    std::optional<int64_t> dim,
+    bool keepdim) {{
+  if (!dim.has_value()) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  if (!mps::{supports}(self.scalar_type())) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  const int64_t rank = self.dim();
+  const int64_t axis = *dim < 0 ? *dim + rank : *dim;
+  if (rank == 0 || axis < 0 || axis >= rank) {{
+    // The reference answers a scalar and raises for an empty axis. Both stay
+    // on the reference so its own shape and error rules are preserved.
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  if (self.numel() == 0 || self.size(axis) == 0) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  at::Tensor self_c = self.contiguous();
+  std::vector<int64_t> out_shape = self_c.sizes().vec();
+  out_shape[axis] = 1;
+  if (!keepdim) {{
+    out_shape.erase(out_shape.begin() + axis);
+  }}
+  at::Tensor selected =
+      at::empty(out_shape, self_c.options().dtype(at::kLong));
+  const bool ran = mps::MpsRunGraph(
+      mps::MpsGraphKey("{op}", axis, keepdim),
+      {{self_c}},
+      selected,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        // MPSGraph gives the coordinates an int32 element type. A NaN-aware
+        // maximum has int32 coordinates too, so the select and minimum below
+        // need no inconsistent scalar width.
+        MPSGraphTensor* positions =
+            [graph coordinateAlongAxis:axis
+                            withShape:mps::MpsShapeOf(self_c.sizes())
+                                  name:nil];
+        MPSGraphTensor* nan = [graph isNaNWithTensor:args[0] name:nil];
+        if (positions == nil || nan == nil) {{
+          return nil;
+        }}
+        MPSGraphTensor* positions_float =
+            [graph castTensor:positions toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor* minus_one =
+            mps::MpsConstant(graph, -1, at::ScalarType::Float);
+        if (positions_float == nil || minus_one == nil) {{
+          return nil;
+        }}
+        // float32 exactly represents every coordinate of a realistic axis. A
+        // finite identity keeps the maximum NaN-unaware, and the NaN positions
+        // are reduced separately. That preserves a NaN's stable replacement of
+        // every earlier maximum.
+        MPSGraphTensor* no_nan =
+            [graph notWithTensor:nan name:nil];
+        MPSGraphTensor* infinity = nil;
+        if (no_nan == nil ||
+            !mps::MpsPositiveInfinity(
+                graph, self_c.scalar_type(), &infinity)) {{
+          return nil;
+        }}
+        MPSGraphTensor* finite_values =
+            [graph selectWithPredicateTensor:nan
+                        truePredicateTensor:infinity
+                       falsePredicateTensor:args[0]
+                                       name:nil];
+        MPSGraphTensor* maximum =
+            [graph reductionMaximumWithTensor:finite_values
+                                         axis:axis
+                                         name:nil];
+        MPSGraphTensor* nan_positions =
+            [graph selectWithPredicateTensor:nan
+                        truePredicateTensor:positions_float
+                       falsePredicateTensor:minus_one
+                                       name:nil];
+        MPSGraphTensor* has_nan =
+            [graph reductionMaximumWithTensor:nan_positions
+                                         axis:axis
+                                         name:nil];
+        MPSGraphTensor* equals =
+            [graph equalWithPrimaryTensor:args[0]
+                          secondaryTensor:maximum
+                                     name:nil];
+        MPSGraphTensor* finite = equals == nil
+            ? nil
+            : [graph logicalANDWithPrimaryTensor:no_nan
+                                 secondaryTensor:equals
+                                            name:nil];
+        MPSGraphTensor* selected_nan =
+            [graph greaterThanWithPrimaryTensor:positions_float
+                                secondaryTensor:has_nan
+                                           name:nil];
+        MPSGraphTensor* matches =
+            [graph selectWithPredicateTensor:nan
+                        truePredicateTensor:selected_nan
+                       falsePredicateTensor:finite
+                                       name:nil];
+        MPSGraphTensor* no_match = mps::MpsConstant(
+            graph, self_c.size(axis), at::ScalarType::Int);
+        if (matches == nil || no_match == nil) {{
+          return nil;
+        }}
+        MPSGraphTensor* candidates =
+            [graph selectWithPredicateTensor:matches
+                        truePredicateTensor:positions
+                       falsePredicateTensor:no_match
+                                       name:nil];
+        MPSGraphTensor* result =
+            [graph reductionMinimumWithTensor:candidates
+                                         axis:axis
+                                         name:nil];
+        if (result == nil) {{
+          return nil;
+        }}
+        return [graph castTensor:result
+                          toType:MPSDataTypeInt64
+                            name:nil];
+      }});
+  if (!ran) {{
+    return at::{at_op}(self.cpu(), dim, keepdim).to(self.device());
+  }}
+  return selected;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
+# aten's triangular solve computes X for AX = B (left=true) or XA = B
+# (left=false). `upper` selects the triangle that A stores, and `unitriangular`
+# makes its diagonal implicitly one.
+#
+# MPSGraph exposes matrix inverse but no triangular solver on the hosted SDK.
+# The graph therefore performs substitution in the reference's traversal order:
+#
+#   AX = B, lower: X[i] = (B[i] - sum_{j<i} A[i,j] X[j]) / A[i,i]
+#   AX = B, upper: X[i] = (B[i] - sum_{j>i} A[i,j] X[j]) / A[i,i]
+#
+# A right-hand system performs the analogous forward or back substitution over
+# the columns of X. Each reduction masks the stored triangle and the already
+# solved positions, so every step is expressed by MPSGraph nodes.
+#
+# Right solves use A.T and B.T as a left solve. Both operations present the
+# working operands densely to the graph as [..., n, n] and [..., n, rhs].
+T_SOLVE_TRIANGULAR = r"""at::Tensor {kernel}(
+    const at::Tensor& self,
+    const at::Tensor& B,
+    bool upper,
+    bool left,
+    bool unitriangular) {{
+  const bool upper_arg = upper;
+  const bool left_arg = left;
+  const bool unitriangular_arg = unitriangular;
+  if (self.dim() < 2 || B.dim() < 2 ||
+      !mps::{supports}(self.scalar_type(), B.scalar_type()) ||
+      self.device() != B.device() ||
+      B.scalar_type() != self.scalar_type()) {{
+    return at::{at_op}(
+        self.cpu(), B.cpu(), upper_arg, left_arg, unitriangular_arg)
+        .to(self.device());
+  }}
+  const int64_t n = self.size(-1);
+  if (self.size(-2) != n ||
+      (left_arg ? B.size(-2) != n : B.size(-1) != n) ||
+      n == 0 || B.size(-2) == 0 || B.size(-1) == 0) {{
+    return at::{at_op}(
+        self.cpu(), B.cpu(), upper_arg, left_arg, unitriangular_arg)
+        .to(self.device());
+  }}
+  std::vector<int64_t> out_shape;
+  if (n > mps::kMpsTriangularSolveMaxRows ||
+      !mps::MpsTriangularSolveShapes(
+          self.sizes(), B.sizes(), left_arg, &out_shape)) {{
+    return at::{at_op}(
+        self.cpu(), B.cpu(), upper_arg, left_arg, unitriangular_arg)
+        .to(self.device());
+  }}
+  // Right solves use A.T and B.T as a left solve. All three working shapes are
+  // then the caller's shapes with the last two axes swapped.
+  at::Tensor matrix_storage = self;
+  at::Tensor right_storage = B;
+  std::vector<int64_t> matrix_shape = self.sizes().vec();
+  std::vector<int64_t> right_shape = left_arg
+      ? B.sizes().vec()
+      : B.transpose(-2, -1).sizes().vec();
+  std::vector<int64_t> working_out_shape = left_arg
+      ? out_shape
+      : ([](const std::vector<int64_t>& shape) {{
+          std::vector<int64_t> transposed(shape);
+          std::swap(
+              transposed[transposed.size() - 2], transposed.back());
+          return transposed;
+        }})(out_shape);
+  if (!left_arg) {{
+    matrix_storage = self.transpose(-2, -1).contiguous();
+    right_storage = B.transpose(-2, -1).contiguous();
+    std::swap(matrix_shape[matrix_shape.size() - 2], matrix_shape.back());
+  }}
+  matrix_storage = matrix_storage.contiguous();
+  right_storage = right_storage.contiguous();
+  // The graph writes a dense [..., n, rhs] result. The final copy performs
+  // the caller's transpose for a right solve.
+  at::Tensor working_out = at::empty(
+      working_out_shape, self.options());
+  at::Tensor graph_out = left_arg ? working_out : at::empty(
+      out_shape, self.options());
+  if (graph_out.numel() == 0) {{
+    return graph_out;
+  }}
+
+  const bool ran = mps::MpsRunGraphExtra(
+      mps::MpsGraphKey(
+          "{op}", left_arg, upper_arg, unitriangular_arg,
+          matrix_storage.sizes(), right_storage.sizes(), working_out_shape),
+      {{}},
+      matrix_storage,
+      right_storage,
+      working_out,
+      ^MPSGraphTensor*(MPSGraph* graph, NSArray<MPSGraphTensor*>* args) {{
+        if (args.count != 2) {{
+          return nil;
+        }}
+        return mps::MpsTriangularSolve(
+            graph,
+            args[0],
+            args[1],
+            working_out_shape,
+            matrix_storage.sizes(),
+            matrix_shape,
+            right_storage.sizes(),
+            right_shape,
+            upper_arg,
+            unitriangular_arg,
+            matrix_storage.scalar_type());
+      }});
+  if (!ran) {{
+    return mps::MpsTriangularSolveReference(
+        self, B, upper_arg, left_arg, unitriangular_arg);
+  }}
+  if (!left_arg) {{
+    graph_out.copy_(working_out.transpose(-2, -1));
+  }}
+  return graph_out;
 }}
 
 REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
@@ -3714,11 +4218,200 @@ at::Tensor {kernel}(const at::Tensor& self) {{
 REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
 """
 
+# aten's `index.Tensor` receives a list in which every unindexed axis is a full
+# slice. Integer tensors broadcast together into the advanced-index block, and
+# reduced axes are then separated from the retained axes. The checkpoint's
+# coordinates are small, so their values and the result layout are checked by
+# the CPU reference before the graph runs. The host then builds one dense
+# row-major source address per result element. MpsGatherIndex reads the source
+# values at those addresses in an MPSGraph gather; source values are not read on
+# the host.
+#
+# The addresses also handle negative coordinates. A boolean mask, scalar tensor
+# coordinate, unsupported source width, empty result or metadata failure
+# declines to the reference result. ATen resolves slices, None and ellipsis
+# before this schema is called.
+T_INDEX = """\
+at::Tensor {kernel}(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices) {{
+  c10::List<std::optional<at::Tensor>> host_indices;
+  host_indices.reserve(indices.size());
+  for (const std::optional<at::Tensor>& entry : indices) {{
+    host_indices.push_back(
+        entry.has_value() && entry->defined()
+            ? std::optional<at::Tensor>(entry->cpu())
+            : std::nullopt);
+  }}
+  const at::Tensor host_self = self.is_cpu() ? self : self.cpu();
+  const at::Tensor selected = at::index(host_self, host_indices);
+  if (selected.numel() == 0) {{
+    return selected.to(self.device());
+  }}
+  std::vector<at::Tensor> index_tensors;
+  for (const std::optional<at::Tensor>& entry : indices) {{
+    if (entry.has_value() && entry->defined()) {{
+      // Boolean masks and scalar coordinates have their own indexing rules;
+      // the checked reference above answers both.
+      if (entry->scalar_type() == at::kBool || entry->dim() == 0) {{
+        return selected.to(self.device());
+      }}
+      index_tensors.push_back(entry->to(at::kLong).cpu().reshape(-1));
+    }}
+  }}
+  std::vector<int64_t> block_shape;
+  for (const at::Tensor& index : index_tensors) {{
+    const std::vector<int64_t> sizes = index.sizes().vec();
+    try {{
+      block_shape = block_shape.empty()
+          ? sizes : at::infer_size(block_shape, sizes);
+    }} catch (const std::exception&) {{
+      return selected.to(self.device());
+    }}
+  }}
+  int64_t block_count = 1;
+  for (const int64_t extent : block_shape) {{
+    block_count *= extent;
+  }}
+  if (block_count == 0) {{
+    return selected.to(self.device());
+  }}
+  const std::vector<int64_t> out_shape = selected.sizes().vec();
+  const int64_t block_rank = static_cast<int64_t>(block_shape.size());
+  std::vector<int64_t> index_axes;
+  std::vector<int64_t> retained_axes;
+  for (int64_t axis = 0; axis < self.dim(); ++axis) {{
+    if (axis < static_cast<int64_t>(indices.size()) &&
+        indices.get(axis).has_value() &&
+        indices.get(axis)->defined()) {{
+      index_axes.push_back(axis);
+    }} else {{
+      retained_axes.push_back(axis);
+    }}
+  }}
+  std::vector<int64_t> retained_shape;
+  for (const int64_t axis : retained_axes) {{
+    if (self.size(axis) == 0) {{
+      return selected.to(self.device());
+    }}
+    retained_shape.push_back(self.size(axis));
+  }}
+  int64_t retained_count = 1;
+  for (const int64_t extent : retained_shape) {{
+    retained_count *= extent;
+  }}
+  // Contiguous indices insert the block where its first axis was; a separated
+  // block moves to the front. The first block extent starts at that offset and
+  // advances through all block extents; every other result axis is retained.
+  const bool adjacent = index_axes.size() == 1 ||
+      index_axes.back() - index_axes.front() + 1 ==
+      static_cast<int64_t>(index_axes.size());
+  int64_t block_offset = 0;
+  if (adjacent) {{
+    for (const int64_t axis : retained_axes) {{
+      if (axis < index_axes.front()) {{
+        ++block_offset;
+      }}
+    }}
+  }}
+  const int64_t output_count = block_count * retained_count;
+  std::vector<int64_t> block_strides(static_cast<size_t>(block_rank), 1);
+  for (int64_t d = block_rank - 2; d >= 0; --d) {{
+    block_strides[static_cast<size_t>(d)] =
+        block_strides[static_cast<size_t>(d + 1)] *
+        block_shape[static_cast<size_t>(d + 1)];
+  }}
+  std::vector<int64_t> source_strides(
+      static_cast<size_t>(self.dim()), 1);
+  for (int64_t axis = self.dim() - 2; axis >= 0; --axis) {{
+    source_strides[static_cast<size_t>(axis)] =
+        source_strides[static_cast<size_t>(axis + 1)] *
+        self.size(axis + 1);
+  }}
+  std::vector<int64_t> address_data(
+      static_cast<size_t>(output_count), 0);
+  for (int64_t position = 0; position < output_count; ++position) {{
+    std::vector<int64_t> block_coordinates(static_cast<size_t>(block_rank), 0);
+    std::vector<int64_t> retained_coordinates(retained_axes.size(), 0);
+    int64_t remaining = position;
+    for (int64_t d = static_cast<int64_t>(out_shape.size()) - 1;
+         d >= 0; --d) {{
+      const int64_t digit = remaining % out_shape[static_cast<size_t>(d)];
+      remaining /= out_shape[static_cast<size_t>(d)];
+      if (adjacent && d >= block_offset &&
+          d < block_offset + block_rank) {{
+        block_coordinates[static_cast<size_t>(d - block_offset)] = digit;
+      }} else {{
+        const int64_t retained =
+            block_rank > 0 && d > block_offset + block_rank - 1
+                ? d - block_rank
+                : d;
+        retained_coordinates[static_cast<size_t>(retained)] = digit;
+      }}
+    }}
+    int64_t address = 0;
+    int64_t retained_slot = 0;
+    int64_t index_slot = 0;
+    for (int64_t axis = 0; axis < self.dim(); ++axis) {{
+      if (std::find(index_axes.begin(), index_axes.end(), axis) ==
+          index_axes.end()) {{
+        address += retained_coordinates[static_cast<size_t>(retained_slot++)] *
+            source_strides[static_cast<size_t>(axis)];
+        continue;
+      }}
+      int64_t flat = 0;
+      for (int64_t d = 0; d < block_rank; ++d) {{
+        flat += block_coordinates[static_cast<size_t>(d)] *
+            (d + 1 == block_rank
+                 ? 1
+                 : block_strides[static_cast<size_t>(d)]);
+      }}
+      const int64_t index_count =
+          index_tensors[static_cast<size_t>(index_slot)].numel();
+      int64_t value = index_tensors[static_cast<size_t>(index_slot)]
+          [block_count == index_count ? flat : flat % index_count]
+              .item<int64_t>();
+      if (value < 0) {{
+        value += self.size(axis);
+      }}
+      address += value * source_strides[static_cast<size_t>(axis)];
+      ++index_slot;
+    }}
+    address_data[static_cast<size_t>(position)] = address;
+  }}
+  at::Tensor out = at::empty(out_shape, self.options());
+  at::Tensor addresses =
+      at::tensor(address_data,
+                 at::TensorOptions().dtype(at::kInt).device(self.device()));
+  std::vector<int64_t> storage_shape = self.sizes().vec();
+  if (adjacent) {{
+    storage_shape[static_cast<size_t>(index_axes.front())] = block_count;
+  }} else {{
+    storage_shape[static_cast<size_t>(index_axes.front())] = block_count;
+    storage_shape.erase(storage_shape.begin() + index_axes.front() + 1,
+                        storage_shape.begin() + index_axes.back() + 1);
+  }}
+  if (!mps::MpsGatherIndex(out, self, addresses, storage_shape)) {{
+    return selected.to(self.device());
+  }}
+  return out;
+}}
+
+REGISTER_IMPL_TO_DISPATCHER({fn}, {disp}, Backend::kMps, {kernel})
+"""
+
 CATEGORIES = {
     "unary": T_UNARY,
     "binary": T_BINARY,
     "binary_scalar": T_SCALAR,
     "reduce": T_REDUCE,
+    "all": T_ALL,
+    "all_dim": T_ALL_DIM,
+    "all_dims": T_ALL_DIMS,
+    "triu": T_TRIU,
+    "argmax": T_ARGMAX,
+    "SOLVE_TRIANGULAR": T_SOLVE_TRIANGULAR,
+    "index": T_INDEX,
     "gemm": T_GEMM,
     "softmax": T_SOFTMAX_BODY,
     "pow_scalar": T_POW,
@@ -3794,6 +4487,7 @@ FILE_HEADER = """\
 
 #include "../../../generated/ops.h"
 #include <ATen/ExpandUtils.h>
+#include <ATen/TensorIndexing.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/ops/_softmax.h>
 #include <ATen/ops/abs.h>
@@ -3836,7 +4530,9 @@ namespace at::native::flagos {
 
 """
 
-FILE_FOOTER = "\n} // namespace at::native::flagos\n"
+FILE_FOOTER = "\
+} // namespace at::native::flagos\
+"
 
 INC_HEADER = """\
 // Copyright (c) 2026, BAAI. All rights reserved.
@@ -3941,7 +4637,7 @@ def render():
         covered.append((op, category))
 
     return (
-        FILE_HEADER + "\n".join(bodies) + FILE_FOOTER,
+        FILE_HEADER + "\n\n".join(bodies) + FILE_FOOTER,
         INC_HEADER
         + "".join(f'  m.impl("{op}", {wrappers[op]});\n' for op, _ in sorted(covered)),
         covered,
