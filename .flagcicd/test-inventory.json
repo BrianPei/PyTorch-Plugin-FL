@@ -1510,6 +1510,15 @@
       ],
       "selector": "tests/unit/test_backend_enum_naming.py"
     },
+    "tests/unit/test_backend_key_vendor_naming.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Hardware-free backend enumerator and vendor route-key naming contract introduced by upstream #649.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_backend_key_vendor_naming.py"
+    },
     "tests/unit/test_ci_commands.py": {
       "lane": "L1",
       "owner": "Torch-FL CI maintainers",
