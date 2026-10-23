@@ -21,7 +21,9 @@ from collections import Counter
 from pathlib import Path
 
 
-def merge_reports(directory, platform, outcome, source_repository, source_ref):
+def merge_reports(
+    directory, platform, outcome, source_repository, source_ref, require_execution=False
+):
     summary = Counter(total=0, collected=0)
     tests, collectors, warnings, sessions, incomplete = [], [], [], [], []
     duration = 0.0
@@ -83,34 +85,37 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
 
     if not sessions:
         raise ValueError("No pytest sessions started; no test report to upload")
-    ledger_path = Path(directory) / "groups.json"
-    ledger = None
-    if ledger_path.exists():
-        ledger = json.loads(ledger_path.read_text())
-        groups = ledger["groups"]
+    execution = None
+    execution_errors = []
+    execution_path = Path(directory) / "groups.json"
+    if execution_path.is_file():
+        execution = json.loads(execution_path.read_text())
+        groups = execution.get("groups", [])
         if (
-            not ledger["complete"]
-            or ledger["expected"] != [group["name"] for group in groups]
-            or any(group["status"] != "passed" for group in groups)
+            not groups
+            or execution.get("expected") != [g.get("name") for g in groups]
+            or any(g.get("status") != "passed" for g in groups)
         ):
-            incomplete.append("groups.json")
+            execution_errors.append(
+                "integration groups did not all complete successfully"
+            )
         for group in groups:
-            if group["requires_pytest"]:
-                matched = [s for s in sessions if s.get("group") == group["name"]]
-                counts = Counter()
-                for session in matched:
-                    counts.update(session.get("summary", {}))
-                group["summary"] = dict(counts)
-                group["pytest_sessions"] = [s["report"] for s in matched]
-                if not matched:
-                    incomplete.append("missing pytest session: " + group["name"])
-                elif group.get("min_passed", 0) > sum(
-                    s.get("summary", {}).get("passed", 0) for s in matched
-                ):
-                    incomplete.append(
-                        "required group has no passing tests: " + group["name"]
-                    )
-    complete = not incomplete
+            matched = [
+                session for session in sessions if session.get("group") == group["name"]
+            ]
+            if group.get("requires_pytest") and not matched:
+                execution_errors.append("missing pytest session: " + group["name"])
+            if group.get("min_passed", 0) > sum(
+                session.get("summary", {}).get("passed", 0) for session in matched
+            ):
+                execution_errors.append(
+                    "required group has no passing tests: " + group["name"]
+                )
+    elif require_execution:
+        execution_errors.append("integration execution record is missing")
+    if not summary.get("passed", 0):
+        execution_errors.append("no tests passed")
+    complete = not incomplete and not execution_errors
     # The integration runner owns the verdict, including its existing explicit
     # teardown-crash policy and failures in non-pytest environment checks.
     return {
@@ -129,9 +134,10 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
             "source_repository": source_repository,
             "source_ref": source_ref,
             "complete": complete,
+            "execution": execution,
+            "execution_errors": execution_errors,
             "incomplete_sessions": incomplete,
             "sessions": sessions,
-            "execution": ledger,
         },
     }
 
@@ -139,6 +145,7 @@ def merge_reports(directory, platform, outcome, source_repository, source_ref):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report-dir", required=True)
+    parser.add_argument("--require-execution", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--platform", required=True)
     parser.add_argument(
@@ -153,6 +160,7 @@ def main():
         args.outcome,
         args.source_repository,
         args.source_ref,
+        args.require_execution,
     )
     Path(args.output).write_text(json.dumps(report), encoding="utf-8")
     print(

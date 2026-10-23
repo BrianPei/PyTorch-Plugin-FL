@@ -112,8 +112,8 @@ def test_every_publishing_platform_has_a_build_job_in_the_release_workflow():
     """
     matrix = _release_matrix_platforms()
     publishing = publishing_platforms()
-    missing = sorted(set(publishing.values()) - set(matrix))
-    extra = sorted(set(matrix) - set(publishing.values()))
+    missing = sorted(set(publishing) - set(matrix))
+    extra = sorted(set(matrix) - set(publishing))
     assert not missing, f"release.yml's matrix has no job for: {missing}"
     assert not extra, (
         f"release.yml's matrix builds {extra}, which carry no pypi_lane, so "
@@ -140,14 +140,10 @@ def test_the_publisher_reads_the_same_platforms_the_table_does():
     assert _publisher().lanes() == publishing_platforms()
 
 
-@pytest.mark.parametrize("naming", ["vendor", "legacy"])
-def test_the_publisher_reads_the_platform_out_of_the_artifact_directory(
-    tmp_path, naming
-):
+def test_the_publisher_reads_the_platform_out_of_the_artifact_directory(tmp_path):
     publisher = _publisher()
-    for platform, vendor in publishing_platforms().items():
-        name = vendor if naming == "vendor" else platform
-        directory = tmp_path / f"wheel-{name}"
+    for platform in publishing_platforms():
+        directory = tmp_path / f"wheel-{platform}"
         directory.mkdir()
         (directory / "torch_fl-2.10.0+x-cp312-cp312-linux_x86_64.whl").touch()
     found = publisher.collect(tmp_path)
@@ -292,21 +288,26 @@ def test_the_build_workflow_derives_the_pre_release_from_the_tag():
 # the platform somewhere in the workflow (the test above) is satisfied either way.
 
 
-def test_release_publishes_only_after_accepting_all_candidate_wheels():
-    jobs = _release_jobs(RELEASE.read_text(encoding="utf-8"))
-    assert "publish: false" in jobs["build"]
-    assert "test_profile: release" in jobs["acceptance"]
-    assert "candidate_artifact: wheel-${{ matrix.platform }}" in jobs["acceptance"]
-    for vendor in _release_matrix_platforms():
-        config = (CONFIGS / f"{vendor}.yml").read_text()
-        artifact = re.search(r"^wheel_artifact_name:\s*(\S+)", config, re.M)
-        assert artifact is not None
-        assert artifact.group(1) == f"wheel-{vendor}"
+def test_every_release_build_job_carries_the_upload():
+    """The one matrix job builds and uploads every publishing platform.
 
-    assert "needs: [guard, acceptance]" in jobs["publish"]
-    assert ".github/workflows/publish-accepted-wheel.yml" in jobs["publish"]
-    assert "NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}" in jobs["publish"]
-    assert set(_release_matrix_platforms()) == set(publishing_platforms().values())
+    There were seven spelled-out jobs before, each holding its own `publish:`
+    and `NEXUS_TOKEN`; a platform wired without them produced a green release
+    with a wheel silently missing. There is one job now, so the upload is
+    checked once, and the matrix it fans out over is held to the publishing
+    platforms so a platform cannot drop out of the release unnoticed.
+    """
+    jobs = _release_jobs(RELEASE.read_text(encoding="utf-8"))
+    builds = {
+        name: body
+        for name, body in jobs.items()
+        if ".github/workflows/build-wheel.yml" in body
+    }
+    assert len(builds) == 1, sorted(builds)
+    name, body = next(iter(builds.items()))
+    assert "publish: true" in body, f"{name} builds a wheel but does not publish it"
+    assert "NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}" in body, name
+    assert set(_release_matrix_platforms()) == set(publishing_platforms())
 
 
 def test_ci_still_builds_without_publishing():

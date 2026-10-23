@@ -51,6 +51,8 @@ _ENTRY_KEYS = {
     "platforms",
     "environment",
     "environment_from_config",
+    "profiles",
+    "min_passed",
 }
 
 
@@ -129,6 +131,18 @@ def validate_manifest(manifest, known):
         _require_string(entry.get("name"), f"steps[{index}].name")
         _require_string(entry.get("command"), f"steps[{index}].command")
         platforms = _entry_platforms(entry, known)
+        minimum = entry.get("min_passed", 0)
+        if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 0:
+            raise ManifestError(
+                f"step {step_id!r}: min_passed must be a nonnegative integer"
+            )
+        profiles = entry.get("profiles", ["pr", "nightly"])
+        if (
+            not isinstance(profiles, list)
+            or not profiles
+            or any(profile not in ("pr", "nightly") for profile in profiles)
+        ):
+            raise ManifestError(f"step {step_id!r}: profiles must name pr or nightly")
 
         if entry.get("environment") is not None:
             _environment(entry, f"steps[{index}].environment")
@@ -181,12 +195,14 @@ def _environment(entry, field):
     return {str(key): str(value) for key, value in environment.items()}
 
 
-def compose(manifest, config, platform, known, profile=None, tier_policy=None):
+def compose(manifest, config, platform, known, profile="nightly"):
     """The `integration_tests` list for one platform.
 
     Order is the manifest's, never the config's, so two platforms that run the
     same steps run them in the same sequence.
     """
+    if profile not in ("pr", "nightly"):
+        raise ManifestError("weekly is reserved; supported profiles are pr and nightly")
     steps, _ids, _assigned = validate_manifest(manifest, known)
     if platform not in known:
         raise ManifestError(
@@ -204,6 +220,8 @@ def compose(manifest, config, platform, known, profile=None, tier_policy=None):
 
     composed = []
     for entry in steps:
+        if profile not in entry.get("profiles", ["pr", "nightly"]):
+            continue
         if platform not in _entry_platforms(entry, known):
             continue
         environment = _environment(entry, f"step {entry['id']}.environment")
@@ -228,6 +246,8 @@ def compose(manifest, config, platform, known, profile=None, tier_policy=None):
             "name": entry["name"].replace(DISPLAY_NAME_TOKEN, display_name),
             "command": entry["command"],
         }
+        if entry.get("min_passed"):
+            step["min_passed"] = entry["min_passed"]
         if environment:
             step["environment"] = environment
         composed.append(step)
@@ -248,19 +268,6 @@ def compose(manifest, config, platform, known, profile=None, tier_policy=None):
 
     if not composed:
         raise ManifestError(f"no steps apply to {platform!r}")
-    if profile:
-        from test_tiers import policy, requirement_evidence, select
-
-        ids = [
-            entry["id"] for entry in steps if platform in _entry_platforms(entry, known)
-        ]
-        composed = select(composed, ids, profile, platform, tier_policy or policy())
-        composed.sort(key=lambda group: group["level"])
-        for group in composed:
-            evidence = requirement_evidence(group, config)
-            group["requirement_evidence"] = evidence
-            if evidence["status"] == "blocked":
-                group["blocked_reason"] = "; ".join(evidence["reasons"])
     return composed
 
 
@@ -280,15 +287,13 @@ def coverage_report(assigned, known):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--platform", required=True)
+    parser.add_argument("--profile", default="pr")
     parser.add_argument("--manifest", required=True, help="manifest as JSON")
     parser.add_argument("--platform-config", required=True, help="config as JSON")
     parser.add_argument(
         "--config-dir",
         default=".github/configs",
         help="directory the platform list is read from",
-    )
-    parser.add_argument(
-        "--profile", choices=("pr", "pr-risk", "nightly", "weekly", "release")
     )
     args = parser.parse_args(argv)
 
@@ -298,7 +303,7 @@ def main(argv=None):
         known = known_platforms(args.config_dir)
         steps, _ids, assigned = validate_manifest(manifest, known)
         composed = compose(manifest, config, args.platform, known, args.profile)
-    except (ManifestError, ValueError, KeyError) as error:
+    except ManifestError as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1
     except (OSError, json.JSONDecodeError) as error:

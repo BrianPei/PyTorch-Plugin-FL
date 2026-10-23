@@ -632,6 +632,8 @@ def test_the_loader_invocation_composes_the_same_groups(tmp_path, capsys):
     assert (
         composer.main(
             [
+                "--profile",
+                "nightly",
                 "--platform",
                 "nvidia",
                 "--manifest",
@@ -661,6 +663,8 @@ def test_the_loader_refuses_a_platform_with_no_config(tmp_path, capsys):
     assert (
         composer.main(
             [
+                "--profile",
+                "nightly",
                 "--platform",
                 "nvidia_h100",
                 "--manifest",

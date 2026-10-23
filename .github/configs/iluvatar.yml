@@ -67,7 +67,6 @@ container_options: >-
   --device=/dev/iluvatar15
 
 timeout_minutes: 60
-integration_timeout_minutes: 720
 wheel_artifact_name: wheel-iluvatar
 
 environment_check:

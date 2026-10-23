@@ -79,9 +79,8 @@ container_options: >-
   --device=/dev/alixpu_ppu15
 
 timeout_minutes: 60
-integration_timeout_minutes: 720
 # Release/manual wheel-build artifact; CI tests the wheel in the build job.
-wheel_artifact_name: wheel-thead
+wheel_artifact_name: wheel-ppu
 
 # What this platform's environment has to look like before any test runs, read
 # by the first step of .github/integration-manifest.yml through

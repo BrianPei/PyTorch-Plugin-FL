@@ -205,11 +205,7 @@ def test_abrupt_exit_keeps_completed_sessions_without_inventing_crash_results(tm
     assert process.returncode == 3
     report = _merge(reports, "failure")
     assert report["summary"]["total"] == report["summary"]["passed"] == 1
-    assert "groups.json" in report["flagcicd"]["incomplete_sessions"]
-    assert any(
-        name.endswith(".json") and name != "groups.json"
-        for name in report["flagcicd"]["incomplete_sessions"]
-    )
+    assert len(report["flagcicd"]["incomplete_sessions"]) == 1
     assert report["exitcode"] == 1
 
 
@@ -463,40 +459,3 @@ def test_missing_token_skips_upload_without_logging_credentials(
     assert result.returncode == 0, result.stderr
     assert output.read_text() == expected
     assert not token or token not in result.stdout + result.stderr
-
-
-def test_one_passing_group_cannot_hide_another_required_all_skip_group(tmp_path):
-    workdir = tmp_path / "wheel-only"
-    workdir.mkdir()
-    (workdir / "test_ok.py").write_text("def test_ok(): pass\n")
-    (workdir / "test_skip.py").write_text(
-        "import pytest\ndef test_skip(): pytest.skip('no capability')\n"
-    )
-    process, reports = _integration(
-        tmp_path,
-        [
-            {
-                "name": "required pass",
-                "command": f"{PYTHON} -m pytest test_ok.py -q",
-                "min_passed": 1,
-            },
-            {
-                "name": "required skip",
-                "command": f"{PYTHON} -m pytest test_skip.py -q",
-                "min_passed": 1,
-            },
-        ],
-    )
-    assert process.returncode == 0
-    merged = _merge(reports)
-    assert merged["summary"]["passed"] == 1
-    assert merged["flagcicd"]["complete"] is False
-    assert merged["exitcode"] == 1
-    assert (
-        "required group has no passing tests: required skip"
-        in merged["flagcicd"]["incomplete_sessions"]
-    )
-    groups = merged["flagcicd"]["execution"]["groups"]
-    assert groups[0]["summary"]["passed"] == 1
-    assert groups[1]["summary"]["skipped"] == 1
-    assert groups[1]["pytest_sessions"]

@@ -17,6 +17,11 @@ name: FlagCICD Entry
 on:
   workflow_dispatch:
     inputs:
+      profile:
+        description: pr or full nightly; weekly is reserved
+        type: choice
+        default: pr
+        options: [pr, nightly, weekly]
       pr_number:
         description: Optional open PR number; resolves the actual head and base SHAs
         type: string
@@ -33,21 +38,11 @@ on:
         description: all (change-aware) or comma-separated platform names
         type: string
         default: all
-      selection:
-        description: 'Select affected or all candidate platforms; legacy preserves old callers'
-        type: choice
-        default: legacy
-        options: [legacy, affected, all]
       test_level:
         description: Minimum level; changed files may raise it
         type: choice
         default: auto
-        options: [auto, L0, L1, L2, L3]
-      profile:
-        description: Execution profile; auto selects a bounded L3 subset for runtime changes
-        type: choice
-        default: auto
-        options: [auto, pr, pr-risk, nightly, weekly]
+        options: [auto, L0, L1, L2]
       task_id:
         description: Optional external task identifier
         type: string
@@ -85,8 +80,8 @@ jobs:
     timeout-minutes: 20
     outputs:
       context: ${{ steps.plan.outputs.context }}
-      profile: ${{ steps.plan.outputs.profile }}
       test_level: ${{ steps.plan.outputs.test_level }}
+      profile: ${{ steps.plan.outputs.profile }}
       platforms: ${{ steps.plan.outputs.platforms }}
       validated_platforms: ${{ steps.plan.outputs.validated_platforms }}
       source_repository: ${{ steps.resolve.outputs.source_repository }}
@@ -107,7 +102,6 @@ jobs:
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          CONTROL_SHA: ${{ github.workflow_sha }}
         run: python control/.github/scripts/flagcicd_resolve.py --output request.json
       - name: Checkout source data
         uses: actions/checkout@v4
@@ -122,8 +116,6 @@ jobs:
       # `git diff base...head` then fails with "no merge base" and silently
       # degrades the plan to an unavailable diff.
       - name: Fetch comparison commit
-        continue-on-error: true
-        timeout-minutes: 3
         env:
           BASE_SHA: ${{ steps.resolve.outputs.base_sha }}
         run: >-
@@ -159,6 +151,7 @@ jobs:
     uses: ./.github/workflows/load-platform-config.yml
     with:
       platform: ${{ matrix.platform }}
+      test_profile: ${{ needs.plan.outputs.profile }}
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
 
@@ -178,17 +171,9 @@ jobs:
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
 
-  wheel-checks:
-    needs: [plan, lint, preflight]
-    if: needs.plan.outputs.test_level != 'L0'
-    uses: ./.github/workflows/wheel-checks.yml
-    with:
-      checkout_repository: ${{ needs.plan.outputs.source_repository }}
-      checkout_ref: ${{ needs.plan.outputs.source_sha }}
-
   platforms:
-    needs: [plan, lint, preflight, agnostic, codegen, wheel-checks]
-    if: needs.plan.outputs.test_level == 'L2' || needs.plan.outputs.test_level == 'L3'
+    needs: [plan, lint, preflight, agnostic, codegen]
+    if: needs.plan.outputs.test_level == 'L2'
     strategy:
       fail-fast: false
       matrix:
@@ -198,15 +183,15 @@ jobs:
       FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
     with:
       platform: ${{ matrix.platform }}
+      test_profile: ${{ needs.plan.outputs.profile }}
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
       flagcicd_plan: ${{ needs.plan.outputs.context }}
-      test_profile: ${{ needs.plan.outputs.profile }}
 
   complete:
     name: FlagCICD complete
     if: always()
-    needs: [plan, lint, preflight, agnostic, codegen, wheel-checks, platforms]
+    needs: [plan, lint, preflight, agnostic, codegen, platforms]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

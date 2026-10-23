@@ -108,8 +108,7 @@ def test_the_parameterized_workflow_provisions_every_platform():
         'bash "${{ needs.configuration.outputs.setup_script }}" '
         '--platform "${{ needs.configuration.outputs.setup_platform }}"' in text
     )
-    assert "CI_STAGE:" in text
-    assert "needs.configuration.outputs.setup_stage" in text
+    assert "CI_STAGE: ${{ needs.configuration.outputs.setup_stage }}" in text
 
 
 def test_config_driven_path_uses_the_runner():
@@ -298,87 +297,3 @@ def _requested_names(requirements: list[str]) -> list[str]:
             name = name.split(separator, 1)[0]
         names.append(name)
     return names
-
-
-def test_ascend_defers_flagcx_backend_loading_across_build_steps(tmp_path):
-    """Installed FlagCX must not load an extension that setup has yet to build."""
-    import os
-    import sys
-
-    hook = (HOOKS / "set_env_ascend.sh").read_text()
-    environment = hook[
-        hook.index("export FLAGOS_ACCELERATOR=ascend") : hook.index(
-            "# --- Ascend driver "
-        )
-    ]
-    persist = next(
-        line.strip()
-        for line in hook.splitlines()
-        if line.strip().startswith("export_ci_env ")
-    )
-    stubs = tmp_path / "modules"
-    stubs.mkdir()
-    (stubs / "torch.py").write_text(
-        "import os\n"
-        "if os.environ.get('TORCH_DEVICE_BACKEND_AUTOLOAD', '1') == '1':\n"
-        "    import flagcx\n"
-    )
-    (stubs / "flagcx.py").write_text("import torch_fl._C\n")
-    (stubs / "torch_fl").mkdir()
-    (stubs / "torch_fl/__init__.py").touch()
-    probe = "import sys; sys.path.insert(0, sys.argv[1]); import torch"
-    env = {**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "1"}
-    before = subprocess.run(
-        [sys.executable, "-c", probe, str(stubs)],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert before.returncode != 0
-    assert "No module named 'torch_fl._C'" in before.stderr
-    github_env = tmp_path / "github-env"
-    # Supply unrelated hook fields without provisioning any hardware or packages.
-    defaults = "\n".join(
-        f"if [[ ! -v {name} ]]; then {name}=fixture; fi" for name in persist.split()[1:]
-    )
-    script = (
-        'set -euo pipefail\nsource "$1"\nGITHUB_ENV="$2"\n'
-        + defaults
-        + "\n"
-        + environment
-        + "\n"
-        + persist
-        + '\n"$3" -c \'import sys; sys.path.insert(0, sys.argv[1]); import torch\' "$4"\n'
-    )
-    setup = subprocess.run(
-        [
-            "bash",
-            "-c",
-            script,
-            "ascend-setup",
-            str(SCRIPTS / "lib/set_env_common.sh"),
-            str(github_env),
-            sys.executable,
-            str(stubs),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert setup.returncode == 0, setup.stderr
-    persisted = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
-    later = subprocess.run(
-        [sys.executable, "-c", probe, str(stubs)],
-        env={**env, **persisted},
-        capture_output=True,
-        text=True,
-    )
-    assert later.returncode == 0, later.stderr
-    (stubs / "torch_fl/_C.py").touch()
-    explicit = subprocess.run(
-        [sys.executable, "-c", probe + "; import torch_fl._C", str(stubs)],
-        env={**env, **persisted},
-        capture_output=True,
-        text=True,
-    )
-    assert explicit.returncode == 0, explicit.stderr

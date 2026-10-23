@@ -45,9 +45,7 @@ def test_required_gate_covers_matrix_pipeline():
         "lint",
         "agnostic-checks",
         "codegen-checks",
-        "wheel-checks",
         "discover-platforms",
-        "preflight",
         "platform-pipeline",
     }
     assert (
@@ -121,88 +119,26 @@ def test_dispatch_can_select_each_platform(platform):
     assert json.loads(result.stdout.removeprefix("platforms=")) == [platform]
 
 
-def _run_gate(tmp_path, selected, result, failed_job=None, report=True):
+@pytest.mark.parametrize("selected", [True, False])
+@pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
+def test_required_gate_checks_platform_result(selected, result):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
     results = {name: {"result": "success"} for name in gate["needs"]}
-    results["platform-pipeline"]["result"] = result
-    if failed_job:
-        name, outcome = failed_job
-        results[name]["result"] = outcome
-    plan = {
-        "source_repository": "flagos-ai/Torch-FL",
-        "source_sha": "a" * 40,
-        "run_id": "42",
-        "test_level": "L2" if selected else "L1",
-        "config_hash": "b" * 64,
-        "scope": "installed_wheel_integration",
-        "risk_level": "R2",
-        "task_id": "",
-        "parent_run_id": "",
-        "expected_platforms": ["cuda"] if selected else [],
+    results["discover-platforms"]["outputs"] = {
+        "platforms": json.dumps(PLATFORMS[:1] if selected else [])
     }
-    directory = tmp_path / "platform-reports"
-    directory.mkdir()
-    if selected and report:
-        (directory / "flagcicd-platform-cuda.json").write_text(
-            json.dumps(
-                {
-                    **{
-                        key: plan[key]
-                        for key in (
-                            "source_repository",
-                            "source_sha",
-                            "run_id",
-                            "test_level",
-                            "config_hash",
-                        )
-                    },
-                    "schema_version": "flagcicd.report/v1",
-                    "report_type": "platform",
-                    "platform": {"name": "cuda"},
-                    "status": "passed",
-                    "run_attempt": 1,
-                }
-            )
-        )
-    run = next(
-        step["run"] for step in gate["steps"] if "JOB_RESULTS" in step.get("env", {})
-    )
-    run = run.replace(
-        ".github/scripts/flagcicd_report.py",
-        str(ROOT / ".github/scripts/flagcicd_report.py"),
-    )
+    results["platform-pipeline"]["result"] = result
     process = subprocess.run(
-        ["bash", "-e", "-c", run],
-        cwd=tmp_path,
-        env={
-            **os.environ,
-            "JOB_RESULTS": json.dumps(results),
-            "FLAGCICD_PLAN": json.dumps(plan),
-            "GITHUB_RUN_ID": "42",
-            "GITHUB_RUN_ATTEMPT": "1",
-        },
+        ["bash", "-e", "-c", gate["steps"][0]["run"]],
+        env={**os.environ, "RESULTS": json.dumps(results)},
         capture_output=True,
         text=True,
     )
-    summary = json.loads((tmp_path / "flagcicd-run-summary.json").read_text())
-    return process, summary
-
-
-@pytest.mark.parametrize("selected", [True, False])
-@pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
-def test_required_gate_checks_platform_result(tmp_path, selected, result):
-    process, summary = _run_gate(tmp_path, selected, result)
     assert (process.returncode == 0) == (
-        (selected and result == "success") or (not selected and result == "skipped")
+        result == "success" or (not selected and result == "skipped")
     )
-    assert summary["entry_jobs"]["platform-pipeline"] == result
-
-
-def test_passing_matrix_without_a_platform_report_cannot_pass(tmp_path):
-    process, summary = _run_gate(tmp_path, True, "success", report=False)
-    assert process.returncode == 1
-    assert summary["status"] == "report_error"
-    assert "missing platform report: cuda" in summary["errors"]
+    if process.returncode:
+        assert f"platform-pipeline: {result}" in process.stdout
 
 
 @pytest.mark.parametrize(
@@ -212,17 +148,22 @@ def test_passing_matrix_without_a_platform_report_cannot_pass(tmp_path):
         "lint",
         "agnostic-checks",
         "codegen-checks",
-        "wheel-checks",
         "discover-platforms",
-        "preflight",
     ],
 )
-@pytest.mark.parametrize("result", ["failure", "cancelled", "skipped"])
-def test_required_gate_rejects_unsuccessful_shared_checks(tmp_path, name, result):
-    process, summary = _run_gate(tmp_path, False, "skipped", (name, result))
+def test_required_gate_rejects_skipped_shared_checks(name):
+    gate = _workflow("ci.yml")["jobs"]["ci-complete"]
+    results = {job: {"result": "success"} for job in gate["needs"]}
+    results["discover-platforms"]["outputs"] = {"platforms": "[]"}
+    results[name]["result"] = "skipped"
+    process = subprocess.run(
+        ["bash", "-e", "-c", gate["steps"][0]["run"]],
+        env={**os.environ, "RESULTS": json.dumps(results)},
+        capture_output=True,
+        text=True,
+    )
     assert process.returncode == 1
-    assert summary["entry_jobs"][name] == result
-    assert summary["status"] != "passed"
+    assert f"{name}: skipped" in process.stdout
 
 
 def _container_expression(name):

@@ -17,11 +17,10 @@ name: CI
 permissions:
   contents: read
   pull-requests: read
-  actions: read
 
 on:
   schedule:
-    - cron: '0 18 * * *'     # 02:00 CST daily: full nightly regression (L0-L4)
+    - cron: '0 18 * * *'   # 02:00 CST daily
   push:
     branches: [main, dev, devops, dev-hygon, dev-thead, dev-musa, iluvatar_build_and_test]
   pull_request:
@@ -29,16 +28,16 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
+      profile:
+        description: pr or full nightly; weekly is reserved
+        type: choice
+        default: pr
+        options: [pr, nightly, weekly]
       platforms:
         description: 'Comma-separated platforms to run, or all'
         required: false
         default: all
         type: string
-      selection:
-        description: 'Select all candidate platforms or affected candidates; legacy keeps existing behavior'
-        type: choice
-        default: legacy
-        options: [legacy, affected, all]
       pr_number:
         description: 'PR number for a trusted fork on-demand run'
         required: false
@@ -61,20 +60,45 @@ jobs:
     outputs:
       repository: ${{ steps.resolve.outputs.repository }}
       ref: ${{ steps.resolve.outputs.ref }}
-      base_sha: ${{ steps.resolve.outputs.base_sha }}
-      request: ${{ steps.resolve.outputs.request }}
     steps:
-      - name: Checkout trusted control code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
       - name: Resolve trusted source
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          CONTROL_SHA: ${{ github.workflow_sha }}
-        run: python3 .github/scripts/flagcicd_resolve.py --entry ci --output request.json
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_REF: ${{ github.sha }}
+          PR_NUMBER: ${{ inputs.pr_number || '' }}
+        run: |
+          set -euo pipefail
+
+          repository="$EVENT_REPOSITORY"
+          ref="$EVENT_REF"
+          if [[ -n "$PR_NUMBER" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::pr_number must be a positive integer"
+              exit 1
+            fi
+            pr=$(gh api "repos/${EVENT_REPOSITORY}/pulls/${PR_NUMBER}")
+            repository=$(jq -r '.head.repo.full_name // empty' <<<"$pr")
+            ref=$(jq -r '.head.sha // empty' <<<"$pr")
+            state=$(jq -r '.state // empty' <<<"$pr")
+            if [[ "$state" != "open" ]]; then
+              echo "::error::PR #${PR_NUMBER} is not open"
+              exit 1
+            fi
+            if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::PR head repository is unavailable (the fork may have been deleted)"
+              exit 1
+            fi
+            if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::PR head SHA is not a full commit SHA"
+              exit 1
+            fi
+            echo "Testing PR #${PR_NUMBER} from ${repository}@${ref}"
+          fi
+
+          printf 'repository=%s\n' "$repository" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
 
   lint:
     needs: resolve-checkout
@@ -88,7 +112,7 @@ jobs:
   # matrix, so fork on-demand runs test the submitted PR rather than base main.
   agnostic-checks:
     name: Platform-agnostic checks
-    needs: [resolve-checkout, lint, preflight]
+    needs: [resolve-checkout, lint]
     uses: ./.github/workflows/agnostic-checks.yml
     with:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
@@ -96,100 +120,74 @@ jobs:
 
   codegen-checks:
     name: Codegen checks
-    needs: [resolve-checkout, lint, preflight]
+    needs: [resolve-checkout, lint]
     uses: ./.github/workflows/codegen-checks.yml
     with:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
-  wheel-checks:
-    name: Wheel validation (L1)
-    needs: [resolve-checkout, lint, preflight]
-    uses: ./.github/workflows/wheel-checks.yml
-    with:
-      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
-      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
-
   discover-platforms:
-    name: Plan CI execution
-    needs: resolve-checkout
+    name: Discover platforms
+    needs: [resolve-checkout, lint, agnostic-checks, codegen-checks]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     outputs:
-      context: ${{ steps.plan.outputs.context }}
-      platforms: ${{ steps.plan.outputs.platforms }}
-      validated_platforms: ${{ steps.plan.outputs.validated_platforms }}
-      profile: ${{ steps.plan.outputs.profile }}
-      test_level: ${{ steps.plan.outputs.test_level }}
+      platforms: ${{ steps.detect.outputs.platforms }}
     steps:
-      - name: Checkout trusted control code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: control
-          persist-credentials: false
-      - name: Checkout source data
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ needs.resolve-checkout.outputs.repository }}
           ref: ${{ needs.resolve-checkout.outputs.ref }}
-          path: source
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install matrix parser dependency
-        run: python -m pip install "PyYAML==6.0.2"
-      - name: Fetch comparison commit
-        continue-on-error: true
-        timeout-minutes: 3
-        env:
-          BASE_SHA: ${{ needs.resolve-checkout.outputs.base_sha }}
-        run: >-
-          git -C source fetch --no-tags
-          "${{ github.server_url }}/${{ github.repository }}" "$BASE_SHA"
-      - name: Retain normalized request
-        env:
-          REQUEST: ${{ needs.resolve-checkout.outputs.request }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          Path("request.json").write_text(os.environ["REQUEST"])
-          PY
-      - name: Create shared execution plan
-        id: plan
-        run: >-
-          python control/.github/scripts/flagcicd_plan.py
-          --request request.json --source source --output flagcicd-plan.json
-      - name: Retain plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: flagcicd-plan-${{ github.run_attempt }}
-          path: flagcicd-plan.json
-          if-no-files-found: error
-          retention-days: 14
 
-  preflight:
-    name: Validate configuration (${{ matrix.platform }})
-    needs: [resolve-checkout, discover-platforms]
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON(needs.discover-platforms.outputs.validated_platforms) }}
-    uses: ./.github/workflows/load-platform-config.yml
-    with:
-      platform: ${{ matrix.platform }}
-      checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
-      checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
+      - name: Install matrix parser dependency
+        run: python -m pip install PyYAML
+
+      # Emits `platforms` as a JSON array of config basenames, narrowed to the
+      # platforms a pull request can affect. Labels take precedence over files.
+      - name: Detect configured platforms
+        id: detect
+        env:
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_PROFILE: ${{ github.event_name == 'schedule' && 'nightly' || inputs.profile || 'pr' }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          case "$TEST_PROFILE" in
+            pr) ;;
+            nightly)
+              if [[ -n "$DISPATCH_PLATFORMS" && "$DISPATCH_PLATFORMS" != all ]]; then
+                echo "::error::nightly requires platforms=all"
+                exit 2
+              fi
+              ;;
+            *) echo "::error::weekly is reserved; choose pr or nightly"; exit 2 ;;
+          esac
+          PR_LABELS=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            PR_LABELS=$(jq -r 'join(",")' <<<"$PR_LABELS_JSON")
+          fi
+
+          python .github/scripts/ci/generate_matrix.py \
+            --event-name "$EVENT_NAME" \
+            --base-ref "$BASE_REF" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --configs-dir .github/configs \
+            --pr-labels "$PR_LABELS" \
+            --dispatch-platforms "$DISPATCH_PLATFORMS" \
+            >> "$GITHUB_OUTPUT"
 
   # One hardware pipeline per configured platform. The reusable workflow reads
   # runner, image, timeout, and test manifest values from that platform config.
   platform-pipeline:
     name: Platform pipeline (${{ matrix.platform }})
-    needs: [resolve-checkout, discover-platforms, lint, preflight, agnostic-checks, codegen-checks, wheel-checks]
-    if: needs.discover-platforms.outputs.test_level == 'L2' || needs.discover-platforms.outputs.test_level == 'L3'
+    needs: [resolve-checkout, discover-platforms]
     strategy:
       fail-fast: false
       matrix:
@@ -199,8 +197,7 @@ jobs:
       FLAGCICD_API_TOKEN: ${{ secrets.FLAGCICD_API_TOKEN }}
     with:
       platform: ${{ matrix.platform }}
-      test_profile: ${{ needs.discover-platforms.outputs.profile }}
-      flagcicd_plan: ${{ needs.discover-platforms.outputs.context }}
+      test_profile: ${{ github.event_name == 'schedule' && 'nightly' || inputs.profile || 'pr' }}
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
@@ -213,36 +210,42 @@ jobs:
       - lint
       - agnostic-checks
       - codegen-checks
-      - wheel-checks
       - discover-platforms
-      - preflight
       - platform-pipeline
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - name: Checkout trusted report code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - name: Download platform outcomes
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          pattern: flagcicd-platform-*
-          path: platform-reports
-      - name: Verify shared checks and planned execution
+      - name: Verify shared checks and selected platforms passed
         env:
-          FLAGCICD_PLAN: ${{ needs.discover-platforms.outputs.context }}
-          JOB_RESULTS: ${{ toJSON(needs) }}
-        run: >-
-          python3 .github/scripts/flagcicd_report.py summary --entry ci
-          --directory platform-reports --output flagcicd-run-summary.json
-      - name: Retain run summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: flagcicd-run-summary-${{ github.run_attempt }}
-          path: flagcicd-run-summary.json
-          if-no-files-found: error
-          retention-days: 14
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          jobs = json.loads(os.environ["RESULTS"])
+          errors = []
+          for name in ("resolve-checkout", "lint", "agnostic-checks", "codegen-checks", "discover-platforms"):
+              if jobs[name]["result"] != "success":
+                  errors.append(f"{name}: {jobs[name]['result']}")
+
+          try:
+              selected = json.loads(jobs["discover-platforms"]["outputs"]["platforms"])
+              if not isinstance(selected, list) or not all(isinstance(p, str) for p in selected):
+                  raise ValueError("platforms must be an array of strings")
+          except (KeyError, TypeError, ValueError) as exc:
+              errors.append(f"Invalid platform discovery: {exc}")
+              selected = []
+
+          platform_result = jobs["platform-pipeline"]["result"]
+          if selected and platform_result != "success":
+              errors.append(f"platform-pipeline: {platform_result}")
+          elif not selected and platform_result not in ("success", "skipped"):
+              errors.append(f"platform-pipeline: {platform_result}")
+
+          for error in errors:
+              print(f"::error::{error}")
+          if errors:
+              sys.exit(1)
+          print("Shared checks and all selected platforms passed.")
+          PY

@@ -1,6 +1,6 @@
 # CI selection and maintainer controls
 
-CI schedules configured hardware platforms through the shared integration
+CI schedules nine configured hardware platforms through the shared integration
 workflow. Runner labels, images and device access come from each platform config;
 test groups come from the shared integration manifest.
 
@@ -13,43 +13,8 @@ test groups come from the shared integration manifest.
 | PR with an unknown routing label | Every platform, conservatively |
 | PR without routing labels | Platforms affected by the changed files |
 | Documentation-only PR without routing labels | No hardware jobs; shared checks still run |
-| Push or nightly schedule | Every platform |
+| Push or daily schedule | Every platform |
 | Manual dispatch | `platforms=all` or a comma-separated platform list |
-
-Automatic CI and FlagCICD Entry normalize requests through `flagcicd_resolve.py`,
-then use the same `flagcicd_plan.py` planner and `flagcicd_report.py` aggregator.
-Both retain `flagcicd-plan-<attempt>`, per-platform outcomes and a
-`flagcicd-run-summary-<attempt>` artifact. Automatic documentation PRs preserve
-the existing shared L1 checks without hardware; an external automatic-level
-documentation request can remain L0. CI manual dispatch preserves a hardware
-minimum and interprets `platforms=all` as the full matrix. Legacy external
-`platforms=all` remains change-aware unless an explicit full selection or
-nightly/weekly profile is requested.
-
-Both dispatch forms expose `selection=legacy|affected|all`. `platforms` defines
-the candidate set; `affected` intersects it with changed-file routing, while
-`all` selects every candidate. `legacy` is normalized to the old entry-specific
-default and recorded as `selection_origin` in the request and summary. Omitting
-the field in repository dispatch has the same compatibility mapping. An explicit
-hardware minimum may restore an empty affected set to its candidate set; the
-plan records this as `affected_or_hardware_floor`.
-
-The plan lists `required_platforms` before narrowing, `platform_decisions` and
-per-platform `case_decisions` with selection, exclusion and blocking reasons.
-Routing labels retain their previous precedence. If labels or an explicit
-subset omit affected platforms, the plan and summary say
-`validation_scope=diagnostic`; a successful diagnostic does not satisfy the
-automatic `CI complete` gate. Nightly with `platforms=all` still covers every
-configured platform and every applicable L0-L4 case. The weekly profile is
-retained for future/manual use; explicit subsets of either profile remain
-diagnostic.
-
-Ordinary PR CI tests its event merge commit and records `target_kind=merge`;
-selection compares the PR base with its head via `diff_sha`. An on-demand fork
-PR request resolves and tests the immutable head with `target_kind=head`.
-`control_sha` records the workflow's control-code version independently of the
-source under test. The plan fingerprint includes execution profile, expected
-cases and control identity so a rerun cannot reuse evidence for another policy.
 
 Routing labels take precedence over file filtering. Adding or removing labels
 reruns PR CI. Supported platform names are `apple`, `ascend`, `enflame`, `hygon`,
@@ -61,9 +26,6 @@ and dedicated workflow automatically belong to that lane. Shared code or an
 unrecognized code path selects all lanes; a recognized vendor change must not
 hide an unrelated shared change in the same PR. Missing or invalid watch
 metadata also selects all lanes. A failed Git comparison selects all lanes.
-Fetching a comparison commit has a bounded, non-fatal step: if it remains
-unavailable, the shared planner records `diff_status=unavailable` and uses its
-conservative selection policy instead of stopping before that fallback.
 
 Selection compares the immutable PR base and head commits and includes both
 paths when files move between platforms. Watch lists include shared consumers:
@@ -72,16 +34,22 @@ also affects MetaX. Keep these relationships aligned with
 `cmake/flagos_platforms.json` and the runtime build configuration when adding or
 changing a platform.
 
+## Functional profiles
+
+The default `pr` profile preserves the platform selection above. The daily
+`nightly` profile runs every configured platform and all applicable existing
+functional groups, including the dedicated CUDA transfer regressions. Manual
+nightly requests require `platforms=all`. `weekly` is reserved and rejected
+before hardware dispatch. Both CI and FlagCICD Entry expose these profile names.
+See [Functional CI profiles](ci-test-tiers.md) for execution and evidence rules.
+
 ## One required check
 
 The top-level job named **CI complete** runs after the shared checks and every
 hardware pipeline. Shared checks and every selected platform must succeed.
 Unselected platforms may skip. A selected platform that unexpectedly skips,
-fails or is cancelled blocks the gate, as do an unavailable plan, missing or
-contradictory platform reports, incomplete test collection and a run with no
-passing pytest cases. The gate checks planned case IDs against execution
-evidence instead of trusting the matrix job result alone. A documentation-only
-PR can pass after its shared checks and configuration validation succeed.
+fails or is cancelled blocks the gate, as does missing or invalid discovery
+output. A documentation-only PR can pass after its shared checks succeed.
 
 A repository administrator can make **CI complete** the required status check
 in the branch protection rule or ruleset. Adding the job does not change that
@@ -97,8 +65,8 @@ first line of a PR comment:
 /ci run
 /ci run all
 /ci run ascend
-/ci run ascend nvidia
-/ci run ascend,nvidia
+/ci run ascend cuda
+/ci run ascend,cuda
 ```
 
 The command validates platform names, keeps unrelated labels, replaces routing
@@ -130,16 +98,6 @@ DNS failures, connection resets, selected curl transport failures and HTTP
 compiler, missing-package and OOM failures take precedence over network noise.
 Unknown failures, driver faults, collective hangs, plain timeouts, unavailable
 logs and cancellations remain failed for investigation.
-
-The platform outcome job records failed execution without failing merely because
-that recorded verdict is non-passing. The hardware job retains its original
-failure and **CI complete** enforces the report verdict. This keeps report-only
-bookkeeping from becoming an extra unknown root failure that disables the
-bounded network retry. A report generation or artifact transfer failure still
-fails normally, and the summary command cannot use record-only mode.
-A non-passing report after otherwise successful hardware also fails the outcome
-job, so rerunning failed jobs regenerates that report before recalculating the
-summary. Invalid stage data is retained as an explicit error in the report.
 
 The policy requests `gh run rerun --failed` at most once, including dependent
 jobs so the aggregate gate is recalculated. It checks the current attempt again

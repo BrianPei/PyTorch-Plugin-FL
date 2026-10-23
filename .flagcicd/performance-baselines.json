@@ -1,5 +1,0 @@
-{
-  "schema_version": "flagcicd.performance-baselines/v1",
-  "reason": "No measured baseline is available in this branch. Nightly records fixed-workload samples; release acceptance requires an approved environment-specific reference.",
-  "environments": {}
-}

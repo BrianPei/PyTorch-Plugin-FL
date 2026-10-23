@@ -79,9 +79,8 @@ container_options: >-
 # is the per-file coverage that caught the cp310 `tomllib` collection error, and
 # nothing else runs it. Ascend, the other long manifest, is already at 120.
 timeout_minutes: 90
-integration_timeout_minutes: 720
 # Release/manual wheel-build artifact; CI tests the wheel in the build job.
-wheel_artifact_name: wheel-hygon
+wheel_artifact_name: wheel-dcu
 
 # What this platform's environment has to look like before any test runs, read
 # by the first step of .github/integration-manifest.yml through

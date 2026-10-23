@@ -17,7 +17,7 @@
 # This job runs the checks that need no accelerator, no vendor image, and no
 # built wheel, so they fail in seconds on ubuntu-latest instead of after a
 # multi-minute hardware job. ci.yml gates every platform pipeline on this job
-# (as a direct prerequisite), which is what stops a repository-wide breakage
+# (through discover-platforms), which is what stops a repository-wide breakage
 # -- a stale generated conf, a shell syntax error in a setup script -- from
 # surfacing as a red hardware job on an unrelated platform (e.g. a PPU conf
 # drift failing the DCU pipeline's trailing unit group).
@@ -105,8 +105,11 @@ jobs:
           python -m pytest \
             tests/unit/test_ai_reviewer.py \
             tests/unit/test_backend_autoload_contract.py \
+            tests/unit/test_ci_functional_profiles.py \
+            tests/unit/test_conf_matches_codegen_routes.py \
             tests/unit/test_backend_enum_naming.py \
             tests/unit/test_backend_key_vendor_naming.py \
+            tests/unit/test_platform_vendor_naming.py \
             tests/unit/test_ci_pip_cache.py \
             tests/unit/test_ci_platform_routing.py \
             tests/unit/test_ci_matrix.py \
@@ -115,7 +118,6 @@ jobs:
             tests/unit/test_flagcicd_reports.py \
             tests/unit/test_flagcicd_coverage.py \
             tests/unit/test_ci_version_pins.py \
-            tests/unit/test_conf_matches_codegen_routes.py \
             tests/unit/test_cupti_runtime_cbid_table.py \
             tests/unit/test_dcu_core_decoupling.py \
             tests/unit/test_dcu_env_script.py \
@@ -136,7 +138,6 @@ jobs:
             tests/unit/test_platform_capability_matrix.py \
             tests/unit/test_platform_detect.py \
             tests/unit/test_platform_support_detect.py \
-            tests/unit/test_platform_vendor_naming.py \
             tests/unit/test_run_integration_tests.py \
             tests/unit/test_run_unit_tests.py \
             tests/unit/test_set_env_common.py \
@@ -156,13 +157,3 @@ jobs:
       - name: Run FlagCICD entry contract tests
         if: hashFiles('tests/unit/test_flagcicd_entry.py') != ''
         run: python -m pytest tests/unit/test_flagcicd_entry.py -v --tb=short -p no:cacheprovider
-
-      - name: Check tier policy and inventory regressions
-        run: python -m pytest tests/unit/test_test_tiers.py -v --tb=short -p no:cacheprovider
-
-      - name: Check the project contract against the workflows it names
-        run: |
-          python -m pytest \
-            tests/unit/test_contract_consistency.py \
-            tests/unit/test_flagcicd_compat.py \
-            -v --tb=short -p no:cacheprovider

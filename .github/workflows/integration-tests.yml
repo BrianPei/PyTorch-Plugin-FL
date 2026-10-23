@@ -47,6 +47,11 @@ name: Platform integration tests
 on:
   workflow_call:
     inputs:
+      test_profile:
+        description: Functional test selection (pr or nightly; weekly is reserved)
+        type: string
+        required: false
+        default: pr
       platform:
         description: Config basename under .github/configs (without .yml)
         required: true
@@ -64,14 +69,6 @@ on:
       flagcicd_plan:
         description: Optional compact plan context for structured execution reporting
         required: false
-        type: string
-        default: ''
-      test_profile:
-        description: Tier selection; release requires a candidate artifact
-        type: string
-        default: ''
-      candidate_artifact:
-        description: Exact wheel artifact from this run; never rebuilt
         type: string
         default: ''
     secrets:
@@ -93,9 +90,9 @@ jobs:
     uses: ./.github/workflows/load-platform-config.yml
     with:
       platform: ${{ inputs.platform }}
+      test_profile: ${{ inputs.test_profile }}
       checkout_repository: ${{ inputs.checkout_repository }}
       checkout_ref: ${{ inputs.checkout_ref }}
-      test_profile: ${{ inputs.test_profile }}
 
   integration-tests:
     name: Build and test (${{ needs.configuration.outputs.display_name }})
@@ -104,9 +101,7 @@ jobs:
       stages: ${{ steps.execution.outputs.stages }}
       run_attempt: ${{ steps.execution.outputs.run_attempt }}
     runs-on: ${{ fromJson(needs.configuration.outputs.runner_labels) }}
-    # PRs stay bounded for feedback; longer profiles use the explicit budget
-    # loaded from the platform config instead of a hidden workflow override.
-    timeout-minutes: ${{ (inputs.test_profile == 'pr' || inputs.test_profile == 'pr-risk') && 60 || fromJson(needs.configuration.outputs.integration_timeout_minutes) }}
+    timeout-minutes: ${{ fromJson(needs.configuration.outputs.integration_timeout_minutes) }}
     # A platform without a `ci_image` runs directly on its runner. MPS needs a
     # macOS host with its Metal GPU, and macOS jobs cannot use containers.
     container: ${{ needs.configuration.outputs.ci_image && fromJson(format('{{"image":{0},"volumes":{1},"options":{2}}}', toJson(needs.configuration.outputs.ci_image), needs.configuration.outputs.container_volumes, toJson(needs.configuration.outputs.container_options))) || null }}
@@ -179,39 +174,19 @@ jobs:
       - name: Prepare ${{ needs.configuration.outputs.display_name }} build environment
         id: setup
         env:
-          CI_STAGE: ${{ inputs.candidate_artifact != '' && 'integration' || needs.configuration.outputs.setup_stage }}
-          TORCH_FL_CANDIDATE_ONLY: ${{ inputs.candidate_artifact != '' && '1' || '0' }}
+          CI_STAGE: ${{ needs.configuration.outputs.setup_stage }}
         run: bash "${{ needs.configuration.outputs.setup_script }}" --platform "${{ needs.configuration.outputs.setup_platform }}"
 
       # Kunlunxin's image ships no `build` module, and a missing one does not
       # fail cleanly: the checkout's own CMake `build/` directory shadows it as
       # a namespace package. Empty for every other platform.
       - name: Install build tools
-        if: inputs.candidate_artifact == '' && needs.configuration.outputs.integration_build_tools != ''
+        if: needs.configuration.outputs.integration_build_tools != ''
         run: ${{ needs.configuration.outputs.integration_build_tools }}
 
       - name: Build wheel
         id: build
-        if: inputs.candidate_artifact == ''
         run: python -m build --wheel --no-isolation
-
-      - name: Download immutable candidate
-        id: candidate
-        if: inputs.candidate_artifact != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ inputs.candidate_artifact }}
-          path: dist
-
-      - name: Require candidate for release acceptance
-        env:
-          TEST_PROFILE: ${{ inputs.test_profile }}
-          CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
-        run: |
-          if [[ "$TEST_PROFILE" == release && -z "$CANDIDATE_ARTIFACT" ]]; then
-            echo "::error::L4 must start from an existing candidate wheel"
-            exit 1
-          fi
 
       - name: Validate wheel compatibility manifest
         id: validate
@@ -242,23 +217,12 @@ jobs:
           printf 'INTEGRATION_WORKDIR=%s\n' "$TEST_ROOT" >> "$GITHUB_ENV"
           REPORT_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-pytest.XXXXXX")
           printf 'FLAGCICD_REPORT_DIR=%s\n' "$REPORT_DIR" >> "$GITHUB_ENV"
-          printf 'FLAGCICD_METRICS_DIR=%s\n' "$REPORT_DIR" >> "$GITHUB_ENV"
-
-      - name: Record candidate identity
-        if: inputs.test_profile == 'release'
-        env:
-          CANDIDATE_IMAGE: ${{ needs.configuration.outputs.ci_image }}
-        run: >-
-          python .github/scripts/candidate_evidence.py record
-          --wheel dist/*.whl --platform "${{ inputs.platform }}"
-          --receipt "$FLAGCICD_REPORT_DIR/candidate.json"
 
       - name: Record hardware identity
-        id: record-identity
-        run: |
-          python .github/scripts/record_hardware_identity.py \
-            --platform "${{ inputs.platform }}" \
-            --output "$FLAGCICD_REPORT_DIR/hardware-${{ inputs.platform }}.json"
+        run: >-
+          python .github/scripts/record_hardware_identity.py
+          --platform "${{ inputs.platform }}"
+          --output "$FLAGCICD_REPORT_DIR/hardware-${{ inputs.platform }}.json"
 
       - name: Install pytest JSON reporting
         run: python -m pip install pytest-json-report==1.5.0 coverage==7.10.7
@@ -271,17 +235,11 @@ jobs:
           COVERAGE_DIR=$(mktemp -d "${RUNNER_TEMP:-/tmp}/torch-fl-coverage.XXXXXX")
           python .github/scripts/python_coverage.py prepare --report-dir "$COVERAGE_DIR" --env-file "$GITHUB_ENV"
 
-      # Setup, build, validation and installation above provision one hardware
-      # environment once. The runner then runs consecutive single-accelerator
-      # groups declared `parallel` in .flagcicd/test-tiers.json at most
-      # FLAGCICD_MAX_PARALLEL at a time; exclusive groups run alone, in
-      # manifest order. See docs/development/ci-test-tiers.md.
-      - name: Run ${{ needs.configuration.outputs.display_name }} integration test matrix
+      - name: Run ${{ needs.configuration.outputs.display_name }} integration tests
         id: integration-tests
         env:
           INTEGRATION_TESTS: ${{ needs.configuration.outputs.integration_tests }}
           INTEGRATION_ENVIRONMENT: ${{ needs.configuration.outputs.integration_environment }}
-          FLAGCICD_MAX_PARALLEL: '2'
           METAL_DEVICE_WRAPPER_TYPE: ${{ env.METAL_DEVICE_WRAPPER_TYPE }}
           TORCH_FL_MPS_HIGH_WATERMARK_RATIO: ${{ env.TORCH_FL_MPS_HIGH_WATERMARK_RATIO }}
           TORCH_FL_MPS_LOW_WATERMARK_RATIO: ${{ env.TORCH_FL_MPS_LOW_WATERMARK_RATIO }}
@@ -309,41 +267,24 @@ jobs:
           SOURCE_REF: ${{ inputs.checkout_ref || github.sha }}
         run: >-
           python .github/scripts/merge_pytest_reports.py
-          --report-dir "$FLAGCICD_REPORT_DIR"
+          --report-dir "$FLAGCICD_REPORT_DIR" --require-execution
           --output "$GITHUB_WORKSPACE/pytest-${REPORT_PLATFORM}.json"
           --platform "$REPORT_PLATFORM" --outcome "$TEST_OUTCOME"
           --source-repository "$SOURCE_REPOSITORY" --source-ref "$SOURCE_REF"
 
-      - name: Check collection completeness
-        if: ${{ !cancelled() && steps.integration-tests.outcome == 'success' }}
+      - name: Check functional test evidence
         env:
           REPORT_PLATFORM: ${{ inputs.platform }}
         run: |
-          python - <<'PY'
-          import json, os
-          report = json.load(open('pytest-' + os.environ['REPORT_PLATFORM'] + '.json'))
-          if report['flagcicd']['complete'] is not True or report['exitcode'] != 0:
-              raise SystemExit('Test execution/collection inventory is incomplete')
-          PY
-
-      - name: Accept candidate
-        if: inputs.test_profile == 'release'
-        run: >-
-          python .github/scripts/candidate_evidence.py finish
-          --wheel dist/*.whl --platform "${{ inputs.platform }}"
-          --receipt "$FLAGCICD_REPORT_DIR/candidate.json"
-          --report "pytest-${{ inputs.platform }}.json"
-          --hardware "$FLAGCICD_REPORT_DIR/hardware-${{ inputs.platform }}.json"
-
-      - name: Retain candidate acceptance
-        if: always() && inputs.test_profile == 'release' && env.FLAGCICD_REPORT_DIR != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: acceptance-${{ inputs.platform }}
-          overwrite: true
-          path: ${{ env.FLAGCICD_REPORT_DIR }}/
-          if-no-files-found: error
-          retention-days: 90
+          python - <<'PYCODE'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads(Path(os.environ["GITHUB_WORKSPACE"], f"pytest-{os.environ['REPORT_PLATFORM']}.json").read_text())
+          assert report["flagcicd"]["complete"] is True, "test evidence is incomplete"
+          assert report["exitcode"] == 0, "test execution failed"
+          assert report["summary"].get("passed", 0) > 0, "no functional tests passed"
+          PYCODE
 
       # Resolve report paths inside the job container; github.workspace may
       # contain the runner host's checkout path instead of its container mount.
@@ -446,7 +387,7 @@ jobs:
         if: always() && inputs.flagcicd_plan != ''
         env:
           SETUP_RESULT: ${{ steps.setup.outcome }}
-          BUILD_RESULT: ${{ inputs.candidate_artifact != '' && steps.candidate.outcome || steps.build.outcome }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
           VALIDATE_RESULT: ${{ steps.validate.outcome }}
           INSTALL_RESULT: ${{ steps.install.outcome }}
           TEST_RESULT: ${{ steps.integration-tests.outcome }}
@@ -506,7 +447,7 @@ jobs:
           JOB_RESULTS: ${{ toJSON(needs) }}
           REPORT_PLATFORM: ${{ inputs.platform }}
         run: >-
-          python3 .github/scripts/flagcicd_report.py platform --record-only
+          python3 .github/scripts/flagcicd_report.py platform
           --platform "$REPORT_PLATFORM" --directory raw
           --output "flagcicd-platform-${REPORT_PLATFORM}.json"
       - name: Retain platform outcome
