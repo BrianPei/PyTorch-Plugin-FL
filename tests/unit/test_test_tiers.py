@@ -565,8 +565,12 @@ def test_acceptance_initializes_backend_before_torch(monkeypatch, tmp_path, file
             target()
 
 
-def test_cuda_installed_acceptance_reports_scope_and_keeps_dependency_checks(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("platform", "profile", "whole_environment_check"),
+    [("cuda", "pr-risk", False), ("cuda", "release", True), ("metax", "pr-risk", True)],
+)
+def test_installed_acceptance_keeps_checks_within_the_declared_scope(
+    monkeypatch, tmp_path, platform, profile, whole_environment_check
 ):
     import sys
     import types
@@ -578,7 +582,7 @@ def test_cuda_installed_acceptance_reports_scope_and_keeps_dependency_checks(
     spec.loader.exec_module(module)
     package = tmp_path / "installed/torch_fl"
     package.mkdir(parents=True)
-    (package / "compatibility.json").write_text('{"platform": "cuda"}')
+    (package / "compatibility.json").write_text(json.dumps({"platform": platform}))
     monkeypatch.setitem(
         sys.modules,
         "torch_fl",
@@ -589,22 +593,28 @@ def test_cuda_installed_acceptance_reports_scope_and_keeps_dependency_checks(
     )
     monkeypatch.setattr(module.importlib.metadata, "version", lambda _: "2.10.0")
     monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "checkout"))
-    monkeypatch.setenv("FLAGCICD_PROFILE", "pr-risk")
+    monkeypatch.setenv("FLAGCICD_PROFILE", profile)
     commands = []
     monkeypatch.setattr(
         module.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd)
     )
     properties = {}
     module.test_installed_candidate_and_dependencies(properties.__setitem__)
-    assert properties == {"flagcx_communication": "not_validated"}
-    assert commands[0] == [sys.executable, "-m", "pip", "check"]
-    assert commands[1] == [
+    assert properties == (
+        {"flagcx_communication": "not_validated"} if platform == "cuda" else {}
+    )
+    if whole_environment_check:
+        assert commands.pop(0) == [sys.executable, "-m", "pip", "check"]
+    preflight = [
         "torch-fl-preflight",
         "--installed",
         "--check-installed",
         "--check-build-env",
         "--strict-tested",
     ]
+    if profile == "release":
+        preflight += ["--release", "--require-sdk"]
+    assert commands == [preflight]
 
 
 def test_performance_uses_published_device_properties_and_writes_evidence(

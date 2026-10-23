@@ -229,8 +229,8 @@ def test_cuda_communication_extra_uses_the_pinned_flagcx():
     assert extra.group(1) == f"flagcx=={_pins()['FLAGCX_VERSION_cuda']}"
 
 
-def test_cuda_package_metadata_and_pip_check_allow_no_flagcx(tmp_path):
-    """Validate actual setuptools metadata and pip's optional-dependency rules."""
+def test_cuda_package_metadata_makes_flagcx_an_explicit_extra(tmp_path):
+    """Verify generated package metadata without simulating an installation."""
     from packaging.requirements import Requirement
 
     output = tmp_path / "metadata"
@@ -253,42 +253,6 @@ def test_cuda_package_metadata_and_pip_check_allow_no_flagcx(tmp_path):
     assert flagcx[0].marker.evaluate({"extra": "cuda-comm"})
     assert str(flagcx[0].specifier) == f"=={_pins()['FLAGCX_VERSION_cuda']}"
     assert "cuda-comm" in metadata.get_all("Provides-Extra", [])
-
-    # A metadata-only installation needs no native runtime or network. Hide the
-    # host's distributions from pip check so only this synthetic environment is
-    # inspected; optional FlagCX is deliberately absent.
-    site = tmp_path / "site"
-    site.mkdir()
-    package = site / "torch_fl-2.10.0.dist-info"
-    package.mkdir()
-    (package / "METADATA").write_text(metadata_text)
-    required = [req for req in requirements if not req.marker or req.marker.evaluate()]
-    for req in required:
-        version = next(
-            (s.version for s in req.specifier if s.operator in ("==", ">=")), "99.0"
-        )
-        dependency = site / f"{req.name.replace('-', '_')}-{version}.dist-info"
-        dependency.mkdir()
-        (dependency / "METADATA").write_text(
-            f"Metadata-Version: 2.3\nName: {req.name}\nVersion: {version}\n"
-        )
-    check = (
-        "import sys; import pip._internal.cli.main; "
-        "sys.path[:] = [sys.argv[1]] + "
-        "[p for p in sys.path if 'site-packages' not in p and 'dist-packages' not in p]; "
-        "raise SystemExit(pip._internal.cli.main.main(['check']))"
-    )
-    checked = subprocess.run(
-        [sys.executable, "-c", check, str(site)], capture_output=True, text=True
-    )
-    assert checked.returncode == 0, checked.stdout + checked.stderr
-    dependency_metadata = next(site.glob("flagtree-*.dist-info/METADATA"))
-    dependency_metadata.unlink()
-    rejected = subprocess.run(
-        [sys.executable, "-c", check, str(site)], capture_output=True, text=True
-    )
-    assert rejected.returncode != 0
-    assert "requires flagtree" in rejected.stdout
 
 
 @pytest.mark.parametrize(

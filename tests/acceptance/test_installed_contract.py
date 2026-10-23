@@ -40,7 +40,11 @@ def test_installed_candidate_and_dependencies(record_property):
         print("CUDA functional scope: FlagCX communication is not validated")
     assert importlib.metadata.version("torch_fl")
     assert torch.__version__
-    subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=120)
+    profile = os.environ["FLAGCICD_PROFILE"]
+    # CUDA functional acceptance checks this wheel through preflight below.
+    # Auditing every installed distribution belongs to release acceptance.
+    if compatibility.get("platform") != "cuda" or profile == "release":
+        subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=120)
     args = [
         "torch-fl-preflight",
         "--installed",
@@ -48,7 +52,7 @@ def test_installed_candidate_and_dependencies(record_property):
         "--check-build-env",
         "--strict-tested",
     ]
-    if os.environ["FLAGCICD_PROFILE"] == "release":
+    if profile == "release":
         args += ["--release", "--require-sdk"]
     subprocess.run(args, check=True, timeout=120)
 

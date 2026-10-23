@@ -13,7 +13,10 @@ records FlagCX communication as `not_validated`. Multi-device placement tests
 do not imply collective-communication acceptance. The CUDA setup hook requires
 explicit `TORCH_FL_CUDA_FLAGCX_WHEEL=1` provisioning in a matching environment;
 FlagCX communication must be validated by separate communication workloads.
-Other vendors keep their current dependency requirements.
+CUDA functional profiles use the installed-wheel preflight instead of a global
+`pip check`. Release acceptance additionally audits the whole environment with
+`pip check`. Other vendors keep their current dependency requirements and
+acceptance behavior.
 
 | Profile | Trigger | Selection |
 | --- | --- | --- |
