@@ -196,6 +196,47 @@ def required_mpirun(command, test_environment):
     )
 
 
+def descendant_pids(root_pid):
+    """Return descendants using procfs, with a portable ps fallback."""
+    children = {}
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for task in proc_root.glob("*/task/*/children"):
+            try:
+                parent = int(task.parts[2])
+                values = task.read_text().split()
+                children.setdefault(parent, []).extend(int(value) for value in values)
+            except (OSError, ValueError):
+                continue
+    else:
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid=,ppid="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            result = None
+        if result and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if len(fields) == 2:
+                    try:
+                        children.setdefault(int(fields[1]), []).append(int(fields[0]))
+                    except ValueError:
+                        continue
+    found = []
+    pending = list(children.get(root_pid, ()))
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.append(pid)
+        pending.extend(children.get(pid, ()))
+    return found
+
+
 def run_command(command, test_environment, workdir):
     """Stream one command; timeout and cancellation also kill its descendants."""
     required_mpirun(command, test_environment)
@@ -214,10 +255,20 @@ def run_command(command, test_environment, workdir):
     timed_out = threading.Event()
 
     def kill_group():
+        descendants = set(descendant_pids(process.pid))
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
+        # Vendor launchers may escape the process group with setsid().
+        descendants.update(descendant_pids(process.pid))
+        for pid in descendants:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if process.stdout and not process.stdout.closed:
+            process.stdout.close()
 
     def expire():
         timed_out.set()
@@ -233,6 +284,12 @@ def run_command(command, test_environment, workdir):
             sys.stdout.write(line)
             lines.append(line)
         sys.stdout.flush()
+        returncode = process.wait()
+    except (OSError, ValueError):
+        if not timed_out.is_set():
+            kill_group()
+            process.wait()
+            raise
         returncode = process.wait()
     except BaseException:
         kill_group()

@@ -148,7 +148,8 @@ def test_serial_failure_records_unstarted_groups(tmp_path):
     assert [g["status"] for g in records] == ["failed", "not_run"]
 
 
-def test_command_timeout_kills_descendants(tmp_path):
+@pytest.mark.parametrize("escape", [False, True])
+def test_command_timeout_kills_descendants(tmp_path, escape):
     spec = importlib.util.spec_from_file_location(
         "functional_runner", SCRIPTS / "run_integration_tests.py"
     )
@@ -156,7 +157,7 @@ def test_command_timeout_kills_descendants(tmp_path):
     spec.loader.exec_module(runner)
     pid_file = tmp_path / "child.pid"
     child = "import time; time.sleep(30)"
-    code = f"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable, '-c', {child!r}]); Path({str(pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
+    code = f"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session={escape!r}); Path({str(pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
     command = shlex.join([sys.executable, "-c", code])
     result, _ = runner.run_command(
         command, {**os.environ, "FLAGCICD_CASE_TIMEOUT": "1"}, str(tmp_path)
@@ -203,9 +204,13 @@ def test_incomplete_or_empty_evidence_cannot_pass(tmp_path, missing):
     assert actual["exitcode"] != 0
 
 
-def test_cancellation_kills_the_active_command_group(tmp_path):
+@pytest.mark.parametrize("escape", [False, True])
+def test_cancellation_kills_the_active_command_group(tmp_path, escape):
     pid_file = tmp_path / "active.pid"
     code = f"import os,time; from pathlib import Path; Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
+    if escape:
+        child = "import time; time.sleep(30)"
+        code = f"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); Path({str(pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
     group = {"name": "active", "command": shlex.join([sys.executable, "-c", code])}
     env = {
         **os.environ,
