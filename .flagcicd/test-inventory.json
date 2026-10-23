@@ -721,6 +721,15 @@
       ],
       "selector": "tests/integration/ops -m mps"
     },
+    "tests/integration/ops/test_mps_vision_interpolation.py": {
+      "lane": "L2",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "Native MPS operator suite selected by the mps marker.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops -m mps"
+    },
     "tests/integration/ops/test_mps_where.py": {
       "lane": "L2",
       "owner": "Torch-FL runtime maintainers",
