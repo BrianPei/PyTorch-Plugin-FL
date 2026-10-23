@@ -13,7 +13,7 @@ full-coverage conf.
 
 | Platform | `FLAGOS_ACCELERATOR` | FlagGems | Vendor native | Supported / total | Supported rate |
 |---|---|---:|---:|---:|---:|
-| NVIDIA CUDA | `cuda` | 454 | 1583 | 2037 / 2037 | 100.0% |
+| NVIDIA CUDA | `cuda` | 549 | 1485 | 2037 / 2037 | 100.0% |
 | PPU | `ppu` | 592 | 1445 | 2037 / 2037 | 100.0% |
 | MetaX | `metax` | 604 | 1433 | 2037 / 2037 | 100.0% |
 | Hygon DCU | `dcu` | 454 | 1583 | 2037 / 2037 | 100.0% |

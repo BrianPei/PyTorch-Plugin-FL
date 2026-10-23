@@ -243,7 +243,9 @@ def test_musa_registers_all_flaggems_ops_except_known_failures():
     """
     routes = g.build_all(CONF_DIR)["musa"][1]
     native = g.vendor_native_ops("musa")
-    flaggems_py = g.flaggems_python_ops()
+    # The ceiling this platform's conf was actually built from: cuda reads the
+    # measured package set, every other vendor the frozen pre-2026-10-22 one.
+    flaggems_py = g.flaggems_python_ops_for("musa")
     registered = g.vendor_registered_ops("musa")
     gaps = g.NATIVE_TRITON_GAPS.get("musa", set())
 
@@ -351,6 +353,44 @@ def test_boxing_cpp_ops_recovers_measured_subset(tmp_path):
 # ---------------------------------------------------------------------------
 # The shipped confs
 # ---------------------------------------------------------------------------
+
+
+def test_hold_list_matches_codegen_ops():
+    """``FLAGGEMS_HOLDS`` is a data copy of codegen_ops' own hold sets.
+
+    The generators read the data copy because ``codegen_ops`` cannot be imported
+    everywhere (it exits from import when torchgen is absent, and an empty hold
+    list silently changes the generated confs). This keeps the two equal: adding
+    an op to ``FLAGGEMS_RUNTIME_BROKEN`` without updating the copy is a routing
+    change that would otherwise ship unreviewed.
+    """
+    import ast
+
+    from backend_coverage import FLAGGEMS_HOLDS
+
+    src = (REPO_ROOT / "scripts/codegen/codegen_ops.py").read_text()
+    tree = ast.parse(src)
+    runtime_broken = None
+    recursive = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", None) == "FLAGGEMS_RUNTIME_BROKEN" for t in node.targets
+        ):
+            runtime_broken = set(ast.literal_eval(node.value))
+        if isinstance(node, ast.AnnAssign) and (
+            getattr(node.target, "id", None) == "FLAGGEMS_RECURSIVE_FALLBACK"
+        ):
+            if isinstance(node.value, ast.Call) and not node.value.args:
+                recursive = set()
+            else:
+                recursive = set(ast.literal_eval(node.value))
+    assert runtime_broken is not None, "FLAGGEMS_RUNTIME_BROKEN not found"
+    expected = runtime_broken | recursive
+    assert set(FLAGGEMS_HOLDS) == expected, (
+        "backend_coverage.FLAGGEMS_HOLDS and codegen_ops' hold sets disagree: "
+        f"only in data {sorted(set(FLAGGEMS_HOLDS) - expected)}, "
+        f"only in codegen_ops {sorted(expected - set(FLAGGEMS_HOLDS))}"
+    )
 
 
 def test_shipped_confs_are_up_to_date():
