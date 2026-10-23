@@ -562,7 +562,7 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
     "FLAGOS_DCU_SKIP_LEGACY_SMOKE": (
         SCOPE_TEST,
         "0 (off)",
-        "In .github/scripts/set_env_dcu.sh, skip the legacy-mode smoke path "
+        "In .github/scripts/set_env_hygon.sh, skip the legacy-mode smoke path "
         "(FLAGOS_DCU_VENDOR_CORE=1) after the decoupled gates have run",
     ),
     # --- Assets and libraries --------------------------------------------
@@ -576,7 +576,7 @@ VARIABLES: dict[str, tuple[str, str, str]] = {
         SCOPE_BUILD_RUNTIME,
         "Auto-discovered",
         "Path to the vendor torch's lib directory, used when no bundled "
-        "lib_maca/lib_dcu/lib_ppu is present. Only the active accelerator's "
+        "lib_metax/lib_hygon/lib_thead is present. Only the active accelerator's "
         "build reads it",
     ),
     "FLAGOS_USE_CACHING_ALLOCATOR": (

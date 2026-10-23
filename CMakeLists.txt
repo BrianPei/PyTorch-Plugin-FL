@@ -257,7 +257,7 @@ elseif(FLAGOS_ACCELERATOR STREQUAL "dcu")
   #   hip/lib, lib64         hip runtime
   #   aillvm/lib             libomp.so
   #   .hyhal/rocm_smi/lib    librocm_smi64.so.2
-  # Keep in sync with VENDOR_RPATH in scripts/vendor/bundle_dcu_libtorch.sh.
+  # Keep in sync with VENDOR_RPATH in scripts/vendor/bundle_hygon_libtorch.sh.
   set(_dcu_rpath_dirs
       "${DCU_CUDA_ROOT}/lib64" "${ROCM_PATH}/lib" "${ROCM_PATH}/hip/lib"
       "${ROCM_PATH}/lib64" "${ROCM_PATH}/aillvm/lib" "${ROCM_PATH}/llvm/lib"
@@ -318,7 +318,7 @@ elseif(FLAGOS_ACCELERATOR STREQUAL "musa")
   # Moore Threads MUSA toolkit: musart runtime. There is no libcudart shim here
   # (unlike MetaX/DCU), so nothing pretends to be CUDA -- cuda_runtime_compat
   # points at the native musa* headers and libmusart, and the runtime sources
-  # under csrc/runtime/accelerator/musa/ call musaMalloc/musaStreamCreate/etc.
+  # under csrc/runtime/accelerator/mthreads/ call musaMalloc/musaStreamCreate/etc.
   flagos_resolve_sdk_root(MUSA_HOME "/usr/local/musa" MUSA_HOME)
   if(NOT EXISTS "${MUSA_HOME}/include/musa_runtime.h")
     message(FATAL_ERROR

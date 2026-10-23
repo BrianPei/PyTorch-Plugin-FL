@@ -16,7 +16,7 @@
 #
 # Two consequences worth stating up front, mirroring codegen_kunlunxin.py:
 #
-#   * There is no conf writer. torch_fl/configs/backends_mps.conf is generated
+#   * There is no conf writer. torch_fl/configs/backends_apple.conf is generated
 #     by scripts/codegen/gen_vendor_confs.py from the emitted mps_register.inc
 #     (mps is in VENDORS), so the register file is the single hand-off between
 #     the two generators and the conf keeps one writer.
@@ -28,10 +28,10 @@
 #     skipped op.
 #
 # The generated file is Objective-C++ (.mm) and builds WITHOUT ARC, like the
-# runtime under csrc/runtime/accelerator/mps/: every object this file creates is
+# runtime under csrc/runtime/accelerator/apple/: every object this file creates is
 # released explicitly through mps::MpsRelease.
 #
-# Run it to (re)generate csrc/aten/backends/mps/generated/; `--check` verifies the
+# Run it to (re)generate csrc/aten/backends/apple/generated/; `--check` verifies the
 # committed artifacts are current without writing, which is the mode CI uses.
 
 import argparse
@@ -49,8 +49,8 @@ from codegen_ops import unified_sig
 from torchgen import local
 
 REPO = Path(__file__).resolve().parent.parent.parent
-OUT_MM = REPO / "csrc/aten/backends/mps/generated/mps_kernels.mm"
-OUT_INC = REPO / "csrc/aten/backends/mps/generated/mps_register.inc"
+OUT_MM = REPO / "csrc/aten/backends/apple/generated/mps_kernels.mm"
+OUT_INC = REPO / "csrc/aten/backends/apple/generated/mps_register.inc"
 REGISTER_INC = REPO / "csrc/aten/generated/register.inc"
 
 # ---------------------------------------------------------------------------
@@ -5240,7 +5240,7 @@ FILE_HEADER = """\
 #include <string_view>
 #include <vector>
 #include "../mps_common.h"
-#include "runtime/accelerator/mps/mps_runtime.h"
+#include "runtime/accelerator/apple/mps_runtime.h"
 
 namespace at::native::flagos {
 // The helpers live in the nested at::native::flagos::mps namespace, so an
@@ -5266,7 +5266,7 @@ INC_HEADER = """\
 // cpu_fallback. So this file is exactly the Apple backend's coverage set.
 //
 // It is also what scripts/codegen/gen_vendor_confs.py reads to decide which ops
-// backends_mps.conf may name for this backend, so the conf cannot claim a route
+// backends_apple.conf may name for this backend, so the conf cannot claim a route
 // this file does not register.
 
 """

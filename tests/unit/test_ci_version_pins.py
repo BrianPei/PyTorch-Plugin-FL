@@ -41,7 +41,18 @@ SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
 PINS = REPO_ROOT / ".github" / "version-pins.env"
 PLATFORM_TABLE = REPO_ROOT / "cmake" / "flagos_platforms.json"
 
-PLATFORMS = ["cuda", "ascend", "dcu", "gcu", "iluvatar", "metax", "musa", "ppu"]
+# The lane names: a hook, a pin and a config are each named for the
+# platform's vendor, which is also its flagos-pypi-<lane>.
+PLATFORMS = [
+    "nvidia",
+    "ascend",
+    "hygon",
+    "enflame",
+    "iluvatar",
+    "metax",
+    "mthreads",
+    "thead",
+]
 RUNNER = SCRIPTS_DIR / "set_env.sh"
 HOOKS_DIR = SCRIPTS_DIR / "hooks"
 
@@ -109,7 +120,7 @@ def test_the_cuda_hook_reads_its_own_python_pin():
     block, whose purpose is that each platform has exactly one interpreter. The
     hook now reads `_cuda`, like it already reads `_cuda` for FlagTree.
     """
-    text = (HOOKS_DIR / "set_env_cuda.sh").read_text(encoding="utf-8")
+    text = (HOOKS_DIR / "set_env_nvidia.sh").read_text(encoding="utf-8")
     assert (
         'FLAGTREE_PYTHON_VERSION="${TORCH_FL_FLAGTREE_PYTHON_VERSION:-$FLAGTREE_PYTHON_VERSION_cuda}"'
         in text
@@ -154,7 +165,7 @@ TRITON_AND_FLAGTREE = (
 # (zero macosx files across every release), so the rule enforced below --
 # FlagTree or Triton, plus FlagGems -- cannot be met without an unsatisfiable
 # requirement. setup.py's mps arm returns torch and packaging only, and
-# backends_mps.conf names the native MPSGraph kernels in its full-coverage
+# backends_apple.conf names the native MPSGraph kernels in its full-coverage
 # table, but its MPSGraph kernels need no FlagTree/FlagGems/Triton operator
 # cohort; the native source is the design of the platform rather than the
 # omission this check exists to catch.
