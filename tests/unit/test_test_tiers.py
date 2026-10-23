@@ -43,6 +43,41 @@ def test_repository_inventory_is_complete():
     check_inventory()
 
 
+def test_cuda_mul_route_runs_only_in_cuda_l3_profiles():
+    from manifest_composer import composer, manifest, platform_config, platform_names
+
+    document = policy()
+    known = platform_names()
+    for platform in known:
+        for profile in document["profiles"]:
+            if (
+                profile == "release"
+                and platform not in document["release"]["model_platforms"]
+            ):
+                continue
+            groups = composer.compose(
+                manifest(),
+                platform_config(platform),
+                platform,
+                known,
+                profile,
+                document,
+            )
+            selected = [g for g in groups if g["id"] == "cuda_flaggems_mul"]
+            assert bool(selected) == (platform == "cuda" and profile != "pr"), (
+                platform,
+                profile,
+            )
+            if selected:
+                assert selected[0]["level"] == "L3"
+                assert selected[0]["execution"] == "exclusive"
+                assert selected[0]["min_passed"] == 1
+                assert (
+                    "tests/integration/ops/test_flaggems_mul_route.py"
+                    in selected[0]["command"]
+                )
+
+
 def test_unregistered_file_is_rejected(tmp_path):
     (tmp_path / ".flagcicd").mkdir()
     (tmp_path / ".flagcicd/test-inventory.json").write_text('{"files": {}}')
@@ -384,6 +419,7 @@ def test_execution_modes_default_shared_groups_and_isolate_sensitive_groups():
         "iluvatar_runtime",
         "profiler_contract",
         "profiler_parity",
+        "cuda_flaggems_mul",
         "multi_device_contracts",
         "native_comm_bridge",
         "torch_compile",

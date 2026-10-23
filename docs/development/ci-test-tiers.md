@@ -47,6 +47,16 @@ L0 validates configuration, lint and the explicit test file inventory. L1 runs
 the existing agnostic, codegen and hardware-free wheel checks. Hardware jobs
 depend on all of them. L2 cases precede L3 cases, and L3 precedes L4.
 
+`test_conf_matches_codegen_routes.py` runs in the L1 agnostic checks: it reads
+the CUDA configuration and generator without importing Torch or FlagGems.
+`test_flaggems_mul_route.py` belongs to the CUDA-only L3
+`cuda_flaggems_mul` group in pr-risk, nightly, weekly and release profiles.
+It retains the numerical checks and the profiler check for host transfers,
+and runs exclusively so another group cannot pollute the trace. It is excluded
+from ordinary L2 PR checks and from non-CUDA platforms. The `cuda` pytest marker
+is deliberately absent because that marker requires CUDA boxing kernels;
+this regression exercises the default FlagGems-primary wheel instead.
+
 Setup, build, preflight and wheel installation run once per hardware job; only
 the test groups after them run concurrently. Consecutive single-accelerator
 L2/L3 groups that explicitly declare `execution: parallel` and

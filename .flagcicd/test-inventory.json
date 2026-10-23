@@ -298,6 +298,15 @@
       ],
       "selector": "tests/integration/"
     },
+    "tests/integration/ops/test_flaggems_mul_route.py": {
+      "lane": "L3",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "CUDA-only numerical and host-transfer route regression; profiler runs exclusively in the cuda_flaggems_mul group.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops/test_flaggems_mul_route.py"
+    },
     "tests/integration/ops/test_foreach_dispatch.py": {
       "lane": "L3",
       "owner": "Torch-FL runtime maintainers",
@@ -1536,6 +1545,15 @@
         ".github/integration-manifest.yml"
       ],
       "selector": "python .github/scripts/run_unit_tests.py"
+    },
+    "tests/unit/test_conf_matches_codegen_routes.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Hardware-free CUDA conf/codegen route consistency; reads sources without importing Torch or FlagGems.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_conf_matches_codegen_routes.py"
     },
     "tests/unit/test_conf_registration_consistency.py": {
       "lane": "L1",

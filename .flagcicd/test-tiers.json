@@ -181,6 +181,24 @@
       },
       "execution": "parallel"
     },
+    "cuda_flaggems_mul": {
+      "level": "L3",
+      "category": "performance",
+      "timeout_seconds": 1800,
+      "profiles": [
+        "pr-risk",
+        "nightly",
+        "weekly",
+        "release"
+      ],
+      "requires": [
+        "accelerator"
+      ],
+      "resources": {
+        "min_accelerators": 1
+      },
+      "execution": "exclusive"
+    },
     "musa_flaggems_hybrid": {
       "level": "L2",
       "category": "functional",
