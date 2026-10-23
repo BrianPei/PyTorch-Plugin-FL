@@ -236,13 +236,22 @@
       "selector": "tests/integration/"
     },
     "tests/integration/ops/test_dtype_cast_copy.py": {
-      "lane": "L3",
+      "lane": "L2",
       "owner": "Torch-FL runtime maintainers",
-      "reason": "Manifest selection; platform and marker restrictions remain in the command.",
+      "reason": "Portable dtype-cast numerical and result-device correctness; source contracts and CUDA profiling run in separate L1 and L3 groups.",
       "entrypoints": [
         ".github/integration-manifest.yml"
       ],
       "selector": "tests/integration/"
+    },
+    "tests/integration/ops/test_dtype_cast_performance.py": {
+      "lane": "L3",
+      "owner": "Torch-FL runtime maintainers",
+      "reason": "CUDA-only host-transfer performance regression; the profiler owns the device in an exclusive L3 group.",
+      "entrypoints": [
+        ".github/integration-manifest.yml"
+      ],
+      "selector": "tests/integration/ops/test_dtype_cast_performance.py"
     },
     "tests/integration/ops/test_dtype_route_fallback.py": {
       "lane": "L3",
@@ -1492,6 +1501,15 @@
       ],
       "selector": "tests/unit/test_backend_autoload_contract.py"
     },
+    "tests/unit/test_backend_enum_naming.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Hardware-free naming contract over committed sources and platform metadata.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_backend_enum_naming.py"
+    },
     "tests/unit/test_ci_commands.py": {
       "lane": "L1",
       "owner": "Torch-FL CI maintainers",
@@ -2067,6 +2085,15 @@
         ".github/workflows/agnostic-checks.yml"
       ],
       "selector": "tests/unit/test_platform_support_detect.py"
+    },
+    "tests/unit/test_platform_vendor_naming.py": {
+      "lane": "L1",
+      "owner": "Torch-FL CI maintainers",
+      "reason": "Hardware-free naming contract over committed sources and platform metadata.",
+      "entrypoints": [
+        ".github/workflows/agnostic-checks.yml"
+      ],
+      "selector": "tests/unit/test_platform_vendor_naming.py"
     },
     "tests/unit/test_ppu_cuda_version.py": {
       "lane": "L3",

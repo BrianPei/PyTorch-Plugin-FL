@@ -43,7 +43,14 @@ def test_repository_inventory_is_complete():
     check_inventory()
 
 
-def test_cuda_mul_route_runs_only_in_cuda_l3_profiles():
+@pytest.mark.parametrize(
+    "case_id,filename",
+    [
+        ("cuda_flaggems_mul", "test_flaggems_mul_route.py"),
+        ("cuda_dtype_cast_performance", "test_dtype_cast_performance.py"),
+    ],
+)
+def test_cuda_profiling_runs_only_in_cuda_l3_profiles(case_id, filename):
     from manifest_composer import composer, manifest, platform_config, platform_names
 
     document = policy()
@@ -63,7 +70,7 @@ def test_cuda_mul_route_runs_only_in_cuda_l3_profiles():
                 profile,
                 document,
             )
-            selected = [g for g in groups if g["id"] == "cuda_flaggems_mul"]
+            selected = [g for g in groups if g["id"] == case_id]
             assert bool(selected) == (platform == "cuda" and profile != "pr"), (
                 platform,
                 profile,
@@ -72,10 +79,7 @@ def test_cuda_mul_route_runs_only_in_cuda_l3_profiles():
                 assert selected[0]["level"] == "L3"
                 assert selected[0]["execution"] == "exclusive"
                 assert selected[0]["min_passed"] == 1
-                assert (
-                    "tests/integration/ops/test_flaggems_mul_route.py"
-                    in selected[0]["command"]
-                )
+                assert f"tests/integration/ops/{filename}" in selected[0]["command"]
 
 
 def test_unregistered_file_is_rejected(tmp_path):
@@ -420,6 +424,7 @@ def test_execution_modes_default_shared_groups_and_isolate_sensitive_groups():
         "profiler_contract",
         "profiler_parity",
         "cuda_flaggems_mul",
+        "cuda_dtype_cast_performance",
         "multi_device_contracts",
         "native_comm_bridge",
         "torch_compile",

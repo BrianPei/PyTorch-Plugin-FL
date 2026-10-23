@@ -78,6 +78,7 @@ _CONFIG_DIR = _REPO / ".github/configs"
 # and the check cannot quietly become a description of a pipeline nobody runs.
 _KNOWN_GAPS = {
     "cuda_flaggems_mul": tuple(p for p in _PLATFORMS if p != "cuda"),
+    "cuda_dtype_cast_performance": tuple(p for p in _PLATFORMS if p != "cuda"),
     "iluvatar_runtime": (
         "ascend",
         "cuda",

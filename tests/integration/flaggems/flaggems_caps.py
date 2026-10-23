@@ -154,16 +154,17 @@ FLAGGEMS_PINNED_OFF: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: Number of ``flaggems`` routes each platform's conf is measured to hold.
+#: Number of ``flaggems`` routes recorded in each committed platform conf.
 #:
 #: A regression guard rather than an exact contract: the count only moves when an
-#: operator is added, removed or re-measured, and each of those changes the
-#: support report too. It is what keeps a broad reroute from being split into
+#: operator is added, removed or re-routed. Counts describe the configuration,
+#: not independently verified hardware support. They keep a broad reroute from being split into
 #: narrow ones while every operator still reaches some backend -- the failure
 #: mode a per-operator route assertion cannot see.
 EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
     "ascend": 221,
-    "cuda": 390,
+    # Routing snapshot after the coverage-ceiling update (#638).
+    "cuda": 549,
     "dcu": 454,
     "gcu": 251,
     # The iluvatar lane's landing: the conf routes 585 ops to FlagGems, eleven
@@ -175,7 +176,8 @@ EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
     # not an on-device measurement yet.
     "iluvatar": 585,
     "kunlunxin": 0,
-    "metax": 594,
+    # Eight routes left FlagGems in #638; this is not a hardware re-measurement.
+    "metax": 586,
     "mps": 0,
     "musa": 466,
     "ppu": 592,
@@ -202,7 +204,8 @@ EXPECTED_SDPA_ROUTE: dict[str, str | None] = {
     "metax": "flaggems",
     "mps": "none",
     "musa": "none",
-    "ppu": "cuda",
+    # Default confs no longer select boxing after #643.
+    "ppu": "none",
 }
 
 #: conf value -> the name ``[flagos dispatch]`` prints for the same backend. The

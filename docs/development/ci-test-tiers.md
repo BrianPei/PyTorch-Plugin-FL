@@ -57,6 +57,20 @@ from ordinary L2 PR checks and from non-CUDA platforms. The `cuda` pytest marker
 is deliberately absent because that marker requires CUDA boxing kernels;
 this regression exercises the default FlagGems-primary wheel instead.
 
+Dtype-cast checks follow the same separation: `test_dtype_cast_copy.py`
+keeps portable numerical and result-device assertions in L2. Its source-only
+copy-arm assertion lives in `test_conf_registration_consistency.py` in L1,
+alongside a check that all ten committed confs match the recorded FlagGems
+counts and SDPA routes. These snapshots describe configured routes, not a
+fresh measurement of operator support on hardware.
+`test_dtype_cast_performance.py` retains both bf16/fp32 zero-transfer assertions
+in the CUDA-only, exclusive L3 `cuda_dtype_cast_performance` group, selected in
+pr-risk, nightly, weekly and release profiles. Other vendors retain the L2
+functional checks; extending the performance contract requires measurements
+on their stacks. The module skips other platforms before runtime access and
+carries neither `anyplatform` nor `main_ops`, so the vendor L2 sweep cannot
+select its profiler cases.
+
 Setup, build, preflight and wheel installation run once per hardware job; only
 the test groups after them run concurrently. Consecutive single-accelerator
 L2/L3 groups that explicitly declare `execution: parallel` and

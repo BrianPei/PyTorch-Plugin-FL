@@ -105,6 +105,7 @@ jobs:
           python -m pytest \
             tests/unit/test_ai_reviewer.py \
             tests/unit/test_backend_autoload_contract.py \
+            tests/unit/test_backend_enum_naming.py \
             tests/unit/test_ci_pip_cache.py \
             tests/unit/test_ci_platform_routing.py \
             tests/unit/test_ci_matrix.py \
@@ -134,6 +135,7 @@ jobs:
             tests/unit/test_platform_capability_matrix.py \
             tests/unit/test_platform_detect.py \
             tests/unit/test_platform_support_detect.py \
+            tests/unit/test_platform_vendor_naming.py \
             tests/unit/test_run_integration_tests.py \
             tests/unit/test_run_unit_tests.py \
             tests/unit/test_set_env_common.py \
