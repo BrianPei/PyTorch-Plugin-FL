@@ -79,8 +79,8 @@ _CONFIG_DIR = _REPO / ".github/configs"
 # composition exactly, so wiring a platform in or out is a visible edit here,
 # and the check cannot quietly become a description of a pipeline nobody runs.
 _KNOWN_GAPS = {
-    "cuda_flaggems_mul": tuple(p for p in _PLATFORMS if p != "cuda"),
-    "cuda_dtype_cast_performance": tuple(p for p in _PLATFORMS if p != "cuda"),
+    "cuda_flaggems_mul": tuple(p for p in _PLATFORMS if p != "nvidia"),
+    "cuda_dtype_cast_performance": tuple(p for p in _PLATFORMS if p != "nvidia"),
     "iluvatar_runtime": (
         "apple",
         "ascend",

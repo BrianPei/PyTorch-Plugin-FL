@@ -94,7 +94,7 @@ integration_build_tools:
 
 timeout_minutes: 60
 integration_timeout_minutes: 720
-wheel_artifact_name: wheel-mps
+wheel_artifact_name: wheel-apple
 
 # What this platform's environment has to look like before any test runs, read
 # by the first step of .github/integration-manifest.yml through

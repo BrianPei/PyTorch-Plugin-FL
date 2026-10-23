@@ -200,9 +200,13 @@ def _setup_globals() -> dict:
     return namespace["_flagos_sibling_requires"].__globals__
 
 
+def _table_vendor(platform: str) -> str:
+    return json.loads(PLATFORM_TABLE.read_text())["accelerators"][platform]["vendor"]
+
+
 def _declared(platform: str) -> list:
     globals_ = _setup_globals()
-    globals_["FLAGOS_ACCELERATOR"] = platform
+    globals_["FLAGOS_ACCELERATOR"] = globals_["_normalize_accelerator"](platform)
     return globals_["_flagos_sibling_requires"]()
 
 
@@ -240,7 +244,8 @@ def test_cuda_communication_extra_uses_the_pinned_flagcx():
     assert extra.group(1) == f"flagcx=={_pins()['FLAGCX_VERSION_cuda']}"
 
 
-def test_cuda_package_metadata_makes_flagcx_an_explicit_extra(tmp_path):
+@pytest.mark.parametrize("accelerator", ["cuda", "nvidia"])
+def test_cuda_package_metadata_makes_flagcx_an_explicit_extra(tmp_path, accelerator):
     """Verify generated package metadata without simulating an installation."""
     from packaging.requirements import Requirement
 
@@ -249,7 +254,7 @@ def test_cuda_package_metadata_makes_flagcx_an_explicit_extra(tmp_path):
     done = subprocess.run(
         [sys.executable, "setup.py", "egg_info", "--egg-base", str(output)],
         cwd=REPO_ROOT,
-        env={**os.environ, "FLAGOS_ACCELERATOR": "cuda"},
+        env={**os.environ, "FLAGOS_ACCELERATOR": accelerator},
         capture_output=True,
         text=True,
     )
@@ -273,7 +278,7 @@ def test_cuda_package_metadata_makes_flagcx_an_explicit_extra(tmp_path):
 def test_cuda_flagcx_provisioning_requires_explicit_compatible_opt_in(
     enabled, cuda_version, expected_code, tmp_path
 ):
-    hook = (HOOKS_DIR / "set_env_cuda.sh").read_text()
+    hook = (HOOKS_DIR / "set_env_nvidia.sh").read_text()
     branch = hook.split("# CUDA functional CI", 1)[1].split(
         "# Install the published FlagGems wheel", 1
     )[0]
@@ -319,7 +324,9 @@ def test_triton_is_declared_only_where_no_flagtree_build_is_pinned():
             continue
         declared = _declared(platform)
         flagtree = any(r.startswith("flagtree==") for r in declared)
-        assert flagtree == bool(pins.get(f"FLAGTREE_VERSION_{platform}")), platform
+        assert flagtree == bool(
+            pins.get(f"FLAGTREE_VERSION_{_table_vendor(platform)}")
+        ), platform
         assert flagtree != any(r.startswith("triton") for r in declared), (
             platform,
             TRITON_AND_FLAGTREE,
@@ -363,7 +370,7 @@ def test_requires_python_is_the_platforms_pinned_interpreter():
     globals_ = _setup_globals()
     for platform in _platforms_in_the_table():
         pinned = pins.get(f"FLAGTREE_PYTHON_VERSION_{platform}")
-        globals_["FLAGOS_ACCELERATOR"] = platform
+        globals_["FLAGOS_ACCELERATOR"] = globals_["_normalize_accelerator"](platform)
         # Read it back off the kwargs setup() is called with, not off the helper:
         # a helper that computes the right string while setup() still hard-codes
         # `>=3.8` is exactly the regression this is here for.
@@ -397,7 +404,7 @@ def test_setup_kwargs_survive_a_boxing_lane_walking_the_table(monkeypatch):
     globals_ = _setup_globals()
     monkeypatch.setenv("FLAGOS_BUILD_BOXING", "1")
     for platform in _platforms_in_the_table():
-        globals_["FLAGOS_ACCELERATOR"] = platform
+        globals_["FLAGOS_ACCELERATOR"] = globals_["_normalize_accelerator"](platform)
         assert globals_["_get_setup_kwargs"]()["python_requires"], platform
 
 

@@ -71,7 +71,7 @@ def test_cuda_profiling_runs_only_in_cuda_l3_profiles(case_id, filename):
                 document,
             )
             selected = [g for g in groups if g["id"] == case_id]
-            assert bool(selected) == (platform == "cuda" and profile != "pr"), (
+            assert bool(selected) == (platform == "nvidia" and profile != "pr"), (
                 platform,
                 profile,
             )
@@ -104,7 +104,7 @@ def test_profiles_classify_every_manifest_case(platform):
     assert {g["id"] for g in pr} <= {g["id"] for g in nightly}
     assert {"l3_installed_contract", "l3_lifecycle"} <= {g["id"] for g in nightly}
     assert ("multi_device_contracts" in {g["id"] for g in nightly}) == (
-        platform != "mps"
+        platform != "apple"
     )
     assert "l4_endurance" in {g["id"] for g in nightly}
     if platform in policy()["release"]["model_platforms"]:
@@ -127,7 +127,7 @@ def test_candidate_acceptance_excludes_source_only_diagnostics():
         [{"name": "Source sweep", "command": 'cd "$GITHUB_WORKSPACE" && pytest'}],
         ["unit_tests_per_file"],
         "release",
-        "cuda",
+        "nvidia",
         policy(),
     )
     assert "unit_tests_per_file" not in {group["id"] for group in selected}
@@ -150,7 +150,7 @@ def evidence():
     receipt = {
         "source_sha": "a" * 40,
         "source_repository": "flagos-ai/Torch-FL",
-        "platform": "cuda",
+        "platform": "nvidia",
     }
     groups = [
         {"name": c, "category": c, "status": "passed"}
@@ -163,7 +163,7 @@ def evidence():
             "complete": True,
             "source_ref": receipt["source_sha"],
             "source_repository": receipt["source_repository"],
-            "platform": "cuda",
+            "platform": "nvidia",
             "execution": {
                 "complete": True,
                 "expected": [g["name"] for g in groups],
@@ -220,19 +220,19 @@ def test_publisher_refuses_different_bytes_and_wrong_run(tmp_path):
     wheel.write_bytes(b"accepted bytes")
     receipt = {
         "source_sha": "a" * 40,
-        "platform": "cuda",
+        "platform": "nvidia",
         "run_id": "42",
         "wheel_sha256": sha256(wheel),
         "wheel": wheel.name,
         "status": "accepted",
         "profile": "release",
     }
-    verify(receipt, wheel, "a" * 40, "cuda", "42")
+    verify(receipt, wheel, "a" * 40, "nvidia", "42")
     with pytest.raises(ValueError):
-        verify(receipt, wheel, "a" * 40, "cuda", "43")
+        verify(receipt, wheel, "a" * 40, "nvidia", "43")
     wheel.write_bytes(b"rebuilt bytes")
     with pytest.raises(ValueError):
-        verify(receipt, wheel, "a" * 40, "cuda", "42")
+        verify(receipt, wheel, "a" * 40, "nvidia", "42")
 
 
 def test_installed_package_must_match_candidate_archive(tmp_path, monkeypatch):
@@ -310,14 +310,14 @@ def test_real_pytest_collection_detects_lost_case(tmp_path):
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert merge_reports(reports, "cuda", "success", "repo", "sha")["flagcicd"][
+    assert merge_reports(reports, "nvidia", "success", "repo", "sha")["flagcicd"][
         "complete"
     ]
     marker = next(reports.glob("*.pending"))
     data = json.loads(marker.read_text())
     data["selected_nodeids"].append("test_example.py::test_missing")
     marker.write_text(json.dumps(data))
-    assert not merge_reports(reports, "cuda", "success", "repo", "sha")["flagcicd"][
+    assert not merge_reports(reports, "nvidia", "success", "repo", "sha")["flagcicd"][
         "complete"
     ]
 
@@ -339,7 +339,7 @@ def test_missing_selected_inventory_without_runner_ledger_is_incomplete(tmp_path
             }
         )
     )
-    merged = merge_reports(tmp_path, "cuda", "success", "repo", "sha")
+    merged = merge_reports(tmp_path, "nvidia", "success", "repo", "sha")
     assert merged["flagcicd"]["complete"] is False
     assert merged["flagcicd"]["incomplete_sessions"] == ["acceptance.json"]
 
@@ -409,7 +409,7 @@ def test_execution_modes_default_shared_groups_and_isolate_sensitive_groups():
         ],
         ["factory_ops", "environment"],
         "nightly",
-        "cuda",
+        "nvidia",
         document,
     )
     modes = {group["id"]: group["execution"] for group in selected}
@@ -550,7 +550,7 @@ def test_declared_lower_bound_is_not_mistaken_for_measured_resources(bounds, exp
     assert bool(result["reasons"]) is (expected == "blocked")
 
 
-@pytest.mark.parametrize("value", [[], {"mps": ""}, {"mps": None}, {"": "reason"}])
+@pytest.mark.parametrize("value", [[], {"apple": ""}, {"apple": None}, {"": "reason"}])
 def test_unsupported_case_needs_a_platform_and_reason(tmp_path, value):
     document = policy()
     document["cases"]["multi_device_contracts"]["unsupported_platforms"] = value

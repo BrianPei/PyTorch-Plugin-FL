@@ -52,8 +52,8 @@ source under test. The plan fingerprint includes execution profile, expected
 cases and control identity so a rerun cannot reuse evidence for another policy.
 
 Routing labels take precedence over file filtering. Adding or removing labels
-reruns PR CI. Supported platform names are `ascend`, `cuda`, `dcu`, `gcu`,
-`iluvatar`, `kunlunxin`, `metax`, `mps`, `musa` and `ppu`.
+reruns PR CI. Supported platform names are `apple`, `ascend`, `enflame`, `hygon`,
+`iluvatar`, `kunlunxin`, `metax`, `mthreads`, `nvidia` and `thead`.
 
 Each `.github/configs/<platform>.yml` declares `paths_watch`: exact file names,
 directory prefixes ending in `/`, or shell-style globs. Its own configuration
@@ -97,8 +97,8 @@ first line of a PR comment:
 /ci run
 /ci run all
 /ci run ascend
-/ci run ascend cuda
-/ci run ascend,cuda
+/ci run ascend nvidia
+/ci run ascend,nvidia
 ```
 
 The command validates platform names, keeps unrelated labels, replaces routing

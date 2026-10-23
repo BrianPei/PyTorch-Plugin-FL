@@ -57,7 +57,7 @@ container_options: >-
 timeout_minutes: 60
 integration_timeout_minutes: 720
 # Release/manual wheel-build artifact; CI tests the wheel in the build job.
-wheel_artifact_name: wheel-musa
+wheel_artifact_name: wheel-mthreads
 
 # What this platform's environment has to look like before any test runs, read
 # by the first step of .github/integration-manifest.yml through

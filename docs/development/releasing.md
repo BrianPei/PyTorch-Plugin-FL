@@ -22,7 +22,7 @@ See [CI test tiers](ci-test-tiers.md) for profiles, evidence and remaining gaps.
    receipt on each vendor runner, verifies the source/run/platform/hash and
    accepted status, then calls `publish_wheels.py`. No wheel is rebuilt here.
 
-Required platforms are ascend, cuda, dcu, gcu, metax, musa and ppu. Their vendor
+Required CI lanes are ascend, nvidia, hygon, enflame, metax, mthreads and thead. Their vendor
 lanes remain defined by `cmake/flagos_platforms.json`. Runner labels, images and
 mounts remain in `.github/configs/`. Publication still occurs on vendor runners,
 so package-index upload does not move to a GitHub-hosted runner. Artifact
@@ -60,11 +60,11 @@ The current publishing lanes and representative 2.10.0 filenames are:
 
 | Platform | Lane | Example wheel |
 | --- | --- | --- |
-| cuda | `flagos-pypi-nvidia` | `torch_fl-2.10.0+cuda13.3-cp312-cp312-linux_x86_64.whl` |
-| dcu | `flagos-pypi-hygon` | `torch_fl-2.10.0+dtk2604-cp310-cp310-linux_x86_64.whl` |
-| gcu | `flagos-pypi-enflame` | `torch_fl-2.10.0+tops1.9.10-cp312-cp312-linux_x86_64.whl` |
-| musa | `flagos-pypi-mthreads` | `torch_fl-2.10.0+musa5.2.0-cp310-cp310-linux_x86_64.whl` |
-| ppu | `flagos-pypi-thead` | `torch_fl-2.10.0+ppu2.0.0-cp312-cp312-linux_x86_64.whl` |
+| nvidia | `flagos-pypi-nvidia` | `torch_fl-2.10.0+cuda13.3-cp312-cp312-linux_x86_64.whl` |
+| hygon | `flagos-pypi-hygon` | `torch_fl-2.10.0+dtk2604-cp310-cp310-linux_x86_64.whl` |
+| enflame | `flagos-pypi-enflame` | `torch_fl-2.10.0+tops1.9.10-cp312-cp312-linux_x86_64.whl` |
+| mthreads | `flagos-pypi-mthreads` | `torch_fl-2.10.0+musa5.2.0-cp310-cp310-linux_x86_64.whl` |
+| thead | `flagos-pypi-thead` | `torch_fl-2.10.0+ppu2.0.0-cp312-cp312-linux_x86_64.whl` |
 | ascend | `flagos-pypi-ascend` | `torch_fl-2.10.0+cann9.0.0-cp311-cp311-linux_aarch64.whl` |
 | metax | `flagos-pypi-metax` | `torch_fl-2.10.0+maca3.8.1.3-cp312-cp312-linux_x86_64.whl` |
 
@@ -111,3 +111,8 @@ and accepted receipts; do not rebuild that version. If source, package bytes,
 dependencies or acceptance policy must change, cut a new candidate/version and
 run acceptance again. There is no atomic transaction across vendor lanes, and a
 partially uploaded immutable version cannot be repaired by replacing its bytes.
+
+Candidate artifacts use the CI vendor lane name (`wheel-nvidia`, `wheel-hygon`,
+`wheel-enflame`, `wheel-mthreads`, `wheel-thead`). The publisher resolves these
+through the platform table and still accepts artifact directories named with
+legacy build ids. Wheel versions keep their SDK segments unchanged.

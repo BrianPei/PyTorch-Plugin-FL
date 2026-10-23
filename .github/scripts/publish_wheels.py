@@ -63,11 +63,13 @@ def lanes() -> dict:
 def collect(wheels: Path) -> list:
     """[(platform, wheel_path)] from the downloaded artifact tree."""
     search = lanes()
+    aliases = {vendor: platform for platform, vendor in search.items()}
     found = []
     for directory in sorted(p for p in wheels.iterdir() if p.is_dir()):
         if not directory.name.startswith(ARTIFACT_PREFIX):
             continue
-        platform = directory.name[len(ARTIFACT_PREFIX) :]
+        artifact_platform = directory.name[len(ARTIFACT_PREFIX) :]
+        platform = aliases.get(artifact_platform, artifact_platform)
         if platform not in search:
             raise SystemExit(
                 f"artifact directory {directory.name!r} does not name a platform "

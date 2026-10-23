@@ -1453,7 +1453,8 @@ def _flagos_sibling_requires() -> list:
         return []
     pins = _version_pins()
     reqs = []
-    flagtree = pins.get(f"FLAGTREE_VERSION_{FLAGOS_ACCELERATOR}")
+    vendor = _PLATFORM_TO_VENDOR.get(FLAGOS_ACCELERATOR, FLAGOS_ACCELERATOR)
+    flagtree = pins.get(f"FLAGTREE_VERSION_{vendor}")
     if flagtree:
         # FlagTree *is* Triton -- it installs a `triton` distribution -- so
         # pinning it is what keeps a stock NVIDIA triton wheel out of the

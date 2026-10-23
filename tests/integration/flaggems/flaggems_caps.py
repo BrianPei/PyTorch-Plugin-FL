@@ -145,7 +145,7 @@ FLAGGEMS_PINNED_OFF: dict[str, tuple[str, ...]] = {
         "special_shifted_chebyshev_polynomial_t",
         "slice.Tensor",
     ),
-    "dcu": (
+    "hygon": (
         "scatter_add_",
         "argmin",
         "mean",
@@ -164,9 +164,9 @@ FLAGGEMS_PINNED_OFF: dict[str, tuple[str, ...]] = {
 EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
     "ascend": 221,
     # Routing snapshot after the coverage-ceiling update (#638).
-    "cuda": 549,
-    "dcu": 454,
-    "gcu": 251,
+    "nvidia": 549,
+    "hygon": 454,
+    "enflame": 251,
     # The iluvatar lane's landing: the conf routes 585 ops to FlagGems, eleven
     # to the native slot (six ixdnn/ixblas kernels -- `_convolution`, `addmm`,
     # `bmm`, `convolution`, `mm`, `native_batch_norm` -- plus `_conj`,
@@ -178,9 +178,9 @@ EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
     "kunlunxin": 0,
     # Eight routes left FlagGems in #638; this is not a hardware re-measurement.
     "metax": 586,
-    "mps": 0,
-    "musa": 466,
-    "ppu": 592,
+    "apple": 0,
+    "mthreads": 466,
+    "thead": 592,
 }
 
 #: The route ``scaled_dot_product_attention`` is expected to carry, per platform.
@@ -193,19 +193,19 @@ EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
 #: well as the leaf operators above.
 EXPECTED_SDPA_ROUTE: dict[str, str | None] = {
     "ascend": "none",
-    "cuda": None,
-    "dcu": "flaggems",
-    "gcu": "none",
+    "nvidia": None,
+    "hygon": "flaggems",
+    "enflame": "none",
     # The same `none` the other FlagGems-primary non-boxing platforms record:
     # the composite reaches the privateuseone kernel on every platform, and on
     # this conf it has no FlagGems route to branch to.
     "iluvatar": "none",
     "kunlunxin": "none",
     "metax": "flaggems",
-    "mps": "none",
-    "musa": "none",
+    "apple": "none",
+    "mthreads": "none",
     # Default confs no longer select boxing after #643.
-    "ppu": "none",
+    "thead": "none",
 }
 
 #: conf value -> the name ``[flagos dispatch]`` prints for the same backend. The

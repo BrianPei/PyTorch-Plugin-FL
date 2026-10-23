@@ -215,7 +215,7 @@ jobs:
 
       - name: Validate wheel compatibility manifest
         id: validate
-        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform "${{ needs.configuration.outputs.setup_platform }}" --check-build-env
+        run: python scripts/tools/torch-fl-preflight --wheel dist/*.whl --platform "$FLAGOS_ACCELERATOR" --check-build-env
 
       - name: Install wheel
         id: install

@@ -64,7 +64,7 @@
     },
     "multi_device_contracts": {
       "unsupported_platforms": {
-        "mps": "The MPS backend exposes one logical device; cross-device execution is not supported."
+        "apple": "The MPS backend exposes one logical device; cross-device execution is not supported."
       },
       "level": "L3",
       "category": "distributed",
@@ -672,8 +672,8 @@
       "performance"
     ],
     "model_platforms": [
-      "cuda",
-      "ppu"
+      "nvidia",
+      "thead"
     ],
     "unavailable_reason": "Model mounts and acceptance workloads are not yet verified on other platforms. Release acceptance must fail until configured.",
     "stability_seconds": 3600,

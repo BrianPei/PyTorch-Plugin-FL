@@ -43,6 +43,12 @@ The plan distinguishes the tested source (`source_sha`), comparison head
 Profile and control identity are included in both the fingerprint and report
 matching, including when successful platform results survive a failed-job rerun.
 
+CI plans and artifacts use the vendor lane names from `.github/configs/`
+(`nvidia`, `hygon`, `enflame`, `mthreads`, `thead`, `apple`). Runtime device
+identification and wheel compatibility records retain the build-table ids
+(`cuda`, `dcu`, `gcu`, `musa`, `ppu`, `mps`). Wheel preflight uses the hook's
+normalized `FLAGOS_ACCELERATOR`; profiler platform guards use `detect_platform()`.
+
 L0 validates configuration, lint and the explicit test file inventory. L1 runs
 the existing agnostic, codegen and hardware-free wheel checks. Hardware jobs
 depend on all of them. L2 cases precede L3 cases, and L3 precedes L4.

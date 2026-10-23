@@ -40,7 +40,7 @@ PLAN_CASES = {
     "no_diff": None,
     "documentation": ["README.md"],
     "native_runtime": ["csrc/runtime.cpp"],
-    "platform_config": [".github/configs/cuda.yml"],
+    "platform_config": [".github/configs/nvidia.yml"],
     "mixed": ["README.md", "csrc/runtime.cpp", "tests/unit/test_test_tiers.py"],
 }
 

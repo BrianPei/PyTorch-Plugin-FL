@@ -171,7 +171,7 @@ def test_documentation_has_no_hardware_but_explicit_l2_is_nonempty():
     assert result["expected_platforms"]
 
 
-@pytest.mark.parametrize("platforms", [["../cuda"], [], [True], "cuda,wrong", {}])
+@pytest.mark.parametrize("platforms", [["../nvidia"], [], [True], "nvidia,wrong", {}])
 def test_invalid_platforms_are_rejected(platforms):
     with pytest.raises(ValueError):
         PLANNER.build_plan(request(platforms=platforms), CONTRACT, ROOT, [])
@@ -391,7 +391,11 @@ def test_rerun_uses_latest_platform_report_and_keeps_other_successful_attempts(
 
 @pytest.mark.parametrize(
     "change",
-    [{"source_sha": "d" * 40}, {"config_hash": "wrong"}, {"platform": {"name": "ppu"}}],
+    [
+        {"source_sha": "d" * 40},
+        {"config_hash": "wrong"},
+        {"platform": {"name": "thead"}},
+    ],
 )
 def test_reports_must_belong_to_the_plan(tmp_path, change):
     save_report(tmp_path, **change)
@@ -405,7 +409,7 @@ def test_diff_preserves_both_paths_of_a_vendor_rename(tmp_path, monkeypatch):
         ).strip()
 
     git("init", "-q")
-    (tmp_path / "cuda.cc").write_text("native code\n")
+    (tmp_path / "nvidia.cc").write_text("native code\n")
     git("add", ".")
     git(
         "-c",
@@ -417,7 +421,7 @@ def test_diff_preserves_both_paths_of_a_vendor_rename(tmp_path, monkeypatch):
         "base",
     )
     base = git("rev-parse", "HEAD")
-    git("mv", "cuda.cc", "ppu.cc")
+    git("mv", "nvidia.cc", "thead.cc")
     git(
         "-c",
         "user.name=Test",
@@ -428,7 +432,10 @@ def test_diff_preserves_both_paths_of_a_vendor_rename(tmp_path, monkeypatch):
         "rename",
     )
     monkeypatch.chdir(tmp_path)
-    assert set(PLANNER._changed_files("unused", base, "HEAD")) == {"cuda.cc", "ppu.cc"}
+    assert set(PLANNER._changed_files("unused", base, "HEAD")) == {
+        "nvidia.cc",
+        "thead.cc",
+    }
 
 
 def test_unavailable_diff_is_distinct_from_an_empty_diff(tmp_path, monkeypatch):
@@ -595,7 +602,7 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(
 def test_report_clis_retain_failed_execution_and_summary(tmp_path, record_only):
     raw = tmp_path / "raw"
     raw.mkdir()
-    output = tmp_path / "flagcicd-platform-cuda.json"
+    output = tmp_path / "flagcicd-platform-nvidia.json"
     env = {
         **os.environ,
         "FLAGCICD_PLAN": json.dumps(plan()),
@@ -740,7 +747,7 @@ def test_a_rerun_can_replace_a_report_from_a_previous_plan(tmp_path):
 
 def test_array_platforms_are_names_not_comma_separated_sublists():
     with pytest.raises(ValueError):
-        PLANNER.build_plan(request(platforms=["cuda,ppu"]), CONTRACT, ROOT, [])
+        PLANNER.build_plan(request(platforms=["nvidia,thead"]), CONTRACT, ROOT, [])
 
 
 def test_large_diffs_remain_in_artifacts_and_context_can_start_a_process():
@@ -825,7 +832,7 @@ def test_a_report_from_another_platform_cannot_supply_passing_metrics(tmp_path):
     raw_reports(tmp_path)
     path = tmp_path / "pytest/pytest-nvidia.json"
     data = json.loads(path.read_text())
-    data["flagcicd"]["platform"] = "ppu"
+    data["flagcicd"]["platform"] = "thead"
     path.write_text(json.dumps(data))
     assert (
         REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)["status"]
@@ -872,9 +879,9 @@ def test_workflow_stage_recorder_and_platform_report_use_the_same_contract(tmp_p
 
 def test_missing_hardware_identity_cannot_pass(tmp_path):
     raw_reports(tmp_path)
-    (tmp_path / "pytest/hardware-cuda.json").unlink()
+    (tmp_path / "pytest/hardware-nvidia.json").unlink()
     assert (
-        REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)["status"]
+        REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)["status"]
         == "report_error"
     )
 
@@ -883,9 +890,9 @@ def test_nested_artifact_hardware_identity_is_found(tmp_path):
     raw_reports(tmp_path)
     nested = tmp_path / "pytest/runner-temp/session"
     nested.mkdir(parents=True)
-    (tmp_path / "pytest/hardware-cuda.json").rename(nested / "hardware-cuda.json")
+    (tmp_path / "pytest/hardware-nvidia.json").rename(nested / "hardware-nvidia.json")
     assert (
-        REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)["status"]
+        REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)["status"]
         == "passed"
     )
 
@@ -893,7 +900,7 @@ def test_nested_artifact_hardware_identity_is_found(tmp_path):
 def test_malformed_performance_evidence_retains_failure_report(tmp_path):
     raw_reports(tmp_path)
     (tmp_path / "pytest/performance.json").write_text("invalid JSON")
-    report = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    report = REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)
     assert report["status"] == "report_error"
     assert any("invalid performance evidence" in error for error in report["errors"])
 
@@ -908,7 +915,7 @@ def test_automatic_pr_preserves_merge_target_and_compares_head(monkeypatch):
             "pull_request": {
                 "head": {"sha": SHA},
                 "base": {"sha": "b" * 40},
-                "labels": [{"name": "platform:ppu"}],
+                "labels": [{"name": "platform:thead"}],
             }
         },
         "pull_request",
@@ -922,7 +929,7 @@ def test_automatic_pr_preserves_merge_target_and_compares_head(monkeypatch):
     assert result["target_kind"] == "merge"
     assert result["control_sha"] == "d" * 40
     planned = PLANNER.build_plan(result, CONTRACT, ROOT, ["README.md"])
-    assert planned["expected_platforms"] == ["ppu"]
+    assert planned["expected_platforms"] == ["thead"]
     assert planned["test_level"] == "L2"
 
 
@@ -962,12 +969,12 @@ def test_ci_manual_all_still_runs_hardware_for_a_documentation_diff(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    "changed", [["README.md"], ["csrc/runtime/accelerator/cuda/stream.cpp"], None]
+    "changed", [["README.md"], ["csrc/runtime/accelerator/nvidia/stream.cpp"], None]
 )
 def test_equivalent_manual_requests_get_the_same_plan(monkeypatch, changed):
     monkeypatch.setattr(RESOLVER, "commit", lambda *_: SHA)
     monkeypatch.setattr(RESOLVER, "api", lambda *_: {"default_branch": "main"})
-    common = {"platforms": "cuda,ppu", "test_level": "L2", "selection": "all"}
+    common = {"platforms": "nvidia,thead", "test_level": "L2", "selection": "all"}
     automatic = RESOLVER.resolve(
         {"inputs": common}, "workflow_dispatch", "owner/repo", SHA, entry="ci"
     )
@@ -999,7 +1006,7 @@ def test_automatic_documentation_keeps_shared_checks_without_hardware():
 @pytest.mark.parametrize(
     "labels,expected",
     [
-        (["platform:cuda", "platform:ppu"], ["cuda", "ppu"]),
+        (["platform:nvidia", "platform:thead"], ["nvidia", "thead"]),
         (["platform:unknown"], None),
         (["platform:all"], None),
     ],
@@ -1026,7 +1033,7 @@ def test_shared_planner_preserves_legacy_label_routing(labels, expected):
     ],
 )
 def test_execution_policy_and_control_changes_invalidate_report_reuse(overrides):
-    baseline = request(profile="pr-risk", platforms="cuda")
+    baseline = request(profile="pr-risk", platforms="nvidia")
     old = PLANNER.build_plan(baseline, CONTRACT, ROOT, ["setup.py"])
     new = PLANNER.build_plan({**baseline, **overrides}, CONTRACT, ROOT, ["setup.py"])
     assert new["config_hash"] != old["config_hash"]
@@ -1045,23 +1052,23 @@ def test_same_config_cannot_hide_a_report_with_a_different_profile(tmp_path):
 @pytest.mark.parametrize("counts", [{"total": 0}, {"total": 2, "skipped": 2}])
 def test_no_passing_pytest_case_cannot_accept_hardware(tmp_path, counts):
     raw_reports(tmp_path)
-    path = tmp_path / "pytest/pytest-cuda.json"
+    path = tmp_path / "pytest/pytest-nvidia.json"
     report = json.loads(path.read_text())
     report["summary"] = counts
     path.write_text(json.dumps(report))
-    result = REPORTER.platform_report(plan(), "cuda", jobs(), tmp_path, 1)
+    result = REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)
     assert result["status"] == "report_error"
     assert any("at least one passing test" in error for error in result["errors"])
 
 
 def test_hardware_floor_does_not_expand_an_explicit_platform_set():
     actual = PLANNER.build_plan(
-        request(platforms="cuda", selection="affected", requested_level="L2"),
+        request(platforms="nvidia", selection="affected", requested_level="L2"),
         CONTRACT,
         ROOT,
         ["README.md"],
     )
-    assert actual["expected_platforms"] == ["cuda"]
+    assert actual["expected_platforms"] == ["nvidia"]
 
 
 def test_record_only_cannot_bypass_a_summary_gate(tmp_path):
@@ -1119,13 +1126,13 @@ def test_record_only_keeps_report_defects_rerunnable(tmp_path, defect):
     if defect != "missing":
         raw_reports(raw)
     if defect == "empty":
-        path = raw / "pytest/pytest-cuda.json"
+        path = raw / "pytest/pytest-nvidia.json"
         payload = json.loads(path.read_text())
         payload["summary"] = {"total": 0}
         path.write_text(json.dumps(payload))
     if defect == "malformed_stages":
         results["integration-tests"]["outputs"]["stages"] = "[]"
-    output = tmp_path / "flagcicd-platform-cuda.json"
+    output = tmp_path / "flagcicd-platform-nvidia.json"
     process = subprocess.run(
         [
             sys.executable,
@@ -1133,7 +1140,7 @@ def test_record_only_keeps_report_defects_rerunnable(tmp_path, defect):
             "platform",
             "--record-only",
             "--platform",
-            "cuda",
+            "nvidia",
             "--directory",
             str(raw),
             "--output",
@@ -1175,7 +1182,7 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
     shutil.copytree(ROOT / ".flagcicd", source / ".flagcicd")
     configs = source / ".github/configs"
     configs.mkdir(parents=True)
-    shutil.copyfile(ROOT / ".github/configs/cuda.yml", configs / "cuda.yml")
+    shutil.copyfile(ROOT / ".github/configs/nvidia.yml", configs / "nvidia.yml")
     manifest = {
         "steps": [
             {
@@ -1193,14 +1200,14 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
         yaml.safe_dump(manifest, sort_keys=False)
     )
     planned = PLANNER.build_plan(
-        request(platforms="cuda", profile="pr"), CONTRACT, source, ["fixture.py"]
+        request(platforms="nvidia", profile="pr"), CONTRACT, source, ["fixture.py"]
     )
     planned.update(run_id="42", run_attempt="1")
     groups = PLANNER.compose(
         manifest,
-        yaml.safe_load((configs / "cuda.yml").read_text()),
-        "cuda",
-        ["cuda"],
+        yaml.safe_load((configs / "nvidia.yml").read_text()),
+        "nvidia",
+        ["nvidia"],
         "pr",
         PLANNER.policy(source),
     )
@@ -1219,7 +1226,7 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
     raw = tmp_path / "raw"
     reports = raw / "pytest"
     reports.mkdir(parents=True)
-    (reports / "hardware-cuda.json").write_text(
+    (reports / "hardware-nvidia.json").write_text(
         json.dumps(
             {
                 "machine_model": "synthetic-orchestration-fixture",
@@ -1248,16 +1255,16 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
     )
     outcome = "success" if execution.returncode == 0 else "failure"
     merged = load("merge_pytest_reports").merge_reports(
-        reports, "cuda", outcome, planned["source_repository"], SHA
+        reports, "nvidia", outcome, planned["source_repository"], SHA
     )
-    (reports / "pytest-cuda.json").write_text(json.dumps(merged))
+    (reports / "pytest-nvidia.json").write_text(json.dumps(merged))
     platform = REPORTER.platform_report(
-        planned, "cuda", jobs(outcome, tests=outcome), raw, 1
+        planned, "nvidia", jobs(outcome, tests=outcome), raw, 1
     )
     assert platform["status"] == expected, execution.stdout + execution.stderr
     directory = tmp_path / "outcomes"
     directory.mkdir()
-    (directory / "flagcicd-platform-cuda.json").write_text(json.dumps(platform))
+    (directory / "flagcicd-platform-nvidia.json").write_text(json.dumps(platform))
     results = entry_jobs()
     results["platforms"]["result"] = "success" if expected == "passed" else "failure"
     summary = REPORTER.aggregate(planned, results, directory, 1)
@@ -1281,9 +1288,9 @@ def test_real_runner_evidence_satisfies_only_its_planned_execution(
     [
         ("ci", "all", "legacy", "all"),
         ("external", "all", "legacy", "affected"),
-        ("external", "cuda", "legacy", "all"),
-        ("ci", "cuda", "affected", "affected"),
-        ("external", "cuda", "affected", "affected"),
+        ("external", "nvidia", "legacy", "all"),
+        ("ci", "nvidia", "affected", "affected"),
+        ("external", "nvidia", "affected", "affected"),
         ("ci", "all", "all", "all"),
     ],
 )
@@ -1322,18 +1329,18 @@ def test_selection_input_has_an_explicit_legacy_mapping(
 
 def test_partial_label_selection_is_visible_as_diagnostic():
     actual = PLANNER.build_plan(
-        request(profile="auto", pr_labels=["platform:cuda"]),
+        request(profile="auto", pr_labels=["platform:nvidia"]),
         CONTRACT,
         ROOT,
         ["setup.py"],
     )
-    assert actual["expected_platforms"] == ["cuda"]
+    assert actual["expected_platforms"] == ["nvidia"]
     assert actual["validation_scope"] == "diagnostic"
     assert set(actual["required_platforms"]) == set(
         PLANNER._load_platforms(ROOT / ".github/configs")
     )
     assert (
-        next(p for p in actual["platform_decisions"] if p["platform"] == "cuda")[
+        next(p for p in actual["platform_decisions"] if p["platform"] == "nvidia")[
             "reason"
         ]
         == "platform_label"
@@ -1342,9 +1349,9 @@ def test_partial_label_selection_is_visible_as_diagnostic():
 
 def test_nightly_subset_does_not_claim_complete_platform_coverage():
     actual = PLANNER.build_plan(
-        request(profile="nightly", platforms="cuda"), CONTRACT, ROOT, ["README.md"]
+        request(profile="nightly", platforms="nvidia"), CONTRACT, ROOT, ["README.md"]
     )
-    assert actual["expected_platforms"] == ["cuda"]
+    assert actual["expected_platforms"] == ["nvidia"]
     assert actual["validation_scope"] == "diagnostic"
 
 
@@ -1376,14 +1383,14 @@ def test_planned_missing_capability_remains_required_and_blocks(tmp_path):
     tiers["cases"]["l3_lifecycle"]["requires"].append("model_directory")
     policy_path.write_text(json.dumps(tiers))
     actual = PLANNER.build_plan(
-        request(platforms="mps", profile="pr-risk"), CONTRACT, source, ["setup.py"]
+        request(platforms="apple", profile="pr-risk"), CONTRACT, source, ["setup.py"]
     )
     blocked = next(
         case for case in actual["blocked_cases"] if case["id"] == "l3_lifecycle"
     )
-    assert blocked["platform"] == "mps"
+    assert blocked["platform"] == "apple"
     assert "model directory" in blocked["reason"]
-    assert "l3_lifecycle" in actual["expected_cases"]["mps"]
+    assert "l3_lifecycle" in actual["expected_cases"]["apple"]
     actual.update(run_id="42", run_attempt="1")
     context = json.loads(PLANNER.report_context(actual))
     assert context["blocked_cases"] == actual["blocked_cases"]
@@ -1396,7 +1403,7 @@ def test_diagnostic_success_cannot_satisfy_automatic_required_check(tmp_path):
     planned = {
         **plan(),
         "validation_scope": "diagnostic",
-        "required_platforms": ["cuda", "ppu"],
+        "required_platforms": ["nvidia", "thead"],
     }
     save_report(tmp_path)
     aliases = {
@@ -1456,7 +1463,7 @@ def test_resource_block_is_an_infrastructure_failure_even_without_pytest(tmp_pat
         )
     )
     actual = REPORTER.platform_report(
-        plan(), "cuda", jobs("failure", tests="failure"), tmp_path, 1
+        plan(), "nvidia", jobs("failure", tests="failure"), tmp_path, 1
     )
     assert actual["status"] == "infra_error"
     assert actual["execution"]["groups"][0]["status"] == "blocked"
@@ -1479,16 +1486,16 @@ def test_cancelled_execution_is_not_reclassified_by_a_blocked_ledger(tmp_path):
             }
         )
     )
-    actual = REPORTER.platform_report(plan(), "cuda", jobs("cancelled"), tmp_path, 1)
+    actual = REPORTER.platform_report(plan(), "nvidia", jobs("cancelled"), tmp_path, 1)
     assert actual["status"] == "cancelled"
     assert actual["execution"]["groups"][0]["status"] == "blocked"
 
 
 def test_l0_explicit_candidates_are_validated_without_claiming_hardware_execution():
     actual = PLANNER.build_plan(
-        request(platforms="cuda", requested_level="L0"), CONTRACT, ROOT, ["README.md"]
+        request(platforms="nvidia", requested_level="L0"), CONTRACT, ROOT, ["README.md"]
     )
-    assert actual["validated_platforms"] == ["cuda"]
+    assert actual["validated_platforms"] == ["nvidia"]
     assert actual["expected_platforms"] == []
     assert all(
         item["status"] == "excluded" and item["reason"] == "hardware_not_required"
@@ -1519,13 +1526,13 @@ def test_reporter_independently_validates_each_planned_case(
     raw_reports(tmp_path)
     planned = {
         **plan(),
-        "expected_cases": {"cuda": ["first", "second"]},
+        "expected_cases": {"nvidia": ["first", "second"]},
         "case_contracts": {
             "first": {"min_accelerators": 1, "min_passed": 1},
             "second": {"min_accelerators": 2, "min_passed": 1},
         },
     }
-    path = tmp_path / "pytest/pytest-cuda.json"
+    path = tmp_path / "pytest/pytest-nvidia.json"
     report = json.loads(path.read_text())
     groups = [
         {
@@ -1543,7 +1550,7 @@ def test_reporter_independently_validates_each_planned_case(
     ]
     report["flagcicd"]["execution"] = {"complete": True, "groups": groups}
     report["summary"] = {"total": 2, "passed": 2}
-    hardware_path = tmp_path / "pytest/hardware-cuda.json"
+    hardware_path = tmp_path / "pytest/hardware-nvidia.json"
     hardware = json.loads(hardware_path.read_text())
     hardware["accelerator_count"] = 2
     if defect == "all_skip_group":
@@ -1571,7 +1578,7 @@ def test_reporter_independently_validates_each_planned_case(
         report["flagcicd"]["execution"]["groups"] = ["first", "second"]
     path.write_text(json.dumps(report))
     hardware_path.write_text(json.dumps(hardware))
-    actual = REPORTER.platform_report(planned, "cuda", jobs(), tmp_path, 1)
+    actual = REPORTER.platform_report(planned, "nvidia", jobs(), tmp_path, 1)
     assert actual["status"] == ("report_error" if expected_error else "passed")
     if expected_error:
         assert any(expected_error in reason for reason in actual["errors"])
@@ -1579,15 +1586,15 @@ def test_reporter_independently_validates_each_planned_case(
 
 def test_mps_unsupported_case_is_explicit_in_plan_and_summary(tmp_path):
     actual = PLANNER.build_plan(
-        request(profile="pr-risk", platforms="mps", selection="all"),
+        request(profile="pr-risk", platforms="apple", selection="all"),
         CONTRACT,
         ROOT,
-        [".github/configs/mps.yml"],
+        [".github/configs/apple.yml"],
     )
-    assert "multi_device_contracts" not in actual["expected_cases"]["mps"]
+    assert "multi_device_contracts" not in actual["expected_cases"]["apple"]
     decision = next(
         case
-        for case in actual["case_decisions"]["mps"]
+        for case in actual["case_decisions"]["apple"]
         if case["id"] == "multi_device_contracts"
     )
     assert decision["status"] == "unsupported"
@@ -1603,35 +1610,35 @@ def test_mps_unsupported_case_is_explicit_in_plan_and_summary(tmp_path):
 
 def test_other_single_device_platforms_still_require_multidevice_hardware():
     actual = PLANNER.build_plan(
-        request(profile="pr-risk", platforms="cuda", selection="all"),
+        request(profile="pr-risk", platforms="nvidia", selection="all"),
         CONTRACT,
         ROOT,
-        [".github/configs/cuda.yml"],
+        [".github/configs/nvidia.yml"],
     )
-    assert "multi_device_contracts" in actual["expected_cases"]["cuda"]
+    assert "multi_device_contracts" in actual["expected_cases"]["nvidia"]
     assert actual["unsupported_cases"] == []
     assert actual["case_contracts"]["multi_device_contracts"]["min_accelerators"] == 2
 
 
 def test_platform_report_keeps_only_its_unsupported_capabilities(tmp_path):
     case = {
-        "platform": "mps",
+        "platform": "apple",
         "id": "multi_device_contracts",
         "reason": "one logical device",
     }
     planned = {
-        **plan(platforms=["mps"]),
-        "unsupported_cases": [case, {**case, "platform": "cuda"}],
+        **plan(platforms=["apple"]),
+        "unsupported_cases": [case, {**case, "platform": "nvidia"}],
     }
     raw_reports(tmp_path)
     raw = tmp_path / "pytest"
-    (raw / "hardware-cuda.json").rename(raw / "hardware-mps.json")
-    pytest_path = raw / "pytest-cuda.json"
+    (raw / "hardware-nvidia.json").rename(raw / "hardware-apple.json")
+    pytest_path = raw / "pytest-nvidia.json"
     payload = json.loads(pytest_path.read_text())
-    payload["flagcicd"]["platform"] = "mps"
-    (raw / "pytest-mps.json").write_text(json.dumps(payload))
+    payload["flagcicd"]["platform"] = "apple"
+    (raw / "pytest-apple.json").write_text(json.dumps(payload))
     pytest_path.unlink()
-    report = REPORTER.platform_report(planned, "mps", jobs(), tmp_path, 1)
+    report = REPORTER.platform_report(planned, "apple", jobs(), tmp_path, 1)
     assert report["status"] == "passed"
     assert report["unsupported_cases"] == [case]
     assert report["metrics"]["tests"]["passed"] == 1

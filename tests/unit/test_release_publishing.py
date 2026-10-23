@@ -112,8 +112,8 @@ def test_every_publishing_platform_has_a_build_job_in_the_release_workflow():
     """
     matrix = _release_matrix_platforms()
     publishing = publishing_platforms()
-    missing = sorted(set(publishing) - set(matrix))
-    extra = sorted(set(matrix) - set(publishing))
+    missing = sorted(set(publishing.values()) - set(matrix))
+    extra = sorted(set(matrix) - set(publishing.values()))
     assert not missing, f"release.yml's matrix has no job for: {missing}"
     assert not extra, (
         f"release.yml's matrix builds {extra}, which carry no pypi_lane, so "
@@ -140,10 +140,14 @@ def test_the_publisher_reads_the_same_platforms_the_table_does():
     assert _publisher().lanes() == publishing_platforms()
 
 
-def test_the_publisher_reads_the_platform_out_of_the_artifact_directory(tmp_path):
+@pytest.mark.parametrize("naming", ["vendor", "legacy"])
+def test_the_publisher_reads_the_platform_out_of_the_artifact_directory(
+    tmp_path, naming
+):
     publisher = _publisher()
-    for platform in publishing_platforms():
-        directory = tmp_path / f"wheel-{platform}"
+    for platform, vendor in publishing_platforms().items():
+        name = vendor if naming == "vendor" else platform
+        directory = tmp_path / f"wheel-{name}"
         directory.mkdir()
         (directory / "torch_fl-2.10.0+x-cp312-cp312-linux_x86_64.whl").touch()
     found = publisher.collect(tmp_path)
@@ -293,10 +297,16 @@ def test_release_publishes_only_after_accepting_all_candidate_wheels():
     assert "publish: false" in jobs["build"]
     assert "test_profile: release" in jobs["acceptance"]
     assert "candidate_artifact: wheel-${{ matrix.platform }}" in jobs["acceptance"]
+    for vendor in _release_matrix_platforms():
+        config = (CONFIGS / f"{vendor}.yml").read_text()
+        artifact = re.search(r"^wheel_artifact_name:\s*(\S+)", config, re.M)
+        assert artifact is not None
+        assert artifact.group(1) == f"wheel-{vendor}"
+
     assert "needs: [guard, acceptance]" in jobs["publish"]
     assert ".github/workflows/publish-accepted-wheel.yml" in jobs["publish"]
     assert "NEXUS_TOKEN: ${{ secrets.NEXUS_TOKEN }}" in jobs["publish"]
-    assert set(_release_matrix_platforms()) == set(publishing_platforms())
+    assert set(_release_matrix_platforms()) == set(publishing_platforms().values())
 
 
 def test_ci_still_builds_without_publishing():
