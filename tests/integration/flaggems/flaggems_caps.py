@@ -176,9 +176,17 @@ EXPECTED_FLAGGEMS_ROUTES: dict[str, int] = {
     "iluvatar": 585,
     "kunlunxin": 0,
     "metax": 594,
-    "mps": 0,
+    # 0: the apple conf routes no operator to FlagGems -- its native MPSGraph
+    # kernels serve what it accelerates and the rest reaches cpu_fallback.
+    "apple": 0,
     "musa": 466,
+    #: The two confs the PPU lane can run. `ppu` is the default
+    #: backends_thead.conf, which a FlagGems-primary wheel reads; `ppu_boxing`
+    #: is the day-0 variant the boxing wheel selects (FLAGOS_BACKEND_CONFIG),
+    #: identical to it except that the ops without a FlagGems route go to
+    #: `boxing`. Both counts are the conf's text, not a measurement.
     "ppu": 592,
+    "ppu_boxing": 592,
 }
 
 #: The route ``scaled_dot_product_attention`` is expected to carry, per platform.
@@ -200,9 +208,15 @@ EXPECTED_SDPA_ROUTE: dict[str, str | None] = {
     "iluvatar": "none",
     "kunlunxin": "none",
     "metax": "flaggems",
-    "mps": "none",
+    "apple": "none",
     "musa": "none",
-    "ppu": "cuda",
+    # `none` on PPU: backends_thead.conf leaves the composite to the boxed CUDA
+    # composite (`none` is cpu_fallback, which serves it on a wheel that does
+    # not register it), and the day-0 variant names `boxing` for the same
+    # kernel. Which arm a call takes on either is the operator tests' property,
+    # not this table's.
+    "ppu": "none",
+    "ppu_boxing": "boxing",
 }
 
 #: conf value -> the name ``[flagos dispatch]`` prints for the same backend. The
@@ -213,6 +227,12 @@ _LOG_NAME = {
     "flaggems_python": "flagos_python",
     "flagos_python": "flagos_python",
     "flaggems_cpp": "flagos",
+    # A conf row in the vendor spelling, against the id the log prints. The
+    # NVIDIA rows print "boxing" (the slot they register into).
+    "apple": "mps",
+    "mthreads": "musa",
+    "enflame": "gcu",
+    "nvidia": "boxing",
 }
 
 #: The backend names that mean "this operator took a FlagGems route".
