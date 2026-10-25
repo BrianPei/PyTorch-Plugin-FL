@@ -27,26 +27,26 @@ runner_labels:
 paths_watch:
   - torch_fl/accelerator/thead/
   - torch_fl/configs/backends_thead.conf
-  - csrc/aten/backends/thead/
-  - csrc/runtime/accelerator/thead/
+  # thead is a CUDA-ABI vendor: it ships no vendor kernel tree and no runtime of
+  # its own (FLAGOS_PLATFORM_RUNTIME_DIR is nvidia). The aten/backends/thead and
+  # runtime/accelerator/thead entries never matched a file; nvidia_memory.h is
+  # the allocator header it actually compiles.
   - csrc/runtime/accelerator/nvidia/
   - csrc/runtime/allocator/backends/nvidia_memory.h
-  - csrc/runtime/allocator/backends/thead_memory.h
   - .github/scripts/hooks/set_env_thead.sh
   - .github/scripts/set_env_thead.sh
   - scripts/vendor/bundle_thead_libtorch.sh
 
-container_volumes:
-  # PPU_SDK (underscore, /usr/local/PPU_SDK) is baked into the image with
-  # CUDA_SDK/lib64/libcudart.so; no host mount needed. Neither is FlagGems: the
-  # image ships it as a PEP 660 editable install pointing at a /workspace/FlagGems
-  # bind mount, which is no longer part of the runner pod. set_env_thead.sh instead
-  # installs the FlagGems stack into the job venv from published FlagOS wheels,
-  # so the environment is reproducible from the image plus those indexes alone.
-  - /mnt/cpfs/models/Qwen3-0.6B:/models/Qwen3-0.6B:ro
-
-integration_environment:
-  MODEL_PATH: /models/Qwen3-0.6B
+container_volumes: []
+# The Qwen3 steps need a checkpoint, and the runner pod was the only place one
+# lived: this config mounted /mnt/cpfs/models/Qwen3-0.6B from the pod's host.
+# Every dsw-batch pod with that path is gone (the dsw-879514... run that still
+# carried it has no PPU result), so the mount now references nothing and the
+# job container comes up without /models at all. An empty list says so instead
+# of failing inside a runner-side docker create, where the error is invisible.
+# Restore the line -- and integration_environment's MODEL_PATH -- once the
+# checkpoint lives somewhere the pod can mount again.
+integration_environment: {}
 
 # DSW authZ plugin denies --privileged / --ipc=host / --security-opt /
 # --cap-add (Aliyun DSW docs: "authorization denied by plugin authZ"). Mount
@@ -88,21 +88,22 @@ wheel_artifact_name: wheel-ppu
 # that script; the values are this platform's, and they assert the same things
 # the hand-written heredoc that used to sit here did.
 #
-# PPU takes the CUDA dispatch key over with its own bundled libtorch_cuda.so
-# under lib_thead, which is why torch.version.cuda reads 13.0 in a stock +cpu
-# wheel, and why both the torch.cuda and the flagos device surfaces have to
-# report devices. The Qwen3 groups are the two steps that need the mounted
-# checkpoint, so the mount is asserted here.
+# The lane builds the boxing wheel (see set_env_thead.sh): stock +cpu torch with
+# PPU's own libtorch staged into lib_thead/. Importing it selects that core,
+# which is why torch.version.cuda reads 13.0 rather than None, and the day-0
+# conf (FLAGOS_BACKEND_CONFIG) is what routes the ops this build registers
+# without a FlagGems kernel to `boxing` -- `boxing` in the build record is both
+# the kernel set required here and the reason the bundle is required rather
+# than forbidden.
 environment_check:
   torch_version_prefix: "2.10.0+cpu"
   cuda_version: "13.0"
   torch_path_forbidden:
     - /opt/conda/
+  require_build_kernels:
+    - flaggems
+    - boxing
   require_package_files:
     - lib_thead/libtorch_cuda.so
   flagos_devices:
     more_than: 0
-  cuda_available: true
-  cuda_devices:
-    more_than: 0
-  model_dir: true

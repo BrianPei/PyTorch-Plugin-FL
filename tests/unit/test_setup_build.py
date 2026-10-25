@@ -16,12 +16,18 @@ import importlib.metadata
 import json
 import re
 import runpy
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import setuptools
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10, the DCU/MUSA interpreter
+    tomllib = None
 from setuptools import Distribution, Extension
 from setuptools.command.build_ext import build_ext
 
@@ -35,6 +41,50 @@ KERNEL_SWITCHES = (
     "FLAGOS_BUILD_FLAGGEMS_CPP",
     "FLAGOS_BUILD_TILEOPS",
 )
+
+
+def _gnu_ld_linker() -> str | None:
+    """``gcc``, made to link with GNU ``ld`` -- what the MetaX shim is built with."""
+    import os
+    import shutil
+    import tempfile
+
+    gcc = shutil.which("gcc")
+    if gcc is None or not sys.platform.startswith("linux"):
+        return None
+    ld = shutil.which("ld")
+    if ld is not None:
+        with open(ld, "rb") as handle:
+            if b"GNU ld" in handle.read(4096):
+                return gcc
+    homebrew_ld = "/opt/homebrew/opt/binutils/bin/ld"
+    if os.path.exists(homebrew_ld):
+        return gcc
+    # A bare `ld` resolved by gcc is not necessarily the one `which` found.
+    with tempfile.TemporaryDirectory() as scratch:
+        probe = os.path.join(scratch, "probe.c")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("int _shim(int x) { return x; }\n")
+        script = os.path.join(scratch, "probe.map")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("SHIM_1 { global: _shim; local: *; };\n")
+        try:
+            subprocess.run(
+                [
+                    gcc,
+                    "-shared",
+                    "-fPIC",
+                    "-o",
+                    os.path.join(scratch, "libprobe.so"),
+                    probe,
+                    f"-Wl,--version-script={script}",
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+    return gcc
 
 
 def _load_setup(monkeypatch):
@@ -109,7 +159,7 @@ def test_build_ext_stages_generated_build_config(
     # version segment.
     monkeypatch.setenv("FLAGOS_ACCELERATOR", "mthreads")
     _, setup_kwargs = _load_setup(monkeypatch)
-    assert "scripts/tools/torch-fl-preflight" in setup_kwargs["scripts"]
+    assert "scripts" not in setup_kwargs
     source_root = tmp_path / "source"
     package_root = source_root / "torch_fl"
     package_root.mkdir(parents=True)
@@ -276,6 +326,56 @@ def test_default_kernel_set_per_accelerator(
     assert {names[switch] for switch, on in resolved.items() if on} == expected
 
 
+@pytest.mark.parametrize(
+    "told, platform, aliases",
+    [
+        # The wheels named for a vendor whose row is keyed by another id have to
+        # recognise the vendor spelling; a row whose vendor is also its id
+        # (`metax`) names the row it shares that vendor with, whose arms MetaX's
+        # toolkit answers. The row comes last, which is the entry CMake resolves
+        # any of the names to. `metax` is read on Linux only: loading setup.py
+        # for it builds the libcudart shim, and macOS's ld has no
+        # `--version-script`. The GNU-ld gate asks for the linker the shim
+        # actually needs, not for Linux: a darwin host with GNU binutils named
+        # alongside Homebrew's ld can run it, and would otherwise skip.
+        pytest.param(
+            "metax",
+            "metax",
+            ["metax", "cuda"],
+            marks=pytest.mark.skipif(
+                _gnu_ld_linker() is None,
+                reason="metax setup.py builds its shim with GNU ld",
+            ),
+        ),
+        ("mthreads", "musa", ["musa", "mthreads"]),
+        ("apple", "mps", ["mps", "apple"]),
+        ("hygon", "dcu", ["dcu", "hygon"]),
+        ("nvidia", "cuda", ["cuda", "nvidia"]),
+    ],
+)
+def test_each_build_records_every_spelling_of_its_platform(
+    monkeypatch, tmp_path, clean_kernel_env, told, platform, aliases
+):
+    """A wheel recognises the accelerator name its environment may carry.
+
+    The build is told either half of the name, and a vendor-named build has to
+    accept that name or it falls to the default platform's arms.
+    """
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", told)
+    namespace, _ = _load_setup(monkeypatch)
+    monkeypatch.setitem(
+        namespace["_write_environment_platform_alias"].__globals__,
+        "BASE_DIR",
+        str(tmp_path),
+    )
+    namespace["_write_environment_platform_alias"]()
+    record = {}
+    text = (tmp_path / "torch_fl" / "_platform_alias.py").read_text()
+    exec(text, record)
+    assert record["ACCELERATOR"] == platform
+    assert record["ALIASES"] == aliases
+
+
 def test_explicit_kernel_switch_overrides_the_vendor_default(
     monkeypatch, clean_kernel_env
 ):
@@ -431,6 +531,49 @@ def test_setup_resolves_the_table_defaults(monkeypatch, clean_kernel_env):
         assert namespace["_kernel_switches"](accelerator) == row["kernel_defaults"], (
             accelerator
         )
+
+
+def test_a_build_without_a_marker_drops_an_inherited_one(monkeypatch, tmp_path):
+    """torch_fl/lib/ is never cleaned, so another build's marker must not survive.
+
+    A MetaX build whose tree still carried an "mps" marker (left by the marker
+    tests' copies, or by an earlier apple build) read the empty
+    backends_apple.conf and raised "routed to 'none'" on every op it does not
+    list. setup.py removes it for the platforms whose row writes no marker, and
+    keeps it where the row does.
+    """
+    # Not metax: importing setup.py with it compiles and loads the cu-bridge
+    # shim, which only a MetaX box can do. The removal is keyed on the row's
+    # writes_platform_marker flag, which metax and ppu both set to false.
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "ppu")
+    namespace, _ = _load_setup(monkeypatch)
+    root = tmp_path / "src"
+    marker = root / "torch_fl" / "lib" / "flagos_platform"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("mps\n")
+    monkeypatch.setitem(
+        namespace["_drop_inherited_platform_marker"].__globals__,
+        "BASE_DIR",
+        str(root),
+    )
+    namespace["_drop_inherited_platform_marker"]()
+    assert not marker.exists()
+
+
+def test_a_marker_writing_build_keeps_its_marker(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLAGOS_ACCELERATOR", "ascend")
+    namespace, _ = _load_setup(monkeypatch)
+    root = tmp_path / "src"
+    marker = root / "torch_fl" / "lib" / "flagos_platform"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("ascend\n")
+    monkeypatch.setitem(
+        namespace["_drop_inherited_platform_marker"].__globals__,
+        "BASE_DIR",
+        str(root),
+    )
+    namespace["_drop_inherited_platform_marker"]()
+    assert marker.read_text() == "ascend\n"
 
 
 def _make_minimal_dtk(root):

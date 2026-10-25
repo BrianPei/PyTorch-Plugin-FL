@@ -33,6 +33,7 @@ import pytest
 import torch
 import torch_fl  # noqa: F401
 from platform_support import detect_platform
+from torch_fl import _env
 
 
 DEVICE = "flagos:0"
@@ -76,6 +77,38 @@ _REFERENCE_NEG_IS_ASCEND_ONLY = detect_platform() != "ascend"
 # disagreement is arithmetic rather than a missing kernel.
 _GCU = detect_platform() == "gcu"
 _MUSA = detect_platform() == "musa"
+
+# PPU on an every-op boxing wheel is the one backend that cannot *reach* the
+# conversion. That wheel registers every ATen operator on PrivateUse1 (the
+# boxing tables name the kernel for each), but since #643 a default conf never
+# routes `boxing`, so `to.dtype` -- and with it every `.to(dtype)` call -- is
+# "routed to 'none' ... but the op is registered on PrivateUse1". The
+# FlagGems-primary wheel everyone installs has no such registration and the
+# conversion runs through cpu_fallback, measured on the PPU runner as 236
+# passed on the portable group. This is the same premise `test_rng_dispatch.py`
+# states for its device generators, read from the build record rather than
+# from the platform name.
+_BOXING_WHEEL = "boxing" in _env.build_kernels()
+
+# Two conversions have no route on a wheel that compiles no boxing kernels.
+#
+# A default wheel (FLAGOS_BUILD_BOXING=0) does not register `to.dtype`, so a
+# `.to(dtype)` between two device dtypes reaches ATen's own dispatcher, which
+# has no CUDA kernel for the conversion in a CPU-only torch build:
+#
+#   RuntimeError: DispatchStub: missing kernel for cuda
+#
+# measured on the NVIDIA lane (run 40109182886, 22 failures in the portable
+# group). The same-wheel clone (same dtype) passes, and
+# `test_cpu_device_roundtrip` covers the host<->device direction. `isinstance`
+# rather than truthiness: `to.dtype` is a tuple of overload names, and an empty
+# one still reads as "registered".
+_BOXING_KERNELS = "boxing" in _env.build_kernels()
+
+
+def _to_dtype_is_registered() -> bool:
+    return hasattr(torch.ops.aten.to, "dtype")
+
 
 # The float32 counterpart of the float64 matmul case below: an fp32 product must
 # be computed in fp32, not in a 10-bit-mantissa format that is only *stored* in
@@ -386,6 +419,18 @@ class TestCopyDtypeSupport:
         result = torch.clone(x)
         assert result.dtype == dtype
 
+    @pytest.mark.skipif(
+        _BOXING_WHEEL,
+        reason="an every-op boxing wheel registers to.dtype on PrivateUse1 "
+        "while the default conf routes `none`, so the conversion raises "
+        "'routed to none' instead of converting",
+    )
+    @pytest.mark.skipif(
+        not _to_dtype_is_registered(),
+        reason="this wheel registers no to.dtype on PrivateUse1 (it compiles "
+        "no boxing kernels), so a device<->device conversion reaches ATen's "
+        "CUDA dispatch stub, which a CPU-only torch has no kernel for",
+    )
     @pytest.mark.parametrize("src_dtype", FLOAT_DTYPES)
     @pytest.mark.parametrize("dst_dtype", FLOAT_DTYPES)
     def test_to_dtype_conversion(self, src_dtype, dst_dtype):
@@ -399,6 +444,18 @@ class TestCopyDtypeSupport:
         assert device.dtype == torch.float64
         torch.testing.assert_close(device.cpu(), cpu, rtol=0, atol=0)
 
+    @pytest.mark.skipif(
+        _BOXING_WHEEL,
+        reason="an every-op boxing wheel registers to.dtype on PrivateUse1 "
+        "while the default conf routes `none`, so the conversion raises "
+        "'routed to none' instead of converting",
+    )
+    @pytest.mark.skipif(
+        not _to_dtype_is_registered(),
+        reason="this wheel registers no to.dtype on PrivateUse1 (it compiles "
+        "no boxing kernels), so a device<->device conversion reaches ATen's "
+        "CUDA dispatch stub, which a CPU-only torch has no kernel for",
+    )
     def test_float32_to_float64_on_device(self):
         result = torch.ones(4, device=DEVICE, dtype=torch.float32).to(torch.float64)
         assert result.dtype == torch.float64
@@ -428,6 +485,18 @@ class TestIndexingDtypeSupport:
         result = torch.index_select(x, 0, indices)
         assert result.dtype == dtype
 
+    @pytest.mark.skipif(
+        _BOXING_WHEEL,
+        reason="an every-op boxing wheel registers masked_select on "
+        "PrivateUse1 while the default conf routes `none`, so the call raises "
+        "'routed to none' instead of selecting",
+    )
+    @pytest.mark.skipif(
+        not hasattr(torch.ops.aten.masked_select, "default"),
+        reason="this wheel registers no masked_select on PrivateUse1 (it "
+        "compiles no boxing kernels), so the call reaches ATen's CUDA dispatch "
+        "stub, which a CPU-only torch has no kernel for",
+    )
     @pytest.mark.parametrize("dtype", FLOAT_DTYPES + INT_DTYPES)
     def test_masked_select_preserves_dtype(self, dtype):
         if dtype.is_floating_point:

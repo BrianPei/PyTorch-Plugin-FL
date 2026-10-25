@@ -185,6 +185,7 @@ jobs:
 
   # One hardware pipeline per configured platform. The reusable workflow reads
   # runner, image, timeout, and test manifest values from that platform config.
+  # Complete each selected platform so one failure does not hide other results.
   platform-pipeline:
     name: Platform pipeline (${{ matrix.platform }})
     needs: [resolve-checkout, discover-platforms]
@@ -216,11 +217,13 @@ jobs:
     steps:
       - name: Verify shared checks and selected platforms passed
         env:
+          GH_TOKEN: ${{ github.token }}
           RESULTS: ${{ toJSON(needs) }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import subprocess
           import sys
 
           jobs = json.loads(os.environ["RESULTS"])
@@ -242,6 +245,39 @@ jobs:
               errors.append(f"platform-pipeline: {platform_result}")
           elif not selected and platform_result not in ("success", "skipped"):
               errors.append(f"platform-pipeline: {platform_result}")
+
+          # Report individual platform conclusions alongside the matrix result.
+          # If the API is unavailable, the gate still uses the results above.
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          try:
+              if not (run_id and repo and os.environ.get("GH_TOKEN")):
+                  raise ValueError("not in a GitHub run with a token")
+              listing = subprocess.run(
+                  [
+                      "gh", "api", "--paginate",
+                      f"repos/{repo}/actions/runs/{run_id}/jobs",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+              # --paginate joins the pages' objects; normalize either shape.
+              pages = json.loads(listing if listing.lstrip().startswith("[") else f"[{listing}]")
+              listed = [job for page in pages for job in page.get("jobs", [])]
+          except (subprocess.CalledProcessError, ValueError, AttributeError) as exc:
+              print(f"::warning::could not list job conclusions: {exc}")
+              listed = []
+
+          for job in listed:
+              name = job.get("name", "")
+              conclusion = job.get("conclusion")
+              if conclusion in ("failure", "timed_out"):
+                  print(f"::error::{name}: {conclusion}")
+              elif conclusion == "cancelled" and name.startswith("Platform pipeline ("):
+                  print(
+                      f"::notice::{name} was cancelled and did not complete validation"
+                  )
 
           for error in errors:
               print(f"::error::{error}")
