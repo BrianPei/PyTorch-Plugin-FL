@@ -216,6 +216,11 @@ _LOG_NAME = {
     "flaggems_python": "flagos_python",
     "flagos_python": "flagos_python",
     "flaggems_cpp": "flagos",
+    # Vendor-spelled conf rows retain the dispatch log's established names.
+    "apple": "mps",
+    "mthreads": "musa",
+    "enflame": "gcu",
+    "nvidia": "boxing",
 }
 
 #: The backend names that mean "this operator took a FlagGems route".
