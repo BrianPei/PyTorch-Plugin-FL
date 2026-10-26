@@ -185,7 +185,17 @@ jobs:
 
   # One hardware pipeline per configured platform. The reusable workflow reads
   # runner, image, timeout, and test manifest values from that platform config.
-  # Complete each selected platform so one failure does not hide other results.
+  #
+  # fail-fast is off on purpose. The PR is red whatever the other lanes do, so
+  # cancelling them on the first failure saves accelerator time only when the
+  # failure is the *only* one -- and that is exactly the case that is not true
+  # here. A cancelling matrix reports the first red and nothing else: fix it,
+  # push, wait a full round, and the next run reports the next. The cost is paid
+  # on every lane that turned out to be fine anyway (a cancelled lane is not a
+  # measurement), which is why the platform set stays as narrow as the diff
+  # allows (paths_watch in .github/configs/<platform>.yml). Letting every
+  # selected lane finish turns N rounds into one and still fails `CI complete`
+  # for any lane that did not pass -- see tests/unit/test_ci_fail_fast.py.
   platform-pipeline:
     name: Platform pipeline (${{ matrix.platform }})
     needs: [resolve-checkout, discover-platforms]
@@ -246,8 +256,12 @@ jobs:
           elif not selected and platform_result not in ("success", "skipped"):
               errors.append(f"platform-pipeline: {platform_result}")
 
-          # Report individual platform conclusions alongside the matrix result.
-          # If the API is unavailable, the gate still uses the results above.
+          # The matrix result says that some lane failed, not which one -- the
+          # matrix collapses every failure into "failure", and a lane can still
+          # be cancelled out from under it (a timeout, or the run being stopped
+          # by hand). Read the run's jobs back and report each one's conclusion.
+          # This is a nicety: wherever the API cannot answer (no token, no run id), the
+          # gate still decides on the results above.
           run_id = os.environ.get("GITHUB_RUN_ID", "")
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           try:
@@ -276,7 +290,8 @@ jobs:
                   print(f"::error::{name}: {conclusion}")
               elif conclusion == "cancelled" and name.startswith("Platform pipeline ("):
                   print(
-                      f"::notice::{name} was cancelled and did not complete validation"
+                      f"::notice::{name} was cancelled before it finished, so it "
+                      "measured nothing; re-run that lane to measure it"
                   )
 
           for error in errors:

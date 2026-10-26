@@ -32,7 +32,12 @@ SCRIPTS = ROOT / ".github/scripts"
 sys.path.insert(0, str(SCRIPTS))
 from flagcicd_plan import build_plan  # noqa: E402
 from merge_pytest_reports import merge_reports  # noqa: E402
-from ci.generate_matrix import _load_platforms, _platforms_from_files  # noqa: E402
+from ci.generate_matrix import (  # noqa: E402
+    _load_platforms,
+    _platforms_from_files,
+    _schedule,
+    boxing_platforms,
+)
 from compose_integration_manifest import compose, ManifestError  # noqa: E402
 
 sys.path.pop(0)
@@ -63,7 +68,11 @@ def request(profile="pr", platforms="all"):
 )
 def test_pr_router_and_external_entry_agree(changed, expected):
     known = _load_platforms(CONFIGS)
-    expected = known if expected is None else expected
+    expected = (
+        _schedule(known, boxing_platforms(CONFIGS, known))
+        if expected is None
+        else expected
+    )
     assert _platforms_from_files(changed, known, CONFIGS) == expected
     assert (
         build_plan(request(), CONTRACT, ROOT, changed)["expected_platforms"] == expected
@@ -75,7 +84,10 @@ def test_pr_router_and_external_entry_agree(changed, expected):
 )
 def test_nightly_always_selects_every_configured_platform(changed):
     planned = build_plan(request("nightly"), CONTRACT, ROOT, changed)
-    assert planned["expected_platforms"] == _load_platforms(CONFIGS)
+    known = _load_platforms(CONFIGS)
+    assert planned["expected_platforms"] == _schedule(
+        known, boxing_platforms(CONFIGS, known)
+    )
     assert planned["test_level"] == "L2"
     assert planned["profile"] == "nightly"
 
@@ -95,16 +107,21 @@ def test_profile_identity_and_reserved_weekly():
 def test_nightly_keeps_all_existing_groups_and_isolates_cuda_profiling():
     manifest = yaml.safe_load((ROOT / ".github/integration-manifest.yml").read_text())
     known = _load_platforms(CONFIGS)
+    boxing = boxing_platforms(CONFIGS, known)
     for platform in known:
         config = yaml.safe_load((CONFIGS / f"{platform}.yml").read_text())
-        pr = compose(manifest, config, platform, known, "pr")
-        nightly = compose(manifest, config, platform, known, "nightly")
-        assert {g["name"] for g in pr} <= {g["name"] for g in nightly}
-        extras = {g["name"] for g in nightly} - {g["name"] for g in pr}
-        assert bool(extras) == (platform == "nvidia")
-        assert len(extras) == (2 if platform == "nvidia" else 0)
+        for boxing_lane in (False, True) if platform in boxing else (False,):
+            kwargs = {"boxing": boxing, "boxing_lane": boxing_lane}
+            pr = compose(manifest, config, platform, known, profile="pr", **kwargs)
+            nightly = compose(
+                manifest, config, platform, known, profile="nightly", **kwargs
+            )
+            assert {g["name"] for g in pr} <= {g["name"] for g in nightly}
+            extras = {g["name"] for g in nightly} - {g["name"] for g in pr}
+            expected = platform == "nvidia" and not boxing_lane
+            assert len(extras) == (2 if expected else 0)
     with pytest.raises(ManifestError, match="weekly is reserved"):
-        compose(manifest, config, platform, known, "weekly")
+        compose(manifest, config, platform, known, boxing=boxing, profile="weekly")
 
 
 def test_profile_is_threaded_through_both_workflow_entries():
@@ -276,8 +293,9 @@ def test_automatic_workflow_profile_selection_before_hardware(
     )
     assert done.returncode == expected_code, done.stdout + done.stderr
     if expected_code == 0:
-        assert json.loads(output.read_text().split("=", 1)[1]) == _load_platforms(
-            CONFIGS
+        known = _load_platforms(CONFIGS)
+        assert json.loads(output.read_text().split("=", 1)[1]) == _schedule(
+            known, boxing_platforms(CONFIGS, known)
         )
     else:
         assert "weekly is reserved" in done.stdout

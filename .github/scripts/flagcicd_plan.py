@@ -27,7 +27,9 @@ from ci.generate_matrix import (
     _changed_files,
     _load_platforms,
     _platforms_from_dispatch,
+    _platform_of,
     _platforms_from_files,
+    boxing_platforms,
 )
 from compose_integration_manifest import compose
 
@@ -86,9 +88,10 @@ def build_plan(request, contract, source, changed):
         raise ValueError("weekly is reserved; supported profiles are pr and nightly")
     if profile == "nightly" and selection.strip() != "all":
         raise ValueError("nightly requires platforms=all")
-    selected = _platforms_from_dispatch(selection, known)
+    boxing = boxing_platforms(configs, known)
+    selected = _platforms_from_dispatch(selection, known, boxing)
     if profile == "pr" and selection.strip() == "all" and changed is not None:
-        selected = _platforms_from_files(changed, known, configs)
+        selected = _platforms_from_files(changed, known, configs, boxing)
     inferred, risk, matched, diff_status = infer_level(changed, contract)
     level = max(
         (inferred, "L0" if requested == "auto" else requested), key=LEVELS.__getitem__
@@ -99,15 +102,28 @@ def build_plan(request, contract, source, changed):
         raise ValueError(f"test level {level} is not supported")
     # An explicit hardware request must not become an empty, passing matrix.
     if level == "L2" and not selected:
-        selected = known
+        selected = _platforms_from_dispatch("all", known, boxing)
     manifest_path = source / ".github/integration-manifest.yml"
     manifest = yaml.safe_load(manifest_path.read_text())
     fingerprint = hashlib.sha256(manifest_path.read_bytes())
-    for platform in selected or known:
+    # `selected` names lanes, so a boxing platform arrives as both
+    # `<platform>` and `<platform>-boxing`; both read the platform's one config
+    # and compose a build of it, and the config counts once in the fingerprint.
+    for lane in selected or known:
+        platform = _platform_of(lane, boxing)
+        boxing_lane = lane != platform
         path = configs / f"{platform}.yml"
         config = yaml.safe_load(path.read_text())
-        compose(manifest, config, platform, known, profile)
-        fingerprint.update(platform.encode())
+        compose(
+            manifest,
+            config,
+            platform,
+            known,
+            boxing_lane=boxing_lane,
+            boxing=boxing,
+            profile=profile,
+        )
+        fingerprint.update(lane.encode())
         fingerprint.update(path.read_bytes())
     fingerprint.update(json.dumps(contract, sort_keys=True).encode())
     fingerprint.update(profile.encode())
