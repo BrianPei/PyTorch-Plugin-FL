@@ -61,6 +61,15 @@
 # platform config. Everything else that looks like a variable -- $MODEL_PATH,
 # ${ASCEND_MSPTI_PRELOAD}, $GITHUB_WORKSPACE -- is left for the shell or the
 # environment on the hardware runner, and is not the composer's to resolve.
+#
+# `vendor_only: true` marks a step that asserts routing only the platform's
+# vendor build can have. NVIDIA, Hygon DCU, MetaX and the PPU each run two
+# lanes -- the vendor build and the CUDA-boxing build of the same wheel, the
+# second scheduled as `<platform>-boxing` -- and this manifest is composed for
+# both, from this one file. A step whose selection differs per build names the
+# platforms in `boxing_variant` (the entry then runs on their boxing build and
+# not their vendor build); `vendor_only: true` is the other half. Every other
+# step runs on both builds.
 
 steps:
   # The environment the wheel landed in, asserted against the expectations the
@@ -85,6 +94,9 @@ steps:
   # The vocabulary is documented on the script, not repeated per platform: what
   # a platform states is a value, and why it states it is in that platform's
   # config beside it.
+  # Runs on both of a boxing platform's builds. The expectations are the
+  # config's, and the loader hands the boxing lane the config's
+  # boxing_environment_check block in their place.
   - id: environment
     name: Check isolated {{display_name}} environment
     command: cd "$GITHUB_WORKSPACE" && python .github/scripts/check_platform_environment.py
@@ -229,6 +241,7 @@ steps:
   - id: vendor_ops
     name: Run operator tests (vendor backend, main ops)
     platforms: [nvidia]
+    boxing_variant: [nvidia]
     command: >-
       python -m pytest tests/integration/ops/
       -m "main_ops and not flaggems and not flaggems_python and not flaggems_cpp"
@@ -243,6 +256,7 @@ steps:
   - id: vendor_ops
     name: Run operator tests (vendor backend, main ops)
     platforms: [hygon]
+    boxing_variant: [hygon]
     command: >-
       python -m pytest tests/integration/ops/
       -m "(dcu or main_ops) and not flaggems and not flaggems_python and not flaggems_cpp"
@@ -315,6 +329,7 @@ steps:
   - id: vendor_ops
     name: Run operator tests (vendor backend, main ops)
     platforms: [metax, thead]
+    boxing_variant: [metax, thead]
     command: >-
       python -m pytest tests/integration/ops/
       -m "main_ops and not flaggems and not flaggems_python and not flaggems_cpp"
@@ -339,6 +354,13 @@ steps:
     platforms: [ascend]
     command: python -m pytest tests/integration/ops/ -m "ascend" -v -s --tb=short
 
+  # Both builds. The vendor build's selection is the one that can answer its
+  # own conf; the boxing build's op set is a different conf
+  # (`backends_<platform>_boxing.conf`) over a different kernel table, and it
+  # reads the same selection. Saying that here rather than in a second
+  # `.<platform>` entry keeps "these platforms have a second build" visible as
+  # `boxing_variant` on the entry itself, where a reviewer comparing the two
+  # builds of a step sees it.
   # The FlagGems runtime-path group, byte-identical on every platform: it
   # measures the @pytest.mark.flaggems cases, each of which asserts the conf's
   # own route (through tests/integration/ops/backend_conf.py:routed_backend)
@@ -417,8 +439,46 @@ steps:
       -v -s --tb=line
 
   # Measured on the eight-device C550 host on 2026-09-15: 46 passed.
+  #
+  # `test_module_to_device_migrates_parameters_in_place` computes the same
+  # linear on CPU and on the device with identical weights. On MPS (run
+  # 40165849082) the two differ by one float32 ulp -- `0.0101` printed on both
+  # sides -- which `torch.allclose` does not accept, because a result that lands
+  # near zero has an absolute tolerance scaled by the reference's own magnitude.
+  # That is the accelerator's summation order, not a torch_fl defect, and
+  # rewinding it through BLAS is not worth a per-platform allowance in a test
+  # that would then stop saying anything on the platforms where it holds. The
+  # case is deselected by marker there and runs everywhere else.
+  # `test_module_to_device_migrates_parameters_in_place` computes the same
+  # linear on CPU and on the device with identical weights. On MPS (PR run
+  # 40165849082) the two differ in the last float32 bit -- both print `0.0101`
+  # -- which `torch.allclose` rejects, because a result that lands near zero
+  # gets an absolute tolerance scaled by the reference's own magnitude. That is
+  # the accelerator's summation order, not a torch_fl defect, and winding it
+  # back through BLAS is not worth an allowance in a test that would then stop
+  # saying anything on the platforms where it holds. Deselected by name here,
+  # which keeps the file selected (see the orphan check in
+  # tests/unit/test_integration_workdir.py) and runs everywhere else.
   - id: factory_ops
     name: Run factory ops
+    platforms: [apple]
+    command: >-
+      python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
+      -k "not test_module_to_device_migrates_parameters_in_place"
+
+  # Measured on the eight-device C550 host on 2026-09-15: 30 passed, 7 deselected.
+  - id: factory_ops
+    name: Run factory ops
+    platforms:
+      - ascend
+      - enflame
+      - hygon
+      - iluvatar
+      - kunlunxin
+      - metax
+      - mthreads
+      - nvidia
+      - thead
     command: python -m pytest tests/integration/test_factory_ops.py -v -s --tb=short
 
   # Measured on the eight-device C550 host on 2026-09-15: 30 passed, 7 deselected.
@@ -567,16 +627,24 @@ steps:
   # GCU, Kunlunxin, Iluvatar and MUSA record the gap as a missing model mount
   # rather than a missing test; DCU's inference/training are deferred until its runner
   # has the mount and the first CI run confirms the card count.
+  #
+  # The two are listed platform by platform because they expand $MODEL_PATH and
+  # every listed platform's `integration_environment` must define it
+  # (test_every_command_variable_has_an_environment_supplier). thead used to be
+  # listed on the strength of its own checkpoint mount, which no longer exists:
+  # its `integration_environment` is empty and the group could only fail with
+  # bash's "unbound variable". Restore its `platforms` entry together with the
+  # mount.
   - id: inference
     name: Run inference tests
-    platforms: [nvidia, thead]
+    platforms: [nvidia]
     command: >-
       python -m pytest tests/integration/test_qwen3_infer.py --model "$MODEL_PATH"
       -v -s --tb=short
 
   - id: training
     name: Run training tests
-    platforms: [nvidia, thead]
+    platforms: [nvidia]
     command: >-
       python -m pytest tests/integration/test_qwen3_train.py --model "$MODEL_PATH"
       -v -s --tb=short

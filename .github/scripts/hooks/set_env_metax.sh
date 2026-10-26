@@ -127,32 +127,41 @@ export MACA_PATH=/opt/maca
 export MACA_HOME=/opt/maca
 
 # MetaX builds no native mxcc kernels, so FLAGOS_BUILD_VENDOR=OFF is one
-# build-side statement. Boxing is off by default for every accelerator now
-# (cmake/flagos_platforms.json); this lane stages the vendor image's
-# libtorch_cuda.so (below) and asserts the bundled libtorch, so it opts into
-# boxing explicitly. The exports above are build inputs -- setup.py records them
-# in torch_fl/_build_config.py, and the runtime derives its conf from that record
-# (torch_fl._select_backend_config), so there is no mode variable to keep in
-# agreement with the build any more.
+# build-side statement on both lanes. The exports above are build inputs --
+# setup.py records them in torch_fl/_build_config.py, and the runtime derives
+# its conf from that record (torch_fl._select_backend_config), so there is no
+# mode variable to keep in agreement with the build any more.
 #
-# The CUDA lane no longer opts in: it measures the FlagGems-primary default a
-# `pip install` gets. MetaX keeps the vendor path until the ops
-# backends_metax.conf routes to `cuda` have a FlagGems route of their own --
-# flipping it first would leave them on cpu_fallback.
+# MetaX runs both builds of the wheel, and BOXING_LANE says which one this job
+# is:
+#
+#   vendor lane  the default build: FlagGems routes only, no boxing kernels, no
+#                cu-bridge shim. What a `pip install` gets.
+#
+#   boxing lane  FLAGOS_BUILD_BOXING=1: the generated boxing kernels, the
+#                cu-bridge shim that lets them reach MetaX's MXVM, and the day-0
+#                conf. A boxing wheel registers every op its boxed table names
+#                on PrivateUse1, and backends_metax.conf -- the file a default
+#                wheel selects -- leaves the uncovered ones on `none`, which on
+#                that wheel is a raise rather than a cpu_fallback. Measured on
+#                the MetaX lane (run 40093392100 onwards first showed it; run
+#                40107997127 is the collapse): `empty_like: routed to 'none'
+#                ... but the op is registered on PrivateUse1` for every
+#                unary/binary case of the portable group.
+#                backends_metax_boxing.conf is the same routing table with
+#                FlagGems where this build has it (594 ops) and boxing for the
+#                other 1442.
 export FLAGOS_BUILD_VENDOR=OFF
-export FLAGOS_BUILD_BOXING=1
-export FLAGOS_METAX_CUDART_SHIM=1
-export FLAGOS_DISABLE_CUDA_ASSETS=1
-# The day-0 conf the boxing wheel above needs. A boxing wheel registers every
-# op on PrivateUse1 (the generated boxing tables name a kernel for each), and
-# backends_metax.conf -- the file a *default* wheel selects -- leaves the
-# uncovered ones on `none`, which on this wheel is a raise rather than a
-# cpu_fallback. Measured on the MetaX lane (run 40093392100 onwards first
-# showed it; run 40107997127 is the collapse): `empty_like: routed to 'none'
-# ... but the op is registered on PrivateUse1` for every unary/binary case of
-# the portable group. backends_metax_boxing.conf is the same routing table with
-# FlagGems where this build has it (594 ops) and boxing for the other 1442.
-export FLAGOS_BACKEND_CONFIG="${FLAGOS_BACKEND_CONFIG:-$REPO_ROOT/torch_fl/configs/backends_metax_boxing.conf}"
+if [[ "${BOXING_LANE:-}" == "1" ]]; then
+  export FLAGOS_BUILD_BOXING=1
+  export FLAGOS_METAX_CUDART_SHIM=1
+  export FLAGOS_DISABLE_CUDA_ASSETS=1
+  export FLAGOS_BACKEND_CONFIG="${FLAGOS_BACKEND_CONFIG:-$REPO_ROOT/torch_fl/configs/backends_metax_boxing.conf}"
+  if [[ ! -f "$FLAGOS_BACKEND_CONFIG" ]]; then
+    echo "::error::the MetaX boxing lane needs the day-0 conf $FLAGOS_BACKEND_CONFIG"
+    exit 1
+  fi
+fi
 # Which op takes which backend is stated in backends_metax.conf, not here: that
 # file is full-coverage and lists all five keys per op
 # (flaggems_cpp > flaggems > tileops > cuda), selected from the accelerator
@@ -304,6 +313,12 @@ fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf '%s=%s\n' PATH "$PATH" >> "$GITHUB_ENV"
+
+  # The boxing lane assigns these; the vendor lane leaves them unset, and
+  # export_ci_env reads every name under `set -u`. Assign the empty default here
+  # so both lanes persist an explicit value.
+  : "${FLAGOS_BUILD_BOXING:=}"
+  : "${FLAGOS_BACKEND_CONFIG:=}"
   export_ci_env VIRTUAL_ENV PYTHONNOUSERSITE FLAGOS_ACCELERATOR FLAGOS_BACKEND_CONFIG MACA_PATH MACA_HOME FLAGOS_BUILD_VENDOR FLAGOS_BUILD_BOXING FLAGOS_METAX_CUDART_SHIM FLAGOS_DISABLE_CUDA_ASSETS FLAGOS_BUILD_FLAGGEMS_CPP FLAGOS_BUILD_FLAGGEMS FLAGOS_VENDOR_TORCH_LIB TORCH_FL_VENDOR_TORCH_VERSION LD_LIBRARY_PATH LIBRARY_PATH CPATH
   if [[ -n "${FLAGCX_TORCH_BACKEND:-}" ]]; then
     printf 'FLAGCX_TORCH_BACKEND=%s\n' "$FLAGCX_TORCH_BACKEND" >> "$GITHUB_ENV"
@@ -391,6 +406,28 @@ if [[ "$CI_STAGE" == "integration" ]]; then
       exit 1
     fi
     echo "FlagGems cohort: $FLAGGEMS_GAP kernel names resolve"
+
+    # Which build each lane got, from the record setup.py wrote.
+    python - "$([[ "${BOXING_LANE:-}" == "1" ]] && echo boxing || echo vendor)" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+_record = Path("torch_fl/_build_config.py")
+assert _record.is_file(), _record
+_loader = importlib.machinery.SourceFileLoader("_flagos_build_config", str(_record))
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+_config = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_config)
+kernels = tuple(_config.KERNELS)
+assert "flaggems" in kernels, kernels
+if sys.argv[1] == "boxing":
+    assert "boxing" in kernels, kernels
+else:
+    assert "boxing" not in kernels, kernels
+print(f"Kernel sets: {kernels}")
+PY
 
     python - <<'PY'
 import hashlib

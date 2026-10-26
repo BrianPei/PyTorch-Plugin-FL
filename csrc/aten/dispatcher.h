@@ -144,6 +144,17 @@ class Dispatcher {
     }
   }
 
+  // The kernel `device` resolves to, including GetFn's own degradation, or
+  // nullptr. Lets a kernel set claim an empty slot without displacing the set
+  // the conf's key actually names (soft_lowp/dispatch.cc).
+  FnPtr KernelFor(Backend device) const {
+    return GetFn(device);
+  }
+
+  bool HasKernel(Backend device) const {
+    return KernelFor(device) != nullptr;
+  }
+
   template <typename... Args>
   decltype(auto) operator()(Args&&... args) const {
     // Hot path: the op name is fixed (op_name_) and the backend routing is
@@ -170,6 +181,18 @@ class Dispatcher {
     auto fn = GetFn(backend);
     TORCH_CHECK(fn, op_name_, DispatchFailureMessage(backend));
     return fn(std::forward<Args>(args)...);
+  }
+
+  // Route exactly the way operator() would, without the generated wrapper's
+  // dtype prelude in front of it. The software low-precision matrix path needs
+  // this: its wrapper takes every FLAGOS_SOFT_LOWP build's floating-point GEMMs
+  // as well as the FP8/FP4 ones (the generated .inc cannot tell whether this
+  // build compiles the software path), and the software path has to hand the
+  // ordinary ones back to whatever the conf names -- FlagGems on MetaX, boxing
+  // elsewhere -- rather than to one hard-coded slot.
+  template <typename... Args>
+  decltype(auto) DispatchConfigured(Args&&... args) const {
+    return operator()(std::forward<Args>(args)...);
   }
 
   template <typename... Args>

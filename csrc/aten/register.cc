@@ -752,9 +752,42 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // stays unregistered and falls through to cpu_fallback. Boxing remains an
   // explicit opt-in (-DFLAGOS_BUILD_BOXING=ON / FLAGOS_BUILD_BOXING=1).
   #if defined(FLAGOS_BOXING_BUILD)
-  #define FLAGOS_GEN_IMPLS
-  #include "generated/register.inc"
-  #undef FLAGOS_GEN_IMPLS
+  // One list, and it is the conf's: generated/register_boxing_<platform>.inc
+  // names exactly the ops backends_<platform>.conf routes and this wheel has a
+  // kernel for. Nothing else is claimed here, because registration and routing
+  // have to agree in BOTH directions:
+  //
+  //   * Nothing may be claimed for an op the conf routes to `none`: the claim
+  //     puzzles the dispatcher into "routed to 'none' ... but the op is
+  //     registered on PrivateUse1" instead of letting cpu_fallback take it --
+  //     measured on DCU (cloning a flagos tensor failed on `empty_like`).
+  //   * Nothing the conf routes may be left unclaimed either, and generated
+  //     wrappers are not a route: on metax `torch.mm` reached cpu_fallback's
+  //     `addmm_impl_cpu_` instead of the FP8/FP4 wrapper's soft_lowp prelude
+  //     (run 40137411252, the whole low-precision group) because the wrapper
+  //     was defined and never registered. That is what the boxed list is for:
+  //     it holds the matrix ops the default conf routes to `boxing`.
+  //
+  // The full generated list used to be included here as a second claim, and it
+  // cannot be. A generated wrapper calls the *whole-op* dispatcher
+  // (`mm_dispatcher`), so a claim on it is not a claim on one route: on a
+  // platform whose conf leaves mm on `none` it turns every dtype of mm into
+  // "routed to 'none' ... but the op is registered" (DCU, run 40156011560, the
+  // DCU import gate), and on PPU the same claim made mm/bmm/mul.Tensor answer
+  // with their boxed wrapper while the runtime contract required no dispatch
+  // (run 40153064301). Both platforms now leave those ops unclaimed, which is
+  // what their conf asks for.
+  #if defined(FLAGOS_ACCEL_CUDA)
+  #include "generated/register_boxing_nvidia.inc"
+  #elif defined(FLAGOS_ACCEL_METAX)
+  #include "generated/register_boxing_metax.inc"
+  #elif defined(FLAGOS_ACCEL_DCU)
+  #include "generated/register_boxing_hygon.inc"
+  #elif defined(FLAGOS_ACCEL_PPU)
+  #include "generated/register_boxing_thead.inc"
+  #elif defined(FLAGOS_ACCEL_TSINGMICRO)
+  #include "generated/register_boxing_tsingmicro.inc"
+  #endif
   #elif defined(FLAGOS_FLAGGEMS_PYTHON)
   #if defined(FLAGOS_ACCEL_CUDA)
   #include "generated/register_flaggems_nvidia.inc"

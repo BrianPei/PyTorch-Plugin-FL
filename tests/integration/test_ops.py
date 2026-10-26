@@ -25,7 +25,27 @@ import pytest
 import torch
 import torch.nn.functional as F
 import torch_fl
-from torch_fl import _env
+
+
+def _masked_select_is_served() -> bool:
+    """Whether this wheel has a route for `masked_select` on the case's shape.
+
+    The same probe `tests/integration/test_dtype_coverage.py` guards with: the
+    op is asked through `torch.ops.aten.masked_select` on the 4-element shape
+    the case uses. A conf route is not enough to answer it. On the PPU boxing
+    lane (run 40171498946) `backends_thead.conf` routes the op to FlagGems, yet
+    the wheel imported without the FlagGems Python runtime, so the call fell
+    through to ATen's CUDA dispatch stub -- `DispatchStub: missing kernel for
+    cuda` -- while the 1-element shape the probe used to ask about took the
+    other arm and answered. Share the probe, not the guess.
+    """
+    try:
+        tensor = torch.ones(4, device="flagos:0")
+        mask = torch.tensor([False, False, True, True], device="flagos:0")
+        out = torch.ops.aten.masked_select(tensor, mask)
+    except (NotImplementedError, RuntimeError):
+        return False
+    return out.device.type == "flagos" and out.numel() == 2
 
 
 @pytest.fixture(scope="session")
@@ -327,22 +347,17 @@ class TestIndexing:
         x = torch.arange(10, device=device, dtype=torch.float32)
         assert x[2:5].shape == (3,)
 
-    # An every-op boxing wheel registers masked_select on PrivateUse1 while the
-    # default conf routes `none`; the FlagGems-primary wheel leaves it
-    # unregistered and the call runs through cpu_fallback. Same premise as
-    # test_dtype_coverage.py and test_rng_dispatch.py, read from the build
-    # record.
+    # masked_select runs only where this wheel's conf serves it. A build
+    # record that names `boxing` does not say so: on a CUDA-ABI platform the
+    # boxing wheel also carries the vendor slot, and which one an op measures
+    # is the conf's choice per op -- the NVIDIA lane went red on a boxing wheel
+    # (run 40123568695) because of exactly that assumption. Ask the dispatcher
+    # instead; same probe as test_dtype_coverage.py.
     @pytest.mark.skipif(
-        "boxing" in _env.build_kernels(),
-        reason="an every-op boxing wheel registers masked_select on "
-        "PrivateUse1 while the default conf routes `none`, so the call raises "
-        "'routed to none' instead of selecting",
-    )
-    @pytest.mark.skipif(
-        not hasattr(torch.ops.aten.masked_select, "default"),
-        reason="this wheel registers no masked_select on PrivateUse1 (it "
-        "compiles no boxing kernels), so the call reaches ATen's CUDA dispatch "
-        "stub, which a CPU-only torch has no kernel for",
+        not _masked_select_is_served(),
+        reason="no slot in this wheel's conf serves masked_select on "
+        "PrivateUse1, so the call reaches ATen's CUDA dispatch stub, which a "
+        "CPU-only torch has no kernel for",
     )
     def test_masked_select(self, device):
         x = torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)

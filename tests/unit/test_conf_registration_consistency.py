@@ -98,17 +98,35 @@ PLATFORM_REGISTRATION = {
         "backends/iluvatar/generated/iluvatar_flaggems_register.inc",
     ],
     # Boxing platforms (cuda, dcu, metax, ppu) and tsingmicro share the
-    # register.cc ``#else`` arm. With boxing ON it includes generated/register.inc
-    # (every generated op); with boxing OFF -- the FlagGems-primary default -- it
-    # includes the matching generated/register_flaggems_<platform>.inc, which
-    # claims only the ops the conf routes to a FlagGems backend. Both are listed
-    # here because a build compiles one or the other.
-    "nvidia": ["generated/register.inc", "generated/register_flaggems_nvidia.inc"],
-    "hygon": ["generated/register.inc", "generated/register_flaggems_hygon.inc"],
-    "metax": ["generated/register.inc", "generated/register_flaggems_metax.inc"],
-    "thead": ["generated/register.inc", "generated/register_flaggems_thead.inc"],
+    # register.cc ``#else`` arm. With boxing ON it includes
+    # generated/register_boxing_<platform>.inc -- every op the conf routes
+    # somewhere other than ``none`` that this wheel has a kernel for; with
+    # boxing OFF -- the FlagGems-primary default -- it includes the matching
+    # generated/register_flaggems_<platform>.inc, which claims only the ops the
+    # conf routes to a FlagGems backend. Both are listed here because a build
+    # compiles one or the other. A boxing build also includes the full
+    # generated/register.inc after the boxed list, so the claimed set of that
+    # arm is the boxed list plus whatever register.inc adds; the checks below
+    # ask that the boxed list is a subset of it, which is what the claim gating
+    # guarantees.
+    "nvidia": [
+        "generated/register_boxing_nvidia.inc",
+        "generated/register_flaggems_nvidia.inc",
+    ],
+    "hygon": [
+        "generated/register_boxing_hygon.inc",
+        "generated/register_flaggems_hygon.inc",
+    ],
+    "metax": [
+        "generated/register_boxing_metax.inc",
+        "generated/register_flaggems_metax.inc",
+    ],
+    "thead": [
+        "generated/register_boxing_thead.inc",
+        "generated/register_flaggems_thead.inc",
+    ],
     "tsingmicro": [
-        "generated/register.inc",
+        "generated/register_boxing_tsingmicro.inc",
         "generated/register_flaggems_tsingmicro.inc",
     ],
     # MPS is a native vendor backend: register.cc's USE_MPS arm includes the
@@ -142,6 +160,40 @@ def _registered_ops(inc_path: Path) -> set[str]:
     if not inc_path.exists():
         return set()
     return set(re.findall(r'm\.impl\("([^"]+)"', inc_path.read_text()))
+
+
+@pytest.mark.anyplatform
+@pytest.mark.parametrize("platform", sorted(BOXING_PLATFORMS))
+def test_a_boxing_claim_and_the_conf_route_agree_in_both_directions(platform):
+    """The boxed list is the conf's route set, not a superset or a subset.
+
+    register.cc's boxing arm claims exactly ``register_boxing_<platform>.inc``.
+    A claim with no route is "routed to 'none' ... but the op is registered on
+    PrivateUse1", and a route with no claim -- an op the conf routes to
+    ``boxing`` that nothing registered -- is "backend not registered" the first
+    time a model calls it. Both directions are measured failures on DCU: mm
+    after the arm stopped claiming unlisted wrappers (run 40156011560), and
+    `empty_like` the other way round before the boxed list existed.
+    """
+    boxed = _registered_ops(GEN_DIR / f"register_boxing_{platform}.inc")
+    routes = _parse_conf(CONF_DIR / f"backends_{platform}.conf")
+    assert boxed, f"{platform} claims no boxed op"
+    left_at_none = sorted(op for op in boxed if routes.get(op) == "none")
+    assert not left_at_none, (
+        f"{platform} claims ops its conf routes to none: {left_at_none[:10]}"
+    )
+    unlisted = sorted(op for op in boxed if op not in routes)
+    assert not unlisted, (
+        f"{platform} claims ops its conf does not list: {unlisted[:10]}"
+    )
+    routed_to_boxes = sorted(
+        op for op, value in routes.items() if value.split("#")[0].strip() == "boxing"
+    )
+    unclaimed = sorted(set(routed_to_boxes) - boxed)
+    assert not unclaimed, (
+        f"{platform} routes {len(unclaimed)} op(s) to boxing that its boxed list "
+        f"does not claim: {unclaimed[:10]}"
+    )
 
 
 def _platform_registered(platform: str) -> set[str]:
