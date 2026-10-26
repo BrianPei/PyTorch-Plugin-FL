@@ -788,9 +788,90 @@ def test_boxing_variant_routes_only_flaggems_and_boxing(platform):
 def test_boxing_variant_leaves_unmeasured_ops_on_boxing():
     """The whole-coverage platforms have no measured FlagGems route beyond the
     shared ceiling, so their variants keep everything FlagGems does not cover on
-    the boxing kernel rather than claiming coverage they never ran."""
+    the boxing kernel rather than claiming coverage they never ran.
+
+    ``BOXING_VARIANT_FLAGGEMS_OPS`` is the one exception, and it is not a
+    coverage claim: the boxing kernel for those ops is ATen's own
+    ``native_dropout``, whose draw ``torch.manual_seed`` cannot reach on a
+    CPU-torch wheel, so routing them to boxing makes the mask irreproducible.
+    See the table for the measurement.
+    """
     cuda_routes = g.build_boxing_variants(CONF_DIR, g.build_all(CONF_DIR))["nvidia"][1]
-    assert set(cuda_routes.values()) == {"boxing"}
+    assert set(cuda_routes.values()) == {"boxing", "flaggems"}
+    assert {op for op, value in cuda_routes.items() if value == "flaggems"} == set(
+        g.BOXING_VARIANT_FLAGGEMS_OPS
+    )
+
+
+def test_boxing_variants_route_the_seeded_rng_ops_to_flaggems():
+    """Every variant, not just nvidia's: which generator ``manual_seed``
+    reaches is a property of the kernel library the route runs, so a variant
+    that boxes these ops has the same irreproducible draw."""
+    variants = g.build_boxing_variants(CONF_DIR, g.build_all(CONF_DIR))
+    for platform in g.BOXING_VARIANT_PLATFORMS:
+        routes = variants[platform][1]
+        for op in g.BOXING_VARIANT_FLAGGEMS_OPS:
+            assert routes[op] == "flaggems", f"{platform}: {op} is {routes[op]}"
+
+
+def test_boxing_variant_routes_only_ops_flaggems_registers():
+    """A conf row is a claim that a kernel exists behind it, so every
+    ``flaggems`` row of a variant must be an op FlagGems registers here.
+
+    The seeded-RNG override used to name the ``.out`` overloads too, which
+    FlagGems registers on no platform: the row said ``flaggems`` while the call
+    had no kernel to reach, and the shared test that counts the conf's
+    ``flaggems`` rows against the measured number caught it (thead-boxing, run
+    40268688923). The generators' own names carry no ``.out`` spelling.
+    """
+    variants = g.build_boxing_variants(CONF_DIR, g.build_all(CONF_DIR))
+    for platform in g.BOXING_VARIANT_PLATFORMS:
+        routes = variants[platform][1]
+        registered = g.flaggems_python_ops_for(platform) | g.flaggems_cpp_ops(CONF_DIR)
+        # route_boxing() holds these back whatever the coverage set says, so a
+        # variant never claims them either.
+        held = g.flaggems_holds()
+        claimed = {
+            op
+            for op, value in routes.items()
+            if value.startswith("flaggems") and op not in held
+        }
+        assert not claimed - registered, (
+            f"{platform}: routed to flaggems but not registered: "
+            f"{sorted(claimed - registered)}"
+        )
+
+
+def test_boxing_variant_uses_only_the_flaggems_ceiling_every_platform_measured():
+    """A variant may route to FlagGems only what no platform is missing.
+
+    ``FLAGGEMS_PYTHON_OPS`` has ``mul.Tensor`` and ``FLAGGEMS_PYTHON_OPS_FROZEN``
+    does not: the difference is what only CUDA has measured. A variant built
+    straight from the union hands every chip a route nobody ran there, and the
+    day-0 files exist for the platforms whose day-0 model cannot afford that.
+    Pinning both sides keeps the subtraction honest -- a widened ceiling that
+    is not first frozen reaches the variants, and this fails.
+    """
+    assert set(g.FLAGGEMS_PYTHON_OPS) - set(g.FLAGGEMS_PYTHON_OPS_FROZEN) == {
+        "mul.Tensor"
+    }
+    routes = g.build_boxing_variants(CONF_DIR, g.build_all(CONF_DIR))
+    for platform in g.BOXING_VARIANT_PLATFORMS:
+        # Read the "flaggems" matrices: metax's variant carries the mm family on
+        # `flaggems_cpp`, and the union a variant is built from is the whole
+        # Python coverage set, C++ ops included.
+        over = sorted(
+            {
+                op
+                for op, value in routes[platform][1].items()
+                if value == "flaggems" and op in g.FLAGGEMS_PYTHON_OPS
+            }
+            - g.FLAGGEMS_PYTHON_OPS_FROZEN
+        )
+        assert not over, (
+            f"{platform}: {over} is outside the frozen ceiling; a variant may "
+            "route only what every platform has measured"
+        )
 
 
 def test_boxing_variant_does_not_apply_measured_composite_routes():
