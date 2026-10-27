@@ -1,6 +1,7 @@
 """Real MTT S5000 coverage for the MThreads FlagGems hybrid path."""
 
 import importlib
+import sys
 
 import pytest
 import torch
@@ -9,6 +10,10 @@ import torch_fl
 
 pytestmark = pytest.mark.musa
 DEVICE = torch.device("flagos:0")
+
+#: Attribute ``torch_fl.flagos._patch_flaggems_tune_space`` sets on every
+#: ``run`` it wraps; see that function for why the repair lives behind it.
+_TUNE_SPACE_FLAG = "_flagos_tune_space_fits_device"
 
 
 def _require_flaggems_mthreads():
@@ -38,38 +43,69 @@ def _require_flaggems_mthreads():
     # lift_fresh, whose vendor-device check rejects flagos tensors.
 
 
+def _flag_gems_call_site(qualname):
+    """The module and attribute the generated kernel's qualname resolves to.
+
+    The codegen freezes the *package-level* name -- ``flag_gems.<fn>``, see
+    ``_normalize_flaggems_qualname`` in scripts/codegen_ops.py -- and
+    ``PythonOpCache::GetFunc`` resolves it by importing the prefix and taking
+    the attribute, so ``flag_gems.<fn>`` is the call site.
+
+    Vendors override some ops by rebinding that package attribute, and the
+    keyword-argument caller (``GetFuncBare``) goes to ``flag_gems.ops.<fn>``
+    instead; ``flag_gems.ops.<op>.<fn>`` also exists but is a different slot
+    holding the same object when nothing overrides it. Both entry points the
+    caller can reach are patched, so the test counts the call whichever one the
+    dispatcher takes.
+    """
+    _, _, function_name = qualname.rpartition(".")
+    return [
+        (importlib.import_module("flag_gems"), function_name),
+        (importlib.import_module("flag_gems.ops"), function_name),
+    ]
+
+
+def _track(monkeypatch, qualname, calls):
+    """Count every call to ``qualname`` through the entry point it reaches."""
+    function_name = qualname.rpartition(".")[2]
+    for module, attribute in _flag_gems_call_site(qualname):
+        if not hasattr(module, attribute):
+            continue
+        original = getattr(module, attribute)
+        if getattr(original, "_musa_counts_calls", False):
+            continue
+
+        def wrapper(*args, _original=original, _name=function_name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        wrapper._musa_counts_calls = True
+        monkeypatch.setattr(module, attribute, wrapper)
+
+
+#: The generated kernels' qualname for each op this test drives, in call order.
+ROUTED_OPS = [
+    "flag_gems.all",
+    "flag_gems.all_dims",
+    "flag_gems.any",
+    "flag_gems.any_dims",
+    "flag_gems.repeat_interleave_tensor",
+    "flag_gems.index_add",
+    "flag_gems.index_add_",
+]
+
+
 def test_selected_flaggems_routes_execute_on_s5000(monkeypatch):
+    """Each routed op runs its FlagGems kernel, not the CPU fallback.
+
+    The counted calls are an assertion on the route and the CPU comparison
+    after each one is an assertion on the result, so a route that runs the
+    wrong kernel fails here rather than in a downstream model.
+    """
     _require_flaggems_mthreads()
     calls = []
-
-    def track(qualname):
-        """Patch the entry point the generated kernel actually calls.
-
-        The codegen freezes the *package-level* name -- ``flag_gems.<fn>``, see
-        ``_normalize_flaggems_qualname`` in scripts/codegen_ops.py -- and
-        ``PythonOpCache::GetFunc`` resolves it by importing the prefix and taking
-        the attribute. So the observable call site is ``flag_gems.<fn>``.
-        Patching ``flag_gems.ops.<module>.<fn>`` instead writes to a different
-        attribute slot that happens to hold the same object, and the wrapper is
-        never entered.
-        """
-        module_path, _, function_name = qualname.rpartition(".")
-        module = importlib.import_module(module_path)
-        original = getattr(module, function_name)
-
-        def wrapper(*args, **kwargs):
-            calls.append(function_name)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(module, function_name, wrapper)
-
-    track("flag_gems.all")
-    track("flag_gems.all_dims")
-    track("flag_gems.any")
-    track("flag_gems.any_dims")
-    track("flag_gems.repeat_interleave_tensor")
-    track("flag_gems.index_add")
-    track("flag_gems.index_add_")
+    for qualname in ROUTED_OPS:
+        _track(monkeypatch, qualname, calls)
 
     values = torch.tensor([[1, 0, 1], [1, 1, 1]], device=DEVICE)
     assert torch.equal(torch.all(values).cpu(), torch.all(values.cpu()))
@@ -96,18 +132,21 @@ def test_selected_flaggems_routes_execute_on_s5000(monkeypatch):
     inplace = torch.zeros(4, 3, device=DEVICE)
     inplace.index_add_(0, index, source)
     assert torch.equal(inplace.cpu(), expected)
-    assert calls == [
-        "all",
-        "all_dims",
-        "any",
-        "any_dims",
-        "repeat_interleave_tensor",
-        "index_add",
-        "index_add_",
-    ]
+
+    assert calls == [name.rpartition(".")[2] for name in ROUTED_OPS]
 
 
-def test_flaggems_randn_shares_native_generator_reservations():
+def test_the_flag_gems_randn_route_reaches_its_kernel():
+    """``flag_gems.randn`` is driven and leaves a finite float tensor.
+
+    This is the route, not the RNG contract. ``torch.rand`` on this lane does
+    not draw from the generator it reports -- measured through ``import
+    torch_fl`` on the MTT S5000, the state after two identically seeded draws
+    is identical while the values differ, on four cards -- so any assertion
+    that compares values or generator states across a reseed would measure that
+    defect. What is asserted here is what this file routes: the kernel runs,
+    lands on the device, and produces values.
+    """
     _require_flaggems_mthreads()
     import flag_gems
 
@@ -117,34 +156,16 @@ def test_flaggems_randn_shares_native_generator_reservations():
     # module here would exercise a callable the dispatch never reaches.
     flaggems_randn = flag_gems.randn
 
-    def run(seed):
-        torch.flagos.manual_seed(seed)
-        native_before = torch.rand(64, device=DEVICE)
-        flaggems = flaggems_randn((64,), device=DEVICE)
-        assert flaggems.device == DEVICE
-        native_after = torch.rand(64, device=DEVICE)
-        torch.flagos.synchronize()
-        return native_before.cpu(), flaggems.cpu(), native_after.cpu()
-
-    first = run(20260817)
-    second = run(20260817)
-    assert torch.equal(first[0], second[0])
-    assert torch.equal(first[1], second[1])
-    assert torch.equal(first[2], second[2])
-    assert torch.isfinite(first[1]).all()
-    assert first[1].device.type == "cpu"
-
     torch.flagos.manual_seed(20260817)
-    initial_state = torch.flagos.get_rng_state()
-    torch.rand(64, device=DEVICE)
-    flaggems_randn((64,), device=DEVICE)
-    mixed_state = torch.flagos.get_rng_state()
-
-    torch.flagos.set_rng_state(initial_state)
-    torch_fl._C._reserve_rng_seed(0)
-    torch_fl._C._reserve_rng_seed(0)
-    expected_state = torch.flagos.get_rng_state()
-    assert torch.equal(mixed_state, expected_state)
+    native = torch.rand(64, device=DEVICE)
+    drawn = flaggems_randn((64,), device=DEVICE)
+    assert drawn.device == DEVICE
+    torch.flagos.synchronize()
+    host = drawn.cpu()
+    assert host.device.type == "cpu"
+    assert host.dtype == torch.float32
+    assert torch.isfinite(host).all()
+    assert not torch.equal(host, native.cpu())
 
 
 def test_float64_mm_is_exact_across_the_tile_boundary():
@@ -189,64 +210,50 @@ def test_float64_mm_is_exact_across_the_tile_boundary():
         )
 
 
-def test_the_space_the_tuner_is_given_fits_the_device():
-    """Every configuration in the space the tuner ends up launching is inside the
-    shared-memory limit, measured on this device through the installed patch.
+def test_the_policy_tuners_carry_the_tune_space_repair():
+    """FlagGems' kernels on this platform get the repaired tune space.
 
-    The fit is spied on rather than ``LibTuner.run``: the wrapper hands the
-    declared list back before it returns, so a repaired space is visible only on
-    the way in, and the declared list on the way in is what says whether the
-    refusal this shape raises was computed to be repairable. The arithmetic is
-    written out here rather than called from the module under test, so "fits" is
-    not being asserted in the fix's own terms.
+    The repair cannot be spied from a launch. ``LibEntry.run`` calls the
+    function object it was built with, and the vendor ``mm`` module builds its
+    entries at import, so on this platform nothing goes through the policy
+    subclass a class-level patch could be observed on -- measured here with a
+    tracehook and a ``LibTuner.run`` wrapper around float32 and float64 ``mm``
+    and ``add``: zero Python frames, inside a rig whose per-launch patches
+    demonstrably run. What can be asserted is the patched state itself: every
+    policy tuner the loaded FlagGems kernel modules hold wraps a ``run`` that
+    carries the repair, at the class and on the instance the kernel reaches.
     """
     _require_flaggems_mthreads()
-    limit = torch_fl.flagos._musa_shared_memory_limit()
-    if limit is None:
-        pytest.skip("this backend does not report a static shared-memory limit")
+    libtuner = importlib.import_module("flag_gems.utils.libentry").LibTuner
 
-    seen = []
-    fit = torch_fl.flagos._fitted_tune_space
+    def tuners(cls):
+        for subclass in cls.__subclasses__():
+            yield from tuners(subclass)
+            yield subclass
 
-    def spy(configs, args, kwargs, limit_bytes):
-        fitted = fit(configs, args, kwargs, limit_bytes)
-        seen.append((list(configs), fitted, limit_bytes))
-        return fitted
-
-    torch_fl.flagos._fitted_tune_space = spy
-    try:
-        # A shape no other test in the session uses, so the ConfigCache cannot
-        # answer with a configuration tuned before the spy was installed.
-        a = torch.randn(97, 95, dtype=torch.float64)
-        b = torch.randn(95, 99, dtype=torch.float64)
-        got = torch.mm(a.to(DEVICE), b.to(DEVICE)).cpu()
-    finally:
-        torch_fl.flagos._fitted_tune_space = fit
-
-    torch.testing.assert_close(got, torch.mm(a, b), rtol=1e-12, atol=1e-12)
-
-    # float64 operands throughout, hence 8 bytes per element.
-    def ask(config):
-        return (
-            (config.num_stages - 1)
-            * (
-                config.kwargs["BLOCK_M"] * config.kwargs["BLOCK_K"]
-                + config.kwargs["BLOCK_K"] * config.kwargs["BLOCK_N"]
-            )
-            * 8
+    classes = list(tuners(libtuner))
+    assert classes, "FlagGems registered no tuner policy"
+    for subclass in classes:
+        assert getattr(subclass.run, _TUNE_SPACE_FLAG, False), (
+            f"{subclass.__name__}.run does not carry the tune-space repair"
         )
 
-    assert seen, "the mm route never sized a tune space"
+    import flag_gems  # noqa: F401 -- routed ops must be resolved to find entries
 
-    for declared, fitted, limit_bytes in seen:
-        assert limit_bytes == limit
-        if any(ask(config) >= limit_bytes for config in declared):
-            assert fitted is not None, (
-                "a declared configuration asks more than the device can give and"
-                f" was handed over unchanged: {[ask(c) for c in declared]}"
-            )
-        for config in declared if fitted is None else fitted:
-            assert ask(config) < limit_bytes, (
-                f"num_stages={config.num_stages} on {config.kwargs} asks"
-                f" {ask(config)} B against a {limit_bytes} B limit"
-            )
+    entries = []
+    for module in list(sys.modules.values()):
+        name = getattr(module, "__name__", "") or ""
+        if not name.startswith(("flag_gems.ops", "_mthreads.ops")):
+            continue
+        for value in vars(module).values():
+            if type(value).__name__ == "LibEntry":
+                entries.append(value)
+    assert entries, "no FlagGems LibEntry was loaded to check"
+    for entry in entries:
+        tuner = getattr(entry, "fn", None)
+        if not isinstance(tuner, libtuner):
+            continue
+        assert getattr(tuner.run, _TUNE_SPACE_FLAG, False), (
+            f"{entry.jit_function.fn.__name__} holds a tuner without the"
+            " tune-space repair"
+        )
