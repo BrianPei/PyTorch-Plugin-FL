@@ -17,7 +17,10 @@
 This is a performance contract, separate from cross-platform cast correctness.
 The profiler owns the device through an exclusive CUDA-only L3 manifest group.
 Other CUDA-ABI vendors need their own measurements before joining this contract.
+CPU-only PyTorch intentionally casts through the host and has no CUDA profiler.
 """
+
+from pathlib import Path
 
 import pytest
 import torch
@@ -52,6 +55,9 @@ def _memcpy_count(fn):
 )
 def test_bf16_fp32_cast_is_transfer_free(src_dtype, dst_dtype):
     """End to end: the bf16<->fp32 cast must not move data between host and device."""
+    torch_lib = Path(torch.__file__).resolve().parent / "lib"
+    if not (torch_lib / "libtorch_cuda.so").is_file():
+        pytest.skip("torch has no libtorch_cuda.so; the cast arm is the host one")
     src = torch.randn(512, 1024, dtype=src_dtype, device=_device())
     n = _memcpy_count(lambda: src.to(dst_dtype))
     assert n == 0, (

@@ -752,9 +752,8 @@ def test_default_cuda_cast_keeps_native_and_unsigned_fallback_paths():
     kernel. This asserts on the source so it runs on any host -- the runtime
     check runs separately on CUDA hardware.
 
-    The regression this guards: the default (non-boxing) arm called
-    `strided_copy_cast_via_cpu` unconditionally, so the shipped wheel for the
-    CUDA-ABI platforms paid a host round trip for every dtype cast.
+    The arm must retain both routes: box only when the linked torch supplies
+    CUDA kernels, and use the host path when that torch is CPU-only.
     """
     src = (ATEN_DIR / "copy_ops.cc").read_text()
     # The non-boxing arm is the second `#else` of the FLAGOS_BOXING_BUILD pair
@@ -770,13 +769,15 @@ def test_default_cuda_cast_keeps_native_and_unsigned_fallback_paths():
         "the non-boxing CUDA cast arm is gone; decouple this test from the source "
         "if the arm was deliberately removed"
     )
-    arm = src[start : start + 1400]
+    arm = src[start : start + 2400]
+    assert "FLAGOS_TORCH_LINKS_LIBTORCH_CUDA" in arm, (
+        "the cast arm must not box into an empty CUDA stub on CPU-only torch"
+    )
     assert "DeviceBoxingGuard" in arm, (
-        "the non-boxing CUDA cast arm no longer boxes to CUDA, so a "
-        "dtype cast is a host round trip again"
+        "a build linking libtorch_cuda must retain its native cast path"
     )
     assert "strided_copy_cast_via_cpu(self_contig, result);" in arm, (
-        "the unsigned-dtype escape hatch is missing from the arm"
+        "the CPU-only torch and unsigned-dtype fallback is missing from the arm"
     )
 
 
@@ -785,13 +786,16 @@ _CAPS = runpy.run_path(str(REPO_ROOT / "tests/integration/flaggems/flaggems_caps
 
 @pytest.mark.parametrize("platform", sorted(_CAPS["EXPECTED_FLAGGEMS_ROUTES"]))
 def test_recorded_flaggems_routes_match_committed_conf(platform):
-    """Catch stale routing snapshots in L1, before an accelerator is allocated."""
+    """Match the suite's callable coverage, excluding its seeded-draw routes."""
     base, separator, _ = platform.partition("_boxing")
     table = json.loads((REPO_ROOT / "cmake/flagos_platforms.json").read_text())
     vendor = table["accelerators"].get(base, {}).get("vendor", base)
     conf_name = vendor + ("_boxing" if separator else "")
     routes = _parse_conf(CONF_DIR / f"backends_{conf_name}.conf")
-    count = sum(value == "flaggems" for value in routes.values())
+    count = sum(
+        value == "flaggems" and op not in _CAPS["SEEDED_DRAWOPS"]
+        for op, value in routes.items()
+    )
     assert count == _CAPS["EXPECTED_FLAGGEMS_ROUTES"][platform], (
         f"{platform}: FlagGems route snapshot is stale ({count} in committed conf)"
     )

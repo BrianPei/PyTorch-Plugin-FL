@@ -4,8 +4,8 @@
 
 #include "ops.h"
 
-#include "../../generated/ops.h"
 #include "../../dispatcher.h"
+#include "../../generated/ops.h"
 
 namespace at::native::flagos::soft_lowp {
 namespace {
@@ -126,32 +126,30 @@ at::Tensor OrdinaryBmmKernel(const at::Tensor& self, const at::Tensor& mat2) {
   return OrdinaryBmm(self, mat2);
 }
 
-// Register mm/bmm/addmm/.out on Backend::kFlagGemsCpp unless another kernel set
-// already owns the slot.
+// Claim the flaggems_cpp slot of mm/bmm/addmm/.out, unless another kernel set
+// already owns it.
 //
-// Why the software path registers mm/bmm at all: an ordinary-dtype pair does
-// not stay in MmImpl/BmmImpl, it is handed back to the conf ("the route that
-// names this op's accelerated kernel"). A FLAGOS_SOFT_LOWP build without FlagGems
-// C++ kernels (DCU, a CPU-torch build) has no other kernel for mm/bmm, so the
-// hand-back needs one: with these wrappers the slot resolves and they compute
-// the pair the conventional way; without them it is "backend not registered".
-// (An FP8/FP4 call never comes through the dispatcher -- the generated wrapper's
-// IsLowPrecision prelude calls soft_lowp::Mm/Bmm directly.)
+// This is the route an ordinary-dtype pair takes back out of Mm/Bmm:
+// RunMatrix hands it to whatever the conf names (soft_lowp/ops.cc), and on a
+// build without FlagGems C++ kernels -- DCU, a CPU-torch build -- flaggems_cpp
+// is what the confs name for a platform with no vendor kernel either. Without
+// these wrappers that route is "backend not registered"; with them it computes
+// the pair the conventional way.
 //
-// A FLAGOS_SOFT_LOWP build that also compiles flaggems_cpp_kernels.cc (MetaX's
-// MACA liboperators) does own the slot: those registrations write the same
-// dispatcher/backend field and must survive. When this file overwrote them,
-// `flaggems_cpp` -- which backends_metax.conf names for bmm -- resolved to these
-// wrappers, so the hand-back returned to the kernel that made it and recursed
-// until the stack ran out: SIGSEGV in torch.bmm on float32 (4, 64, 128) x
-// (4, 128, 32), CI run 40242938356. Both sides use REGISTER_IMPL_TO_DISPATCHER,
-// so which one registered first was link order, and link order is not a way to
-// decide routing.
+// A build that also compiles flaggems_cpp_kernels.cc (MetaX's MACA
+// liboperators) owns the slot for real, and those registrations must survive:
+// both sides write the same dispatcher/backend field, so which one wins is link
+// order, and overwriting them resolved `flaggems_cpp` -- which
+// backends_metax.conf names for bmm -- to these wrappers. The hand-back then
+// returned to the kernel that made it and recursed until the stack ran out:
+// SIGSEGV in torch.bmm on float32, CI run 40242938356.
 //
-// The fallback dispatchers below are registered in both cases: they are how
-// ops.cc recognises that the slot is this file (equal kernel) rather than a
-// FlagGems C++ kernel, and on a file-owned slot they remain a route to the
-// same computation that cannot come back here.
+// The wrappers are registered as fallback dispatchers either way, so the
+// fallback path routes through the dispatcher like any other kernel rather
+// than calling OrdinaryMm/OrdinaryBmm around it. No other kernel registers on
+// them, so a fallback dispatcher is exactly where GetFn lands for flaggems_cpp
+// whatever its slot holds -- which is why nothing may route a call it makes
+// back through these dispatchers by their own key.
 void RegisterGemmKernels() {
   MmFn mm_fallback_fn = OrdinaryMmKernel;
   BmmFn bmm_fallback_fn = OrdinaryBmmKernel;

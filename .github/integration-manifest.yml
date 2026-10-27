@@ -394,13 +394,13 @@ steps:
     command: python -m pytest tests/integration/ops/test_flaggems_mul_route.py -v -s --tb=short
 
   # A measured CUDA performance contract, separate from portable cast correctness.
+  # CPU-only torch intentionally takes the host path; report that case as skipped.
   # Profiling runs serially in nightly and never in the PR vendor sweep.
   - id: cuda_dtype_cast_performance
     name: CUDA dtype cast transfer regression
     platforms: [nvidia]
     vendor_only: true
     profiles: [nightly]
-    min_passed: 1
     command: python -m pytest tests/integration/ops/test_dtype_cast_performance.py -v -s --tb=short
 
   # The MUSA hybrid group is a file, not a marker: the MUSA vendor sweep above

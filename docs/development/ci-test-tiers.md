@@ -15,8 +15,11 @@ platform matrix. Shared lint, source and codegen checks still run for PRs.
 Only the hardware matrix is narrowed by the diff router.
 
 `profiles: [nightly]` on a manifest group keeps optional CUDA profiling out of
-ordinary PR checks. Groups without that field run in both profiles. The two
-CUDA transfer regressions require at least one passing test. Runtime platform
+ordinary PR checks. Groups without that field run in both profiles. The CUDA
+FlagGems route regression requires at least one passing test. The dtype-cast
+performance regression reports a skip when PyTorch has no `libtorch_cuda.so`:
+that build intentionally casts through the host, and portable cast correctness
+is still checked in the functional groups. Runtime platform
 guards retain build-table ids such as `cuda`; CI config names use vendor names
 such as `nvidia`. Source-only contracts run in the agnostic/codegen checks.
 
