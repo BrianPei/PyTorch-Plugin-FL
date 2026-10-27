@@ -31,10 +31,11 @@ class DispatchSuppressionGuard {
 };
 
 at::Tensor Mm(const at::Tensor& self, const at::Tensor& mat2);
-// The ordinary-dtype mm/bmm computation. MmImpl/BmmImpl use it when the conf's
-// FlagGems C++ route is this file itself (see CppGemmRouteIsThisKernel) instead
-// of handing the pair back to that route, and dispatch.cc also binds it to the
-// mm_fallback/bmm_fallback dispatchers.
+
+// The ordinary-dtype mm/bmm computation, with the conf out of the loop:
+// dispatch.cc binds it to the mm_fallback/bmm_fallback dispatchers so that the
+// hand-back of an ordinary pair through the dispatcher lands here and not back
+// in the software wrapper that made it.
 at::Tensor OrdinaryMm(const at::Tensor& self, const at::Tensor& mat2);
 at::Tensor OrdinaryBmm(const at::Tensor& self, const at::Tensor& mat2);
 
@@ -45,6 +46,10 @@ at::Tensor OrdinaryBmm(const at::Tensor& self, const at::Tensor& mat2);
 // PrivateUse1 dispatch path, instead of recursing.
 DECLARE_DISPATCHER(MmFn, mm_fallback_dispatcher)
 DECLARE_DISPATCHER(BmmFn, bmm_fallback_dispatcher)
+
+// The soft-lowp entry points the generated wrappers call. Each takes the
+// caller's own schema (mm/mm.dtype/mm.out/mm.dtype_out, bmm/..., addmm/...)
+// and routes the decoded pair by that schema's conf key.
 at::Tensor MmDtype(
     const at::Tensor& self,
     const at::Tensor& mat2,

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <flagos_env.h>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -185,18 +186,98 @@ class Dispatcher {
 
   // Route exactly the way operator() would, without the generated wrapper's
   // dtype prelude in front of it. The software low-precision matrix path needs
-  // this: its wrapper takes every FLAGOS_SOFT_LOWP build's floating-point GEMMs
-  // as well as the FP8/FP4 ones (the generated .inc cannot tell whether this
-  // build compiles the software path), and the software path has to hand the
-  // ordinary ones back to whatever the conf names -- FlagGems on MetaX, boxing
-  // elsewhere -- rather than to one hard-coded slot.
+  // this for the variants that cannot re-enter: its wrapper takes every
+  // FLAGOS_SOFT_LOWP build's floating-point GEMMs as well as the FP8/FP4 ones
+  // (the generated .inc cannot tell whether this build compiles the software
+  // path), and the software path has to send the ordinary ones to whatever the
+  // conf names -- the vendor slot, boxing -- rather than to one hard-coded
+  // slot.
+  //
+  // A decoded FP8 pair asks first (RouteAcceptsDecoded) and then goes through
+  // DecodedKernel: the two names can disagree, and the route a decoded pair
+  // takes is not reachable with an FP8 call's operands.
   template <typename... Args>
   decltype(auto) DispatchConfigured(Args&&... args) const {
     return operator()(std::forward<Args>(args)...);
   }
 
+  // Can a decoded ordinary-dtype pair be handed to this route?
+  //
+  // Three noes. The dispatcher's own routing key must have a kernel at all --
+  // `none` means the platform has no accelerated impl for the op, and the
+  // generated registration was expected to stay away from it. The route must
+  // leave FlagGems out of it: that route runs Python, which resolves the
+  // operands' dtype against torch's own dtype objects on the way in, and the
+  // spine of this path is that the pair is decoded to an ordinary one instead
+  // of being spelled in a low-precision dtype. The other arms do not; and the
+  // kernel the route lands on must exist. Where it does not -- an empty
+  // flaggems_cpp slot on a build without liboperators -- GetFn degrades to
+  // whatever else is registered, and that is not the route the conf named.
+  // And the name must be the conf's: an op the table does not hold answers
+  // kFlagGems, which the second test already refuses.
+  bool RouteAcceptsDecoded(const char* route_key) const {
+    if (!HasBackendForOp(route_key)) {
+      return false;
+    }
+    const auto configured = GetBackendForOp(route_key);
+    if (configured == Backend::kNone || configured == Backend::kFlagGems) {
+      return false;
+    }
+    return GetFn(configured) != nullptr;
+  }
+
+  // The kernel a decoded ordinary-dtype pair goes to: the conf's route for
+  // `route_key`, or the slot FLAGOS_SOFT_LOWP_STAY_ON_ROUTE names, or a
+  // runtime_error saying why neither. The only place that raises
+  // runtime_error rather than TORCH_CHECK; the software path's callers expect
+  // that.
+  //
+  // DispatchAs resolves the key but its kernel comes out of GetFn, which
+  // degrades an empty slot to whatever else is registered: a conf naming
+  // flaggems for a key whose C++ slot is empty -- Medusa GPU, no liboperators --
+  // lands on this file's own fallback wrappers, which answers with the pair
+  // again. That degradation is the wrong answer here, so the fall-through is
+  // opt-in by naming a slot: FLAGOS_SOFT_LOWP_STAY_ON_ROUTE=boxing (or
+  // flaggems_cpp) hands a pair the named route cannot run to that slot instead
+  // of raising. A slot is not a conf key -- no conf names `boxing` -- so the
+  // flag is read here, where the difference is known.
+  //
+  // The kernel is returned rather than called here: the call belongs at the
+  // call site, made on the kernel's own type (soft_lowp/ops.cc).
+  FnPtr DecodedKernel(const std::string& route_key) const {
+    auto backend = GetBackendForOp(route_key);
+    if (!HasBackendForOp(route_key) || backend == Backend::kNone ||
+        backend == Backend::kFlagGems) {
+      throw std::runtime_error(DecodedRefusalFor(route_key, backend));
+    }
+    auto fn = GetFn(backend);
+    if (!fn) {
+      const std::string stay =
+          flagos_env::EnvValue("FLAGOS_SOFT_LOWP_STAY_ON_ROUTE");
+      if (stay.empty()) {
+        throw std::runtime_error(DecodedRefusalFor(route_key, backend));
+      }
+      backend = ParseBackendName(stay);
+      fn = DecodedFallbackFn(backend);
+      if (!fn) throw std::runtime_error(DecodedRefusalFor(route_key, backend));
+    }
+    LogDispatch(route_key, backend);
+    return fn;
+  }
+
+
+  // The key this dispatcher routes by -- op_name_ -- for a caller that has to
+  // name it before it can call: DecodedKernel takes the key, and the kernel it
+  // returns then takes it as its first argument.
+  const char* OpKey() const { return op_name_; }
+
+  // Route exactly as operator() would, but by `op`'s conf key instead of this
+  // dispatcher's own ("mm.out", "addmm.dtype", ...): one dispatcher answers
+  // several schemas, and the conf routes each by its own name. `op` is only the
+  // key; the kernel is called with `args` alone.
   template <typename... Args>
-  decltype(auto) DispatchAs(const std::string& op_name, Args&&... args) const {
+  decltype(auto) DispatchAs(const char* op, Args&&... args) const {
+    const std::string op_name(op);
     auto backend = GetBackendForOp(op_name);
     auto fn = ResolveFn(op_name.c_str(), backend, args...);
     LogDispatch(op_name, backend);
@@ -236,31 +317,6 @@ class Dispatcher {
     }
   }
 
-  // The build's own native kernel slot, with the backend name that selects it.
-  // Exactly one is ever populated: a build registers its native kernels into
-  // its own slot (kAscend on Ascend, kMthreads on MUSA, ...) and, on the
-  // CUDA-compatible platforms, boxing kernels into kBoxing -- which this does
-  // not offer. The boxing kernels are not this build's own (a CPU-torch shim or
-  // another vendor's runtime can host them), and the conf's own degradation
-  // path already reads a FlagGems route with no FlagGems kernel as
-  // `cuda_fn_ ? cuda_fn_ : flaggems_fn_`. Offering the slot when both exist
-  // made FlagGems a second runtime route: NVIDIA's conf leaves index_select off
-  // FlagGems for a broken kernel, and a FlagGems route could still land on the
-  // boxing kernel. Ordered
-  // most-specific-first so a build that somehow populated two still prefers
-  // the vendor's own kernels.
-  std::pair<FnPtr, Backend> VendorSlot() const {
-    if (ascend_fn_)      return {ascend_fn_,      Backend::kAscend};
-    if (mthreads_fn_)    return {mthreads_fn_,    Backend::kMthreads};
-    if (metax_fn_)       return {metax_fn_,       Backend::kMetax};
-    if (enflame_fn_)     return {enflame_fn_,     Backend::kEnflame};
-    if (kunlunxin_fn_)   return {kunlunxin_fn_,   Backend::kKunlunxin};
-    if (iluvatar_fn_)    return {iluvatar_fn_,    Backend::kIluvatar};
-    if (tsingmicro_fn_)  return {tsingmicro_fn_,  Backend::kTsingMicro};
-    if (apple_fn_)       return {apple_fn_,       Backend::kApple};
-    return {nullptr, Backend::kNone};
-  }
-
   // GetFn, plus the dtype escape from the FlagGems route.
   //
   // A conf routes per op, so it cannot say "FlagGems, except for float64" --
@@ -277,6 +333,30 @@ class Dispatcher {
   // Only the Python route is guarded: the C++ one (kFlagGemsCpp) exists only
   // on the vendors that measured it, so its conf entries are already a per-op
   // decision made from a measurement.
+  // The build's own native kernel slot, with the backend name that selects it.
+  // Exactly one is ever populated: a build registers its native kernels into
+  // its own slot (kAscend on Ascend, kMthreads on MUSA, ...) and, on the
+  // CUDA-compatible platforms, boxing kernels into kBoxing -- which this does
+  // not offer. The boxing kernels are not this build's own (a CPU-torch shim or
+  // another vendor's runtime can host them), and the conf's own degradation
+  // path already reads a FlagGems route with no FlagGems kernel as
+  // `cuda_fn_ ? cuda_fn_ : flaggems_fn_`. Offering the slot when both exist
+  // made FlagGems a second runtime route: NVIDIA's conf leaves index_select off
+  // FlagGems for a broken kernel, and a FlagGems route could still land on the
+  // boxing kernel. Ordered most-specific-first so a build that somehow
+  // populated two still prefers the vendor's own kernels.
+  std::pair<FnPtr, Backend> VendorSlot() const {
+    if (ascend_fn_)      return {ascend_fn_,      Backend::kAscend};
+    if (mthreads_fn_)    return {mthreads_fn_,    Backend::kMthreads};
+    if (metax_fn_)       return {metax_fn_,       Backend::kMetax};
+    if (enflame_fn_)     return {enflame_fn_,     Backend::kEnflame};
+    if (kunlunxin_fn_)   return {kunlunxin_fn_,   Backend::kKunlunxin};
+    if (iluvatar_fn_)    return {iluvatar_fn_,    Backend::kIluvatar};
+    if (tsingmicro_fn_)  return {tsingmicro_fn_,  Backend::kTsingMicro};
+    if (apple_fn_)       return {apple_fn_,       Backend::kApple};
+    return {nullptr, Backend::kNone};
+  }
+
   template <typename... Args>
   FnPtr ResolveFn(const char* op_name, Backend& backend,
                   const Args&... args) const {
@@ -387,6 +467,66 @@ class Dispatcher {
     return message;
   }
 
+  // That slot's kernel, or nullptr when the build has none.
+  FnPtr DecodedFallbackFn(Backend backend) const {
+    switch (backend) {
+      case Backend::kFlagGemsCpp: return flaggems_cpp_fn_;
+      case Backend::kBoxing:      return cuda_fn_;
+      default:                    return nullptr;
+    }
+  }
+
+  // The slots a decoded pair may be asked for by
+  // FLAGOS_SOFT_LOWP_STAY_ON_ROUTE, spelled the way a conf spells them. Only
+  // the two that can answer a decoded pair: a C++ FlagGems kernel (real, and
+  // does not run Python), or boxing.
+  static Backend ParseBackendName(const std::string& raw) {
+    const char* boxing[] = {"boxing", "cuda", "nvidia"};
+    for (const char* name : boxing) {
+      if (flagos_env::EnvIs(raw.c_str(), name)) return Backend::kBoxing;
+    }
+    const char* gemm[] = {"flaggems_cpp", "flagos"};
+    for (const char* name : gemm) {
+      if (flagos_env::EnvIs(raw.c_str(), name)) return Backend::kFlagGemsCpp;
+    }
+    TORCH_CHECK(false,
+                "FLAGOS_SOFT_LOWP_STAY_ON_ROUTE=\"",
+                raw,
+                "\" names no live slot for a decoded pair; use boxing or "
+                "flaggems_cpp");
+  }
+
+  // Why a decoded pair will not be handed to a route: the conf's answer for
+  // the key, and what was registered for it. An unstated key is its own
+  // answer: GetBackendForOp answers FlagGems for a key the table does not hold,
+  // and says in its own comment that this means the running conf and the
+  // compiled registration disagree, so the message says that rather than claim
+  // the conf asked for FlagGems.
+  static std::string DecodedRefusalFor(const std::string& op_name,
+                                       Backend backend) {
+    if (!HasBackendForOp(op_name)) {
+      return op_name +
+             ": the backend config does not name this op, so the loaded conf "
+             "and the compiled registration disagree and there is no route to "
+             "hand a decoded pair to";
+    }
+    if (backend == Backend::kNone) {
+      return op_name +
+             ": the backend config routes this op to 'none', so there is no "
+             "accelerated implementation for a decoded pair to go to";
+    }
+    if (backend == Backend::kFlagGems) {
+      return op_name +
+             ": the backend config routes this op to FlagGems, which resolves "
+             "the operand dtype against torch's own dtype objects before any "
+             "kernel runs and cannot take a pair decoded in place of an "
+             "FP8/FP4 one";
+    }
+    return op_name +
+           ": the backend config routes this op to a backend no kernel was "
+           "registered for";
+  }
+
   // Which kernel set provides a backend, named the way setup.py::KERNEL_SET_NAME
   // and the KERNELS tuple in torch_fl/_build_config.py name it. nullptr for a
   // backend that no kernel set owns.
@@ -421,6 +561,12 @@ class Dispatcher {
   static void LogDispatch(const std::string& op_name, Backend backend) {
     static const bool enabled = LogEnabled("dispatch");
     if (!enabled) return;
+    fprintf(stderr, "[flagos dispatch] %s -> %s\n", op_name.c_str(),
+            NameOf(backend));
+  }
+
+  // The name the dispatch log prints for `backend`.
+  static const char* NameOf(Backend backend) {
     const char* name;
     switch (backend) {
       case Backend::kBoxing:        name = "boxing"; break;
@@ -438,7 +584,7 @@ class Dispatcher {
       case Backend::kNone:          name = "none"; break;
       default:                      name = "unknown"; break;
     }
-    fprintf(stderr, "[flagos dispatch] %s -> %s\n", op_name.c_str(), name);
+    return name;
   }
 
   const char* op_name_ = nullptr;
