@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import gc
 import importlib
 import os
 import sys
@@ -162,6 +163,9 @@ def is_initialized():
 def _lazy_init():
     global _initialized
     if is_initialized():
+        # A lane whose first device touch happened after `import flag_gems`
+        # reaches the tune-space repair only here; see the function.
+        _musa_tune_space_ready()
         return
     _C._init()
     _initialized = True
@@ -218,6 +222,15 @@ def _lazy_init():
     # still materialising weights. See the function for the measurement.
     _prewarm_triton_key()
 
+    # The tuner repair goes in after the import above, not before it: the
+    # mthreads `mm` tune space asks more shared memory on float64 than this
+    # device has, so a matmul it refuses has to be repaired rather than
+    # retried, and the entries that need it are built by the FlagGems modules
+    # this import loads (and, for `mm`, by the lazy import of
+    # `flag_gems.ops.mm` on the first call -- see `_musa_tune_space_ready`
+    # for that half). See the function for the measurement.
+    _patch_flaggems_tune_space()
+
     # FlagGems locates itself in the device namespace by the vendor's own device
     # string ("cuda" for nvidia), while torch_fl registers this accelerator as
     # "flagos". Its ops compare the two and hand the call back to ATen when they
@@ -249,11 +262,6 @@ def _lazy_init():
     # op goes through, so they have to be in place before the first one runs.
     # See the function for the measurement.
     _patch_flaggems_pointwise_dispatch()
-
-    # And again for the tuner: the mthreads `mm` tune space asks more shared
-    # memory on float64 than this device has, so a matmul it refuses has to be
-    # repaired rather than retried. See the function for the measurement.
-    _patch_flaggems_tune_space()
 
     # Advanced indexing on this device takes the C++ dispatcher and needs no
     # Python patch here. `index.Tensor` is registered on PrivateUse1 from
@@ -2371,6 +2379,20 @@ _TUNE_SPACE_PATCHED = "_flagos_tune_space_fits_device"
 _MUSA_SMEM_LIMIT = None
 
 
+def _entry_tuner(entry):
+    """The policy tuner a ``LibEntry`` holds, if it holds one.
+
+    ``@libentry()`` and ``@libtuner(...)`` are applied bottom-up, so for every
+    tuned kernel the ``LibEntry`` is built *over* the tuner
+    (``LibEntry(Tuner(jit_fn))``) and is what the kernel's ``[grid](...)``
+    reaches -- ``LibEntry.run`` calls ``self.fn`` once compiled. A tuner patched
+    as a class therefore still has to be asked for through its entry; on the
+    MTT S5000 the float64 ``mm`` space is sized from ``LibEntry.fn.run``.
+    """
+    fn = getattr(entry, "fn", None)
+    return fn if hasattr(fn, "run") and hasattr(fn, "configs") else None
+
+
 def _musa_shared_memory_limit():
     """Static shared memory one MUSA kernel may ask for, in bytes, or None.
 
@@ -2546,8 +2568,151 @@ def _launch_in_fitted_space(original_run, tuner, configs, args, kwargs):
         tuner.__dict__.pop("kernel_hash", None)
 
 
+def _tune_space_run(original_run):
+    """``LibTuner.run`` with the refused-space repair in front of ``original_run``.
+
+    The repair is applied to the class rather than to an instance, so a tuner
+    built later (a kernel module imported after this patch ran) is covered too.
+    See ``_patch_flaggems_tune_space`` for why the repair only runs after a
+    refusal.
+    """
+
+    def run(self, *args, **kwargs):
+        try:
+            return original_run(self, *args, **kwargs)
+        except Exception as refused:
+            limit = _musa_shared_memory_limit()
+            configs = (
+                None
+                if limit is None
+                else _fitted_tune_space(
+                    getattr(self, "configs", None) or [], args, kwargs, limit
+                )
+            )
+            if configs is None:
+                raise
+            try:
+                return _launch_in_fitted_space(
+                    original_run, self, configs, args, kwargs
+                )
+            except Exception:
+                raise refused from None
+
+    run.__wrapped__ = original_run
+    run.__name__ = getattr(original_run, "__name__", "run")
+    return run
+
+
+def _rewrap_flaggems_tuners(class_patch=None, only_in=None):
+    """Point every FlagGems tuner policy subclass at ``LibTuner.run``, then patch it.
+
+    FlagGems does not call ``LibTuner.run`` at a launch. ``@LibTuner.register``
+    builds a policy subclass on every ``libtuner`` decoration, and that subclass
+    gets its *own* ``run``: a copy of whatever ``LibTuner.run`` was when the
+    subclass was created. ``flag_gems.ops`` is imported after ``flagos.init()``
+    in a fresh process (dispatch imports it lazily), and much of it later still,
+    so a patch written to ``LibTuner.run`` alone is never reached -- measured on
+    the MTT S5000: with only ``LibTuner.run`` patched, float64 ``mm`` at
+    33x33x33 kept ending on the refused 64x64x64 space.
+
+    A subclass created before the patch therefore has to be re-pointed at
+    ``LibTuner.run`` itself, which is what ``class_patch`` does; instances
+    already built keep the subclass's previous ``run`` as an instance attribute
+    and are re-wrapped in place. Subclasses created after the patch inherit the
+    patched class method and need nothing.
+    """
+    libentry = importlib.import_module("flag_gems.utils.libentry")
+    libtuner = getattr(libentry, "LibTuner", None)
+    if libtuner is None:
+        return False
+    if only_in is not None and getattr(libtuner, _TUNING_MODULE_PATCHED, None) is (
+        only_in
+    ):
+        # This FlagGems instance has already been repaired against this module;
+        # see ``_musa_tune_space_ready``.
+        return getattr(libtuner.run, _TUNE_SPACE_PATCHED, False)
+    patched_run = libtuner.run
+    for subclass in _subclasses_in_order(libtuner):
+        if subclass.__dict__.get("run") is not None and (
+            class_patch is not None
+            and not getattr(subclass.__dict__["run"], _TUNE_SPACE_PATCHED, False)
+        ):
+            class_patch(subclass)
+        subclass_run = subclass.run
+        if getattr(subclass_run, _TUNE_SPACE_PATCHED, False):
+            continue
+        for referrer in gc.get_referrers(subclass_run):
+            # ``new`` wraps the function and runs the subclass body before
+            # ``__init__``, so a tuner is seen here mid-construction. Its
+            # ``run`` is then still the unpatched one to repair.
+            if not isinstance(referrer, libtuner) or type(referrer) is not subclass:
+                continue
+            declared = referrer.__dict__.get("run", subclass_run)
+            if getattr(declared, _TUNE_SPACE_PATCHED, False):
+                continue
+            repaired = _tune_space_run(declared)
+            setattr(repaired, _TUNE_SPACE_PATCHED, True)
+            referrer.run = repaired
+    _rewrap_libentry_tuners(libtuner)
+    if only_in is not None:
+        setattr(libtuner, _TUNING_MODULE_PATCHED, only_in)
+    return getattr(patched_run, _TUNE_SPACE_PATCHED, False)
+
+
+def _rewrap_libentry_tuners(libtuner):
+    """Patch the tuner a kernel reaches through its ``LibEntry``, in place.
+
+    A kernel decorated ``@libentry()`` over ``@libtuner(...)`` is an instance
+    whose ``fn`` is the tuner, and it calls ``self.fn`` rather than the class:
+    ``LibEntry.run`` invokes the function object it was built with, and
+    ``LibEntry`` instances are created while their module is imported, before
+    ``flagos.init()`` can patch anything. So a tuner held this way keeps
+    whatever ``run`` it had at construction however its class is later rebound,
+    and the repairs above -- which write to classes and to instances of a
+    policy subclass -- do not reach it. Measured through the kernel's own
+    ``LibEntry`` on the MTT S5000, that is where the float64 ``mm`` space is
+    sized from.
+    """
+    for referrer in gc.get_referrers(libtuner):
+        if type(referrer) is not libtuner:
+            continue
+        if getattr(referrer, "run", None) is not libtuner.run:
+            continue
+        tuner = _entry_tuner(referrer.fn)
+        if tuner is None:
+            continue
+        declared = tuner.__dict__.get("run", type(tuner).run)
+        if getattr(declared, _TUNE_SPACE_PATCHED, False):
+            continue
+        repaired = _tune_space_run(declared)
+        setattr(repaired, _TUNE_SPACE_PATCHED, True)
+        tuner.run = repaired
+
+
+def _subclasses_in_order(cls):
+    for subclass in cls.__subclasses__():
+        yield subclass
+        yield from _subclasses_in_order(subclass)
+
+
+#: Set on ``LibTuner`` once its ``__init_subclass__`` installs the repair on
+#: every policy subclass it sees.
+_SUBCLASS_PATCHED = "_flagos_tune_space_subclass_patch"
+
+#: The ``flag_gems.runtime`` module instance a ``LibTuner`` was repaired for.
+#: device_finder.py reloads the whole ``flag_gems`` package when
+#: ``GEMS_VENDOR`` names another vendor, and a reload builds a new
+#: ``LibTuner``; see ``_musa_tune_space_ready``.
+_TUNING_MODULE_PATCHED = "_flagos_tune_space_runtime"
+
+
 def _patch_flaggems_tune_space():
     """Repair a FlagGems tune space the MUSA device has refused, and only then.
+
+    Also installed on every later device bring-up (``_musa_tune_space_ready``),
+    because the kernels that matter are imported after the first one -- dispatch
+    imports ``flag_gems.ops`` lazily, and ``mm`` with it -- and their entries are
+    built then.
 
     ``mm`` on float64 fails on this hardware for every shape whose M, K and N all
     exceed 32 -- ``OutOfResources: out of resource: shared memory, Required:
@@ -2602,36 +2767,69 @@ def _patch_flaggems_tune_space():
 
         libentry = importlib.import_module("flag_gems.utils.libentry")
         libtuner = libentry.LibTuner
-        if getattr(libtuner, _TUNE_SPACE_PATCHED, False):
-            return
-        original_run = libtuner.run
 
-        def run(self, *args, **kwargs):
-            try:
-                return original_run(self, *args, **kwargs)
-            except Exception as refused:
-                limit = _musa_shared_memory_limit()
-                configs = (
-                    None
-                    if limit is None
-                    else _fitted_tune_space(
-                        getattr(self, "configs", None) or [], args, kwargs, limit
-                    )
-                )
-                if configs is None:
-                    raise
-                try:
-                    return _launch_in_fitted_space(
-                        original_run, self, configs, args, kwargs
-                    )
-                except Exception:
-                    raise refused from None
+        # Every policy subclass gets its own copy of ``LibTuner.run`` at class
+        # creation (``LibTuner.register`` builds one per ``libtuner`` call), and
+        # that copy is what a launch calls. Wrapping the base class alone reaches
+        # none of them; see ``_rewrap_flaggems_tuners``. Also, ``tune_speed`` and
+        # ``LibEntry.run`` were already read from the module by kernels that were
+        # imported before this ran, so the *class* has to be the binding, not the
+        # module attribute this function could no longer change.
+        if not getattr(libtuner, _SUBCLASS_PATCHED, False):
 
-        run.__wrapped__ = original_run
-        libtuner.run = run
-        setattr(libtuner, _TUNE_SPACE_PATCHED, True)
+            def __init_subclass__(cls, **kwargs):
+                super(libtuner, cls).__init_subclass__(**kwargs)
+                _tune_space_subclass_patch(cls)
+
+            libtuner.__init_subclass__ = __init_subclass__
+            setattr(libtuner, _SUBCLASS_PATCHED, True)
+
+        if not getattr(libtuner.run, _TUNE_SPACE_PATCHED, False):
+            repaired = _tune_space_run(libtuner.run)
+            setattr(repaired, _TUNE_SPACE_PATCHED, True)
+            libtuner.run = repaired
+
+        _rewrap_flaggems_tuners(
+            class_patch=_tune_space_subclass_patch,
+            only_in=importlib.import_module("flag_gems.runtime"),
+        )
     except Exception:
         pass
+
+
+def _musa_tune_space_ready() -> None:
+    """Re-install the tune-space repair on every device bring-up after the first.
+
+    ``flagos.init`` patches once, and by then only the FlagGems modules already
+    imported are covered: ``flag_gems.ops`` is imported on the first routed op
+    (and ``mm`` with it, building the entries that hold the tuner afterwards), so
+    those entries are built after the one repair the import performs. Calling
+    this from ``_lazy_init`` -- every bring-up repeats it -- re-applies the repair
+    to whatever exists by then, and only once per ``flag_gems.runtime`` instance
+    a reload may replace. It is a no-op until ``flag_gems.runtime`` and
+    ``flag_gems.ops`` are both imported. See ``_patch_flaggems_tune_space``.
+    """
+    from .. import _build_accelerator
+
+    if _build_accelerator() != "mthreads":
+        return
+    if "flag_gems.utils.libentry" not in sys.modules:
+        return
+    if "flag_gems.ops" not in sys.modules:
+        return
+    _patch_flaggems_tune_space()
+
+
+def _tune_space_subclass_patch(subclass):
+    """``class_patch`` for ``_rewrap_flaggems_tuners``: repair one stale subclass.
+
+    A policy subclass made before the ``__init_subclass__`` arm was installed
+    still holds its own copy of the unpatched ``run``; rebinding the method is
+    what every instance -- and any code reaching ``Sub.run`` -- will then see.
+    """
+    repaired = _tune_space_run(subclass.__dict__["run"])
+    setattr(repaired, _TUNE_SPACE_PATCHED, True)
+    subclass.run = repaired
 
 
 def _stand_down_foreign_triton_drivers():
