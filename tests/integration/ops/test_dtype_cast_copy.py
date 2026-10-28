@@ -14,7 +14,7 @@
 
 """Cross-platform dtype-cast correctness and result-device checks.
 
-Source contracts run in L1; CUDA transfer profiling runs in its own L3 group.
+Source contracts run in L1; CUDA transfer profiling runs in its own nightly group.
 """
 
 import pytest

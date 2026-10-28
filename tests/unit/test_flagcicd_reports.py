@@ -309,6 +309,59 @@ def test_pre_pytest_failure_does_not_invent_an_empty_success_report(tmp_path):
         _merge(reports, "failure")
 
 
+def test_swallowed_pytest_failure_cannot_pass_functional_evidence(tmp_path):
+    workdir = tmp_path / "wheel-only"
+    workdir.mkdir()
+    (workdir / "test_mixed.py").write_text(
+        "def test_pass(): pass\ndef test_failure(): assert False\n"
+    )
+    process, reports = _integration(
+        tmp_path,
+        [
+            {
+                "name": "wrapper",
+                "command": f"{PYTHON} -m pytest test_mixed.py -q || true",
+            }
+        ],
+    )
+    assert process.returncode == 0
+    report = _merge(reports)
+    assert report["summary"]["failed"] == report["summary"]["passed"] == 1
+    assert report["flagcicd"]["complete"] is False
+    assert report["exitcode"] != 0
+    assert report["flagcicd"]["execution_errors"]
+
+
+@pytest.mark.parametrize(
+    "summary", [{"passed": 1, "failed": 1}, {"passed": 1, "error": 1}, {"passed": True}]
+)
+def test_shared_evidence_validator_rejects_contradictory_counts(summary):
+    with pytest.raises(ValueError):
+        MERGER.validate_pytest_result(
+            {"exitcode": 0, "summary": summary}, require_success=True
+        )
+
+
+def test_optional_skipped_session_does_not_invalidate_passing_evidence(tmp_path):
+    workdir = tmp_path / "wheel-only"
+    workdir.mkdir()
+    (workdir / "test_pass.py").write_text("def test_ok(): pass\n")
+    (workdir / "test_skip.py").write_text(
+        "import pytest\n@pytest.mark.skip(reason='not applicable')\ndef test_skip(): pass\n"
+    )
+    process, reports = _integration(
+        tmp_path,
+        [
+            {"name": "required", "command": f"{PYTHON} -m pytest test_pass.py -q"},
+            {"name": "conditional", "command": f"{PYTHON} -m pytest test_skip.py -q"},
+        ],
+    )
+    assert process.returncode == 0
+    report = _merge(reports)
+    assert report["flagcicd"]["complete"] is True
+    assert report["exitcode"] == 0
+
+
 def test_workflow_transfers_optional_token_and_uploads_the_generated_report():
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/integration-tests.yml").read_text()
@@ -463,59 +516,6 @@ def test_missing_token_skips_upload_without_logging_credentials(
     assert result.returncode == 0, result.stderr
     assert output.read_text() == expected
     assert not token or token not in result.stdout + result.stderr
-
-
-def test_swallowed_pytest_failure_cannot_pass_functional_evidence(tmp_path):
-    workdir = tmp_path / "wheel-only"
-    workdir.mkdir()
-    (workdir / "test_mixed.py").write_text(
-        "def test_pass(): pass\ndef test_failure(): assert False\n"
-    )
-    process, reports = _integration(
-        tmp_path,
-        [
-            {
-                "name": "wrapper",
-                "command": f"{PYTHON} -m pytest test_mixed.py -q || true",
-            }
-        ],
-    )
-    assert process.returncode == 0
-    report = _merge(reports)
-    assert report["summary"]["failed"] == report["summary"]["passed"] == 1
-    assert report["flagcicd"]["complete"] is False
-    assert report["exitcode"] != 0
-    assert report["flagcicd"]["execution_errors"]
-
-
-@pytest.mark.parametrize(
-    "summary", [{"passed": 1, "failed": 1}, {"passed": 1, "error": 1}, {"passed": True}]
-)
-def test_shared_evidence_validator_rejects_contradictory_counts(summary):
-    with pytest.raises(ValueError):
-        MERGER.validate_pytest_result(
-            {"exitcode": 0, "summary": summary}, require_success=True
-        )
-
-
-def test_optional_skipped_session_does_not_invalidate_passing_evidence(tmp_path):
-    workdir = tmp_path / "wheel-only"
-    workdir.mkdir()
-    (workdir / "test_pass.py").write_text("def test_ok(): pass\n")
-    (workdir / "test_skip.py").write_text(
-        "import pytest\n@pytest.mark.skip(reason='not applicable')\ndef test_skip(): pass\n"
-    )
-    process, reports = _integration(
-        tmp_path,
-        [
-            {"name": "required", "command": f"{PYTHON} -m pytest test_pass.py -q"},
-            {"name": "conditional", "command": f"{PYTHON} -m pytest test_skip.py -q"},
-        ],
-    )
-    assert process.returncode == 0
-    report = _merge(reports)
-    assert report["flagcicd"]["complete"] is True
-    assert report["exitcode"] == 0
 
 
 @pytest.mark.parametrize(

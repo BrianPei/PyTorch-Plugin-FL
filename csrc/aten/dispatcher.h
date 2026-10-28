@@ -547,6 +547,7 @@ class Dispatcher {
       case Backend::kKunlunxin:   return "vendor";
       case Backend::kIluvatar:    return "vendor";
       case Backend::kApple:       return "vendor";
+      case Backend::kDrobotics:   return "vendor";
       case Backend::kNone:
       case Backend::kUncached:    return nullptr;
     }

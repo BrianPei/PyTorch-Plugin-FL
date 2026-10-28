@@ -1,6 +1,6 @@
 # CI selection and maintainer controls
 
-CI schedules nine configured hardware platforms through the shared integration
+CI schedules configured hardware platforms through the shared integration
 workflow. Runner labels, images and device access come from each platform config;
 test groups come from the shared integration manifest.
 
