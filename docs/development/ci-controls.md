@@ -115,6 +115,17 @@ require their workflow definitions to exist on the default branch.
 
 ## Validation and rollout
 
+### Functional evidence validation
+
+The pytest merger, the ordinary hardware evidence check and the external platform
+reporter share `validate_pytest_result`. Successful outer commands cannot hide a
+nonzero pytest session exit code or failed/error counts. Conditional skipped
+sessions remain valid when other functional tests passed; existing explicit
+teardown-crash handling remains separate from assertion failures.
+
+The ordinary gate reads paginated job diagnostics as a JSON array, with a bounded
+API query. Optional diagnostic failures do not replace the required job verdicts.
+
 Platform-agnostic CI runs regression tests for selection, routing, required gate
 results, checkout resolution, comment dispatch, network classification and retry
 budgets. GitHub operations in these tests are simulated; tests do not post real

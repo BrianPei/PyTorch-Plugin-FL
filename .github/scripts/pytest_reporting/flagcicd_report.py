@@ -35,6 +35,7 @@ def pytest_configure(config):
     if not directory:
         return
     group = os.environ.pop("FLAGCICD_TEST_GROUP", "")
+    group_id = os.environ.pop("FLAGCICD_GROUP_ID", group)
     plugins = os.environ.get("PYTEST_PLUGINS", "").split(",")
     plugins = [name for name in plugins if name.strip() not in ("", "flagcicd_report")]
     if plugins:
@@ -48,7 +49,13 @@ def pytest_configure(config):
     directory.mkdir(parents=True, exist_ok=True)
     report = directory / f"pytest-{uuid.uuid4().hex}.json"
     report.with_suffix(".pending").write_text(
-        json.dumps({"group": group, "args": config.invocation_params.args}),
+        json.dumps(
+            {
+                "group": group,
+                "group_id": group_id,
+                "args": config.invocation_params.args,
+            }
+        ),
         encoding="utf-8",
     )
     config._flagcicd_marker = report.with_suffix(".pending")

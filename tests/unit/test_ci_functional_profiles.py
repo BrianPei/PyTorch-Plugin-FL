@@ -136,7 +136,9 @@ def test_profile_is_threaded_through_both_workflow_entries():
     ]
     assert calls and all("test_profile" in job["with"] for job in calls)
     integration = yaml.safe_load((workflows / "integration-tests.yml").read_text())
-    assert integration["jobs"]["configuration"]["with"]["test_profile"]
+    assert integration["jobs"]["configuration"]["with"]["test_profile"] == (
+        "${{ inputs.test_profile || 'pr' }}"
+    )
     loader = (workflows / "load-platform-config.yml").read_text()
     assert '--profile "${{ inputs.test_profile }}"' in loader
 
@@ -221,13 +223,33 @@ def test_incomplete_or_empty_evidence_cannot_pass(tmp_path, missing):
     assert actual["exitcode"] != 0
 
 
-@pytest.mark.parametrize("escape", [False, True])
-def test_cancellation_kills_the_active_command_group(tmp_path, escape):
+@pytest.mark.parametrize(
+    "escape,launcher_exits",
+    [
+        (False, False),
+        (True, False),
+        pytest.param(
+            True,
+            True,
+            marks=pytest.mark.skipif(
+                sys.platform != "linux", reason="Linux orphan adoption contract"
+            ),
+        ),
+    ],
+)
+def test_cancellation_kills_the_active_command_group(tmp_path, escape, launcher_exits):
     pid_file = tmp_path / "active.pid"
     code = f"import os,time; from pathlib import Path; Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(30)"
     if escape:
         child = "import time; time.sleep(30)"
         code = f"import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); Path({str(pid_file)!r}).write_text(str(p.pid)); time.sleep(30)"
+    launcher_pid = tmp_path / "launcher.pid"
+    if launcher_exits:
+        code = (
+            "import os; "
+            + code.rsplit("time.sleep(30)", 1)[0]
+            + f"Path({str(launcher_pid)!r}).write_text(str(os.getpid())); sys.exit(0)"
+        )
     group = {"name": "active", "command": shlex.join([sys.executable, "-c", code])}
     env = {
         **os.environ,
@@ -246,6 +268,15 @@ def test_cancellation_kills_the_active_command_group(tmp_path, escape):
         while not pid_file.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert pid_file.exists()
+        if launcher_exits:
+            while time.monotonic() < deadline:
+                if launcher_pid.exists():
+                    status = Path("/proc") / launcher_pid.read_text() / "status"
+                    if not status.exists() or "State:\tZ" in status.read_text():
+                        break
+                time.sleep(0.02)
+            else:
+                pytest.fail("the launcher did not exit before cancellation")
         process.send_signal(signal.SIGTERM)
         process.communicate(timeout=10)
         assert process.returncode != 0
@@ -300,3 +331,85 @@ def test_automatic_workflow_profile_selection_before_hardware(
     else:
         assert "weekly is reserved" in done.stdout
         assert not output.exists()
+
+
+def test_source_contracts_have_one_shared_cpu_owner():
+    workflows = ROOT / ".github/workflows"
+    commands = [
+        step.get("run", "")
+        for filename in ("agnostic-checks.yml", "codegen-checks.yml")
+        for job in yaml.safe_load((workflows / filename).read_text())["jobs"].values()
+        for step in job.get("steps", [])
+    ]
+    for target in (
+        "scripts/codegen/gen_vendor_confs.py --check",
+        "tests/unit/test_gen_vendor_confs.py",
+        "tests/unit/test_dtype_cast_arm_contract.py",
+    ):
+        assert sum(command.count(target) for command in commands) == 1, target
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux orphan adoption contract")
+@pytest.mark.parametrize("holds_output", [False, True])
+@pytest.mark.parametrize("launcher_exit", [0, 7])
+def test_timeout_reaps_workers_after_their_launcher_exits(
+    tmp_path, holds_output, launcher_exit
+):
+    spec = importlib.util.spec_from_file_location(
+        "orphan_runner", SCRIPTS / "run_integration_tests.py"
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    pid_file = tmp_path / "worker.pid"
+    worker = (
+        "import os,time; from pathlib import Path; "
+        f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(10)"
+    )
+    output = "None" if holds_output else "subprocess.DEVNULL"
+    launcher = (
+        "import os,subprocess,sys; "
+        f"subprocess.Popen([sys.executable,'-c',{worker!r}], "
+        f"start_new_session=True,stdout={output},stderr={output}); "
+        f"os._exit({launcher_exit})"
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    started = time.monotonic()
+    try:
+        code, _ = runner.run_command(
+            shlex.join([sys.executable, "-c", launcher]),
+            {**os.environ, "FLAGCICD_CASE_TIMEOUT": "1"},
+            str(tmp_path),
+        )
+        assert code == 124
+        assert time.monotonic() - started < 4
+        status = Path("/proc") / pid_file.read_text() / "status"
+        assert not status.exists()
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait()
+        if pid_file.exists():
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("exitcode", [0, 7])
+def test_command_drains_partial_utf8_output_and_preserves_exit_status(
+    tmp_path, exitcode
+):
+    spec = importlib.util.spec_from_file_location(
+        "stream_runner", SCRIPTS / "run_integration_tests.py"
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    code = (
+        "import os,time; os.write(1,bytes([228])); time.sleep(0.05); "
+        f"os.write(1,bytes([184,173])); raise SystemExit({exitcode})"
+    )
+    result, output = runner.run_command(
+        shlex.join([sys.executable, "-c", code]), os.environ.copy(), str(tmp_path)
+    )
+    assert result == exitcode
+    assert output == "中"

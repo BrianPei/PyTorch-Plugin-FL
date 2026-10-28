@@ -21,6 +21,112 @@ from collections import Counter
 from pathlib import Path
 
 
+def validate_pytest_result(report, *, require_success=False, require_passed=False):
+    """Check structured pytest evidence, independently of the outer shell status."""
+    counts = report.get("summary")
+    if not isinstance(counts, dict) or not all(
+        type(value) is int and value >= 0 for value in counts.values()
+    ):
+        raise ValueError("invalid pytest summary")
+    if type(report.get("exitcode")) is not int:
+        raise ValueError("invalid pytest exitcode")
+    if require_success:
+        if report["exitcode"] != 0:
+            raise ValueError("pytest report contradicts the successful job result")
+        if any(counts.get(key, 0) for key in ("failed", "error", "errors")):
+            raise ValueError(
+                "pytest failure counts contradict the successful job result"
+            )
+    if require_passed and not counts.get("passed", 0):
+        raise ValueError("no functional tests passed")
+
+
+def validate_pytest_session(session):
+    """Validate one collected session independently of console formatting."""
+    selected, observed = (
+        session.get("selected_nodeids"),
+        session.get("observed_nodeids"),
+    )
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or not isinstance(observed, list)
+        or len(selected) != len(observed)
+        or set(selected) != set(observed)
+    ):
+        raise ValueError("selected test inventory does not match executed tests")
+    validate_pytest_result(session, require_success=True)
+    counts = session["summary"]
+    if counts.get("total", len(observed)) != len(observed) or sum(
+        counts.get(k, 0) for k in ("passed", "skipped", "xfailed", "xpassed")
+    ) != len(observed):
+        raise ValueError("pytest outcome counts differ from the executed inventory")
+
+
+def validate_group_minimum(group, counts):
+    if counts.get("passed", 0) < group.get("min_passed", 0):
+        raise ValueError("required group has no passing tests: " + group["name"])
+
+
+def read_pytest_session(marker, session):
+    """Read one native JSON report and retain its selected/observed inventory."""
+    session.update(json.loads(marker.read_text(encoding="utf-8")))
+    report = json.loads(marker.with_suffix(".json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(report, dict)
+        or not isinstance(report.get("summary"), dict)
+        or not isinstance(report.get("tests"), list)
+        or not isinstance(report.get("exitcode"), int)
+        or not isinstance(report.get("duration"), (int, float))
+        or not all(
+            isinstance(value, int) and value >= 0
+            for value in report["summary"].values()
+        )
+    ):
+        raise ValueError("missing pytest summary or test details")
+    selected = session.get("selected_nodeids")
+    # A group name is the marker that this session came from a FlagCICD
+    # invocation.  The integration runner writes groups.json, but the
+    # acceptance and wheel-only entry points can run pytest directly and
+    # still use the reporting plugin.  Requiring groups.json here would
+    # make their missing collection inventory silently pass.
+    if session.get("group") and selected is None:
+        session["collection_error"] = "selected test inventory is missing"
+    if selected is not None:
+        observed = [test["nodeid"] for test in report["tests"]]
+        session["observed_nodeids"] = observed
+        if (
+            not selected
+            or len(observed) != len(selected)
+            or set(selected) != set(observed)
+        ):
+            session["collection_error"] = (
+                "selected test inventory does not match executed tests"
+            )
+    session["exitcode"] = report["exitcode"]
+    session["summary"] = report["summary"]
+    return report
+
+
+def check_group_minimum(directory, group):
+    """Use native sessions for the executor's early minimum check."""
+    if not directory:
+        raise ValueError("min_passed requires pytest JSON reporting")
+    counts, matched = Counter(), False
+    group_id = group.get("group_id", group.get("manifest_id", group["name"]))
+    for marker in sorted(Path(directory).glob("*.pending")):
+        session = {"report": marker.with_suffix(".json").name}
+        read_pytest_session(marker, session)
+        if session.get("group_id", session.get("group")) != group_id:
+            continue
+        validate_pytest_session(session)
+        counts.update(session["summary"])
+        matched = True
+    if not matched:
+        raise ValueError("missing pytest session: " + group["name"])
+    validate_group_minimum(group, counts)
+
+
 def merge_reports(
     directory, platform, outcome, source_repository, source_ref, require_execution=False
 ):
@@ -30,47 +136,14 @@ def merge_reports(
     for marker in sorted(Path(directory).glob("*.pending")):
         session = {"report": marker.with_suffix(".json").name}
         try:
-            session.update(json.loads(marker.read_text(encoding="utf-8")))
-            report = json.loads(marker.with_suffix(".json").read_text(encoding="utf-8"))
-            if (
-                not isinstance(report, dict)
-                or not isinstance(report.get("summary"), dict)
-                or not isinstance(report.get("tests"), list)
-                or not isinstance(report.get("exitcode"), int)
-                or not isinstance(report.get("duration"), (int, float))
-                or not all(
-                    isinstance(value, int) and value >= 0
-                    for value in report["summary"].values()
-                )
-            ):
-                raise ValueError("missing pytest summary or test details")
-        except (OSError, ValueError, TypeError) as error:
+            report = read_pytest_session(marker, session)
+        except (OSError, ValueError, TypeError, KeyError) as error:
             session["error"] = str(error)
             incomplete.append(session["report"])
             sessions.append(session)
             continue
-        selected = session.get("selected_nodeids")
-        # A group name is the marker that this session came from a FlagCICD
-        # invocation.  The integration runner writes groups.json, but the
-        # acceptance and wheel-only entry points can run pytest directly and
-        # still use the reporting plugin.  Requiring groups.json here would
-        # make their missing collection inventory silently pass.
-        if session.get("group") and selected is None:
+        if session.get("collection_error"):
             incomplete.append(session["report"])
-            session["collection_error"] = "selected test inventory is missing"
-        if selected is not None:
-            observed = [test["nodeid"] for test in report["tests"]]
-            if (
-                not selected
-                or len(observed) != len(selected)
-                or set(selected) != set(observed)
-            ):
-                incomplete.append(session["report"])
-                session["collection_error"] = (
-                    "selected test inventory does not match executed tests"
-                )
-        session["exitcode"] = report["exitcode"]
-        session["summary"] = report["summary"]
         sessions.append(session)
         summary.update(report["summary"])
         duration += report["duration"]
@@ -105,16 +178,27 @@ def merge_reports(
             ]
             if group.get("requires_pytest") and not matched:
                 execution_errors.append("missing pytest session: " + group["name"])
-            if group.get("min_passed", 0) > sum(
-                session.get("summary", {}).get("passed", 0) for session in matched
-            ):
-                execution_errors.append(
-                    "required group has no passing tests: " + group["name"]
-                )
+            counts = Counter()
+            for session in matched:
+                counts.update(session.get("summary", {}))
+            try:
+                validate_group_minimum(group, counts)
+            except ValueError as error:
+                execution_errors.append(str(error))
     elif require_execution:
         execution_errors.append("integration execution record is missing")
     if not summary.get("passed", 0):
         execution_errors.append("no tests passed")
+    for session in sessions:
+        if "summary" not in session:
+            continue
+        try:
+            if outcome == "success" and session.get("group"):
+                validate_pytest_session(session)
+            else:
+                validate_pytest_result(session, require_success=outcome == "success")
+        except (ValueError, TypeError, KeyError) as error:
+            execution_errors.append(f"{session['report']}: {error}")
     complete = not incomplete and not execution_errors
     # The integration runner owns the verdict, including its existing explicit
     # teardown-crash policy and failures in non-pytest environment checks.

@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import argparse
+import codecs
+import ctypes
 import json
 import os
 import re
+import resource
 import signal
-import threading
+import selectors
 import time
 import shlex
 import subprocess
@@ -56,6 +59,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--allow-empty", action="store_true")
+    parser.add_argument("--supervise-command", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -261,72 +265,142 @@ def descendant_pids(root_pid):
     return found
 
 
+def supervise_command(command):
+    """Keep escaped Linux workers parented to a dedicated command supervisor.
+
+    A launcher can exit before its setsid worker. A Linux child subreaper keeps
+    that worker in this command's tree instead of losing it to PID 1. The
+    supervisor is a separate process: unrelated children of the caller must
+    never be adopted or killed. Other POSIX hosts retain process-group cleanup.
+    """
+    if sys.platform != "linux":
+        os.execvp("bash", ["bash", "-c", f"set -euo pipefail\n{command}"])
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    process = subprocess.Popen(["bash", "-c", f"set -euo pipefail\n{command}"])
+    code = process.wait()
+    while True:
+        try:
+            os.waitpid(-1, 0)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            break
+    if code < 0:
+        # Preserve Popen's negative signal result without creating a second
+        # core dump for the supervisor. The command kept its original limit.
+        resource.setrlimit(
+            resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1])
+        )
+        signum = -code
+        if signum not in (signal.SIGKILL, signal.SIGSTOP):
+            signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    return code
+
+
 def run_command(command, test_environment, workdir):
-    """Stream one command; timeout and cancellation also kill its descendants."""
+    """Stream one command with a bounded reader and command-owned cleanup."""
     required_mpirun(command, test_environment)
     timeout = int(test_environment.get("FLAGCICD_CASE_TIMEOUT", "1800"))
     if not 1 <= timeout <= 43200:
         raise ValueError("FLAGCICD_CASE_TIMEOUT must be between 1 and 43200 seconds")
     process = subprocess.Popen(
-        ["bash", "-c", f"set -euo pipefail\n{command}"],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            f"--supervise-command={command}",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         env=test_environment,
         cwd=workdir,
         start_new_session=True,
     )
-    timed_out = threading.Event()
 
     def kill_group():
-        descendants = set(descendant_pids(process.pid))
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        # Vendor launchers may escape the process group with setsid().
-        descendants.update(descendant_pids(process.pid))
-        for pid in descendants:
+        descendants = descendant_pids(process.pid)
+        for pid in reversed(descendants):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        if process.stdout and not process.stdout.closed:
-            process.stdout.close()
+        if sys.platform == "linux" and descendants:
+            # Let the dedicated supervisor reap workers before terminating it;
+            # otherwise a container's PID 1 may retain them as zombies.
+            try:
+                process.wait(timeout=0.5)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
-    def expire():
-        timed_out.set()
-        kill_group()
-
-    timer = threading.Timer(timeout, expire)
-    timer.daemon = True
-    timer.start()
     assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    chunks = []
+    timed_out = False
+    deadline = time.monotonic() + timeout
+
+    def emit(data, final=False):
+        text = decoder.decode(data, final=final)
+        if text:
+            chunks.append(text)
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
     try:
-        lines = []
-        for line in process.stdout:
-            sys.stdout.write(line)
-            lines.append(line)
-        sys.stdout.flush()
-        returncode = process.wait()
-    except (OSError, ValueError):
-        if not timed_out.is_set():
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if not selector.select(timeout=remaining):
+                timed_out = True
+                break
+            data = os.read(process.stdout.fileno(), 65536)
+            if not data:
+                break
+            emit(data)
+        if not timed_out:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out:
             kill_group()
-            process.wait()
-            raise
         returncode = process.wait()
+        # Drain only currently available bytes; an unclosed pipe must never
+        # turn the deadline into another blocking read.
+        while selector.select(timeout=0):
+            data = os.read(process.stdout.fileno(), 65536)
+            if not data:
+                break
+            emit(data)
+        emit(b"", final=True)
     except BaseException:
         kill_group()
         process.wait()
         raise
     finally:
-        timer.cancel()
+        selector.close()
         process.stdout.close()
-    return (124 if timed_out.is_set() else returncode), "".join(lines)
+    return (124 if timed_out else returncode), "".join(chunks)
 
 
 def main():
     args = parse_args()
+    if getattr(args, "supervise_command", None) is not None:
+        return supervise_command(args.supervise_command)
     tests, environment = load_configuration(args.allow_empty)
     if args.validate_only:
         print(f"Validated {len(tests)} configured integration test(s)")
@@ -342,6 +416,7 @@ def main():
             "name": test["name"],
             "command": test["command"],
             "status": "not_run",
+            "group_id": test.get("group_id", test.get("manifest_id", test["name"])),
             "requires_pytest": any(
                 Path(word).name in ("pytest", "run_unit_tests.py")
                 for word in shlex.split(test["command"])
@@ -372,6 +447,7 @@ def main():
             test_environment[key] = os.path.expandvars(value)
         if test_environment.get("FLAGCICD_REPORT_DIR"):
             test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
+            test_environment["FLAGCICD_GROUP_ID"] = records[index - 1]["group_id"]
         record = records[index - 1]
         record.update(status="running", started_at=time.time())
         save_execution()
@@ -408,9 +484,15 @@ def main():
             save_execution()
             raise
         ok, tolerated = classify_command_result(returncode, output, allow_crash)
+        evidence_error = ""
         if ok and test.get("min_passed", 0):
-            passed = sum(int(n) for n in re.findall(r"\b(\d+) passed\b", output))
-            ok = passed >= test["min_passed"]
+            from merge_pytest_reports import check_group_minimum
+
+            try:
+                check_group_minimum(report_dir, test)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                ok, evidence_error = False, str(error)
+                record["error"] = evidence_error
         record.update(
             status="passed" if ok else "failed",
             returncode=returncode,
@@ -429,7 +511,12 @@ def main():
             continue
         if not ok:
             print(
-                f"Integration test '{test['name']}' failed with exit code {returncode}",
+                f"Integration test '{test['name']}' "
+                + (
+                    f"evidence check failed: {evidence_error}"
+                    if evidence_error
+                    else f"failed with exit code {returncode}"
+                ),
                 flush=True,
             )
             raise SystemExit(returncode or 1)

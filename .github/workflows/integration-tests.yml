@@ -90,7 +90,7 @@ jobs:
     uses: ./.github/workflows/load-platform-config.yml
     with:
       platform: ${{ inputs.platform }}
-      test_profile: ${{ inputs.test_profile }}
+      test_profile: ${{ inputs.test_profile || 'pr' }}
       checkout_repository: ${{ inputs.checkout_repository }}
       checkout_ref: ${{ inputs.checkout_ref }}
 
@@ -284,11 +284,13 @@ jobs:
           python - <<'PYCODE'
           import json
           import os
+          import sys
           from pathlib import Path
+          sys.path.insert(0, ".github/scripts")
+          from merge_pytest_reports import validate_pytest_result
           report = json.loads(Path(os.environ["GITHUB_WORKSPACE"], f"pytest-{os.environ['REPORT_PLATFORM']}.json").read_text())
           assert report["flagcicd"]["complete"] is True, "test evidence is incomplete"
-          assert report["exitcode"] == 0, "test execution failed"
-          assert report["summary"].get("passed", 0) > 0, "no functional tests passed"
+          validate_pytest_result(report, require_success=True, require_passed=True)
           PYCODE
 
       # Resolve report paths inside the job container; github.workspace may
