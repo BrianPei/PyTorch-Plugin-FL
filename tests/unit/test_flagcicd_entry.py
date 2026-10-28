@@ -379,6 +379,43 @@ def test_successful_job_requires_complete_pytest_data_but_coverage_is_optional(
     assert report["coverage_warnings"]
 
 
+def test_platform_report_validation_and_write_errors_cannot_succeed(
+    tmp_path, monkeypatch
+):
+    plan_file = tmp_path / "plan.json"
+    current = plan()
+    plan_file.write_text(json.dumps(current))
+    for key, value in {
+        "FLAGCICD_PLAN": PLANNER.report_context(current),
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "JOB_RESULTS": json.dumps(jobs("failure", setup="failure")),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "report",
+            "platform",
+            "--plan-file",
+            str(plan_file),
+            "--platform",
+            "nvidia",
+            "--directory",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "missing" / "report.json"),
+        ],
+    )
+    with pytest.raises(OSError):
+        REPORTER.main()
+    current["plan_hash"] = "invalid"
+    plan_file.write_text(json.dumps(current))
+    with pytest.raises(SystemExit, match="validated plan is unavailable"):
+        REPORTER.main()
+
+
 @pytest.mark.parametrize("source,complete", [("d" * 40, True), (SHA, False)])
 def test_stale_or_partial_pytest_data_cannot_pass(tmp_path, source, complete):
     raw_reports(tmp_path, source, complete)
@@ -645,17 +682,32 @@ def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
     assert all(actual[key] == value for key, value in context.items())
 
 
-def test_report_clis_retain_failed_execution_and_summary(tmp_path):
+@pytest.mark.parametrize(
+    "result,stages,evidence,status,report_exit",
+    [
+        ("success", {}, True, "passed", 0),
+        ("failure", {"build": "failure"}, False, "build_failed", 0),
+        ("failure", {"setup": "failure"}, False, "infra_error", 0),
+        ("failure", {"tests": "failure"}, True, "test_failed", 0),
+        ("cancelled", {}, False, "cancelled", 0),
+        ("success", {}, False, "report_error", 1),
+    ],
+)
+def test_report_clis_retain_execution_and_summary(
+    tmp_path, result, stages, evidence, status, report_exit
+):
     raw = tmp_path / "raw"
     raw.mkdir()
-    output = tmp_path / "flagcicd-platform-cuda.json"
+    if evidence:
+        raw_reports(raw)
+    output = tmp_path / "flagcicd-platform-nvidia.json"
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan()))
     env = {
         **os.environ,
         "CI_PLAN_FILE": str(plan_path),
         "FLAGCICD_PLAN": json.dumps(plan()),
-        "JOB_RESULTS": json.dumps(jobs("failure", build="failure", tests="skipped")),
+        "JOB_RESULTS": json.dumps(jobs(result, **stages)),
         "GITHUB_RUN_ID": "42",
         "GITHUB_RUN_ATTEMPT": "1",
     }
@@ -675,10 +727,12 @@ def test_report_clis_retain_failed_execution_and_summary(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert process.returncode == 1, process.stderr
-    assert json.loads(output.read_text())["status"] == "build_failed"
+    assert process.returncode == report_exit, process.stderr
+    assert json.loads(output.read_text())["status"] == status
     results = entry_jobs()
-    results["platforms"]["result"] = "failure"
+    results["platforms"]["result"] = (
+        result if result != "success" else "failure" if report_exit else "success"
+    )
     env["JOB_RESULTS"] = json.dumps(results)
     summary = tmp_path / "summary.json"
     process = subprocess.run(
@@ -695,9 +749,9 @@ def test_report_clis_retain_failed_execution_and_summary(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert process.returncode == 1, process.stderr
+    assert process.returncode == (0 if status == "passed" else 1), process.stderr
     actual = json.loads(summary.read_text())
-    assert actual["status"] == "build_failed"
+    assert actual["status"] == status
     assert actual["children"][0]["platform"] == {"name": "nvidia"}
 
 

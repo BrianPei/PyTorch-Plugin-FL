@@ -1,6 +1,6 @@
 # CI selection and maintainer controls
 
-CI schedules nine configured hardware platforms through the shared integration
+CI schedules configured hardware platforms through the shared integration
 workflow. Runner labels, images and device access come from each platform config;
 test groups come from the shared integration manifest.
 
@@ -91,6 +91,13 @@ check or publish a synthetic passing check on the PR commit.
 `flaky-retry.yml` listens for completed, failed runs of `ci.yml`. It checks the
 actual run and all failed root jobs using the GitHub API. It excludes the
 dependent **CI complete** summary from root-cause classification.
+
+A platform outcome job succeeds when it successfully describes an upstream
+hardware failure; that failure remains in the report and blocks the shared gate.
+Report validation, generation or upload failures still fail the outcome job and
+remain subject to the same root-failure policy. This keeps a dependent report
+from blocking an otherwise eligible network retry without ignoring real report
+faults by job name.
 
 Only recognized network failures are retried: for example pip read timeouts,
 DNS failures, connection resets, selected curl transport failures and HTTP

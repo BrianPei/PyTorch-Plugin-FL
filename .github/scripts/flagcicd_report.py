@@ -516,6 +516,11 @@ def main():
         diagnose_jobs()
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"FlagCICD {report['report_type']}: {report['status']}")
+    # A platform outcome describes its upstream job; generating that outcome
+    # must not add a false root failure for the bounded network retry policy.
+    # The summary remains the gate, and real reporting failures still fail.
+    if args.mode == "platform":
+        return int(report["status"] == "report_error")
     return int(report["status"] != "passed")
 
 
