@@ -21,6 +21,26 @@ from collections import Counter
 from pathlib import Path
 
 
+def validate_pytest_result(report, *, require_success=False, require_passed=False):
+    """Check structured pytest evidence, independently of the outer shell status."""
+    counts = report.get("summary")
+    if not isinstance(counts, dict) or not all(
+        type(value) is int and value >= 0 for value in counts.values()
+    ):
+        raise ValueError("invalid pytest summary")
+    if type(report.get("exitcode")) is not int:
+        raise ValueError("invalid pytest exitcode")
+    if require_success:
+        if report["exitcode"] != 0:
+            raise ValueError("pytest report contradicts the successful job result")
+        if any(counts.get(key, 0) for key in ("failed", "error", "errors")):
+            raise ValueError(
+                "pytest failure counts contradict the successful job result"
+            )
+    if require_passed and not counts.get("passed", 0):
+        raise ValueError("no functional tests passed")
+
+
 def merge_reports(
     directory, platform, outcome, source_repository, source_ref, require_execution=False
 ):
@@ -87,6 +107,13 @@ def merge_reports(
         raise ValueError("No pytest sessions started; no test report to upload")
     execution = None
     execution_errors = []
+    for session in sessions:
+        if "summary" not in session:
+            continue
+        try:
+            validate_pytest_result(session, require_success=outcome == "success")
+        except ValueError as error:
+            execution_errors.append(f"{session['report']}: {error}")
     execution_path = Path(directory) / "groups.json"
     if execution_path.is_file():
         execution = json.loads(execution_path.read_text())
