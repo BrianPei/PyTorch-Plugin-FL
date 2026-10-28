@@ -276,7 +276,7 @@ def merge_reports(
         session = {"report": marker.with_suffix(".json").name}
         try:
             report = read_pytest_session(marker, session)
-        except (OSError, ValueError, TypeError) as error:
+        except (OSError, ValueError, TypeError, KeyError) as error:
             session["error"] = str(error)
             incomplete.append(session["report"])
             sessions.append(session)

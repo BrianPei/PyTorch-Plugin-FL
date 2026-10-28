@@ -14,7 +14,7 @@
 
 """Cross-platform dtype-cast correctness and result-device checks.
 
-Source contracts run in L1; CUDA transfer profiling runs in its own L3 group.
+Source contracts run in L1; CUDA transfer profiling runs in its own nightly group.
 """
 
 import pytest
@@ -83,3 +83,14 @@ def test_cast_stays_on_device(src_dtype, dst_dtype):
     out = src.to(dst_dtype)
     assert out.device.type == "flagos"
     assert out.dtype == dst_dtype
+
+
+def test_contiguous_matches_cpu_after_the_on_device_gather():
+    """The on-device gather must produce the same values as ATen's."""
+    torch.manual_seed(0)
+    base = torch.randn(48, 72, dtype=torch.float32)
+    src = base.to(_device()).t()
+    expected = base.t().contiguous()
+    torch.flagos.synchronize()
+    got = src.contiguous().cpu()
+    assert torch.equal(got, expected)

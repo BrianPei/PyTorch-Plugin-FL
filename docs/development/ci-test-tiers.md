@@ -26,7 +26,11 @@ such as `nvidia`. Source-only contracts run in the agnostic/codegen checks.
 Groups run serially within a platform; separate platform jobs remain parallel.
 Commands have a 30-minute default deadline, overridable with
 `FLAGCICD_CASE_TIMEOUT`. Timeout and cancellation kill the command's process
-group. `groups.json` retains failed and unstarted groups. Pytest reports retain
+group. A dedicated Linux child subreaper also retains workers that detach and
+outlive their launcher, so they remain reachable for cleanup. Other POSIX hosts
+retain process-group cleanup. The output reader shares the command deadline
+instead of blocking on an inherited pipe. `groups.json` retains failed and
+unstarted groups. Pytest reports retain
 selected node ids, skips and failures. Missing sessions, missing selected test
 results, incomplete execution or an entirely skipped run cannot pass the
 functional evidence check. Existing documented vendor teardown handling stays
@@ -40,7 +44,8 @@ CUDA functional CI keeps FlagCX communication optional through `cuda-comm`.
 It does not run a global `pip check` or claim collective-communication support.
 Other platforms retain their existing dependency setup.
 
-Release publication, candidate receipts, performance baselines, endurance and
-model release acceptance are outside this PR. The existing release workflow
-is unchanged. No whole-repository test-file registry or cross-repository
-schema/adapter framework is required to add a functional test.
+Release publication continues through the existing wheel-build and publishing
+workflows, with platform names and boxing-mode propagation kept consistent with
+CI. Candidate receipts, performance baselines, endurance and model release
+acceptance are outside this PR. No whole-repository test-file registry or
+cross-repository schema/adapter framework is required to add a functional test.

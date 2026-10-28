@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA bf16/fp32 casts must avoid host transfers on the measured CUDA stack.
+"""CUDA casts, strided copies and gathers must avoid host transfers.
 
 This is a performance contract, separate from cross-platform cast correctness.
-The profiler owns the device through an exclusive CUDA-only L3 manifest group.
+The profiler owns the device through an exclusive CUDA-only nightly manifest group.
 Other CUDA-ABI vendors need their own measurements before joining this contract.
 CPU-only PyTorch intentionally casts through the host and has no CUDA profiler.
 """
@@ -63,4 +63,62 @@ def test_bf16_fp32_cast_is_transfer_free(src_dtype, dst_dtype):
     assert n == 0, (
         f"{src_dtype} -> {dst_dtype} performed {n} host/device transfers; the cast "
         "is routing through host memory instead of the native copy kernel"
+    )
+
+
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype",
+    [
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.bfloat16),
+        (torch.float16, torch.float32),
+        (torch.int64, torch.float32),
+        (torch.int32, torch.int64),
+    ],
+)
+def test_copy_into_strided_destination_is_transfer_free(src_dtype, dst_dtype):
+    """`copy_` into a non-contiguous destination must stay on device.
+
+    The same-device fast path in `_copy_from` only covers a contiguous source
+    into a contiguous destination of equal shape and dtype. Everything else --
+    a dtype change, a strided destination, a transposed source -- used to fall
+    through to `strided_copy_cast_via_cpu` on the non-boxing build, which is two
+    blocking `cudaMemcpy` per call. This is the arm `_to_copy` lands on after its
+    own `contiguous()`, so the cost showed up under `_to_copy` and not here.
+    """
+    if src_dtype.is_floating_point:
+        src_cpu = torch.randn(64, 96, dtype=src_dtype)
+    else:
+        src_cpu = torch.randint(-1000, 1000, (64, 96), dtype=src_dtype)
+    src = src_cpu.to(_device())
+    dst = torch.empty(96, 64, dtype=dst_dtype, device=_device()).t()
+
+    def run():
+        dst.copy_(src)
+
+    n = _memcpy_count(run)
+    assert n == 0, (
+        f"copy_({src_dtype} -> {dst_dtype}) into a strided destination performed "
+        f"{n} host/device transfers; the copy is going through host memory"
+    )
+
+
+@pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float32])
+def test_contiguous_of_transposed_source_is_transfer_free(src_dtype):
+    """`contiguous()` on a strided source must gather on device.
+
+    `_to_copy` calls it before its cast, so a host gather here costs the round
+    trip twice: once to make the source contiguous, once for the cast.
+    """
+    src = torch.randn(64, 96, dtype=src_dtype, device=_device()).t()
+    assert not src.is_contiguous()
+
+    out = src.contiguous()
+
+    assert out.is_contiguous()
+    assert out.device.type == "flagos"
+    n = _memcpy_count(lambda: src.contiguous())
+    assert n == 0, (
+        f"contiguous() of a transposed {src_dtype} source performed {n} "
+        "host/device transfers; the gather is going through host memory"
     )
