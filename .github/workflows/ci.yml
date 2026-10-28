@@ -213,6 +213,47 @@ jobs:
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
 
+  # Transitional observation runs beside hardware, outside its required DAG.
+  observe-plan:
+    name: Observe CI plan
+    needs: [resolve-checkout, discover-platforms]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve-checkout.outputs.repository }}
+          ref: ${{ needs.resolve-checkout.outputs.ref }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install plan parser
+        run: python -m pip install "PyYAML==6.0.2"
+      - name: Record CI plan (observation only)
+        timeout-minutes: 1
+        env:
+          SOURCE_REPOSITORY: ${{ needs.resolve-checkout.outputs.repository }}
+          SELECTED_PLATFORMS: ${{ needs.discover-platforms.outputs.platforms }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_PROFILE: ${{ github.event_name == 'schedule' && 'nightly' || inputs.profile || 'pr' }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python .github/scripts/flagcicd_plan.py
+          --ci --source . --output flagcicd-plan.json
+      - name: Retain observed CI plan
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: flagcicd-plan-${{ github.run_attempt }}
+          path: flagcicd-plan.json
+          if-no-files-found: warn
+          retention-days: 14
+
   # Single required-check gate for branch protection.
   ci-complete:
     name: CI complete
@@ -288,6 +329,10 @@ jobs:
           for job in listed:
               name = job.get("name", "")
               conclusion = job.get("conclusion")
+              if name == "Observe CI plan":
+                  if conclusion in ("failure", "timed_out", "cancelled"):
+                      print(f"::warning::{name}: {conclusion}")
+                  continue
               if conclusion in ("failure", "timed_out"):
                   print(f"::error::{name}: {conclusion}")
               elif conclusion == "cancelled" and name.startswith("Platform pipeline ("):

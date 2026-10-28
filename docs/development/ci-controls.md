@@ -115,6 +115,64 @@ require their workflow definitions to exist on the default branch.
 
 ## Validation and rollout
 
+### Implementation discipline
+
+The existing integration PR tracks upstream main and its CI results. Planning
+changes are developed on a dependent branch and reviewed in stages. When the
+integration branch advances, update the dependent branch and recheck its own
+delta; after the integration PR merges, align the planning branch with main.
+
+For each stage, audit existing CI capabilities before adding code. Reuse the
+router, composer, configuration and reporting facilities wherever they fit.
+Existing facilities may be corrected or simplified when evidence shows a defect
+or an unreasonable design; explain the impact and add relevant regression checks.
+Keep one authoritative implementation for each responsibility. Observation beside
+the existing execution path is transitional: when plan consumption and shared
+gating take over, remove the superseded decision paths rather than retaining
+parallel routing, composition or verdict implementations. New abstractions must
+solve a demonstrated need. Each stage must include behavior checks and cleanup;
+test exclusions or weaker gates must not hide defects.
+
+### Observed execution plans
+
+Ordinary CI retains `flagcicd-plan-<attempt>` after platform discovery. The
+observation job runs beside hardware; neither hardware nor the required gate
+depends on it, and its failures remain diagnostic warnings. Its regression tests
+run when present in the tested checkout, so trusted dispatches to older source
+commits do not fail because a newer test file is absent.
+
+The existing matrix generator still supplies the hardware matrix, and `CI complete`
+still uses the existing job/result gate. Plan generation and artifact upload are
+non-blocking observation steps: a missing plan is unavailable diagnostic data,
+never proof that tests ran or that a platform passed.
+
+Both CI and FlagCICD Entry use `flagcicd_plan.py` to snapshot the final groups from
+the existing manifest composer. There is no second group catalog or executor.
+Each lane records its shared test environment and ordered groups, including the
+original commands, group environments and `min_passed` requirements. The stable
+`group_id` reuses the composer's `manifest_id`. Boxing plans use the same display
+name and replacement environment expectations as `load-platform-config.yml`.
+Shell variables remain unexpanded; runner environments and secret values are not
+copied into the plan.
+
+The plan records selection reasons and the actual expected shared checks.
+Documentation PRs retain an empty hardware matrix and all three ordinary shared
+checks. External requests keep their existing L0/L1/L2 policy, including the
+explicit L2 empty-selection fallback. Neither policy is substituted for the other.
+
+`plan_hash` binds the source repository/commit, comparison base and diff head,
+control-code commit, profile, configuration identity and final execution content.
+`source_sha` is the checked-out commit; `diff_head_sha` can instead be a PR head
+when CI tests GitHub's merge commit. Run, attempt, task and parent-run identifiers
+are excluded from this deterministic hash. The compact external report context
+carries the hash, while commands and large routing explanations stay in the plan
+artifact. The current report gate does not yet enforce this new hash.
+
+This first stage does not make executors consume plans or add group routing,
+report completeness gates, retries, caches, test skips or new hardware workloads.
+Those changes require separate review and real-runner acceptance. Local plan
+comparisons are not hardware validation.
+
 ### Functional evidence validation
 
 The pytest merger, the ordinary hardware evidence check and the external platform

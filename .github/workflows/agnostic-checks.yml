@@ -159,6 +159,10 @@ jobs:
         if: hashFiles('tests/unit/test_flagcicd_entry.py') != ''
         run: python -m pytest tests/unit/test_flagcicd_entry.py -v --tb=short -p no:cacheprovider
 
+      - name: Run observed plan contract tests
+        if: hashFiles('tests/unit/test_ci_plan_observation.py') != ''
+        run: python -m pytest tests/unit/test_ci_plan_observation.py -v --tb=short -p no:cacheprovider
+
       # Every vendor conf must be exactly what its generator emits. The
       # generator needs only the standard library (it reads codegen_ops.py and
       # backend_coverage.py as data, precisely so it can run where torchgen and
