@@ -15,7 +15,7 @@
 """CUDA casts, strided copies and gathers must avoid host transfers.
 
 This is a performance contract, separate from cross-platform cast correctness.
-The profiler owns the device through an exclusive CUDA-only L3 manifest group.
+The profiler owns the device through an exclusive CUDA-only nightly manifest group.
 Other CUDA-ABI vendors need their own measurements before joining this contract.
 CPU-only PyTorch intentionally casts through the host and has no CUDA profiler.
 """
