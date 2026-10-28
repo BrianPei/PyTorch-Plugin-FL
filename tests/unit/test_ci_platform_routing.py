@@ -16,6 +16,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,50 @@ PLATFORMS = sorted(
     for path in CONFIGS.glob("*.yml")
     if path.stem not in {"template", "image_sources", "platforms"}
 )
+
+
+def _shared_test_files(workflow):
+    return [
+        token
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        for token in shlex.split(step.get("run", ""), comments=True)
+        if token.startswith("tests/") and token.endswith(".py")
+    ]
+
+
+def test_cpu_workflows_do_not_schedule_the_same_explicit_test_file_twice():
+    agnostic = _shared_test_files(_workflow("agnostic-checks.yml"))
+    codegen = _shared_test_files(_workflow("codegen-checks.yml"))
+    assert len(agnostic) == len(set(agnostic))
+    assert len(codegen) == len(set(codegen))
+    assert not set(agnostic) & set(codegen)
+    assert "tests/unit/test_gen_vendor_confs.py" in agnostic
+
+
+def test_stdlib_vendor_conf_check_has_one_lightweight_owner():
+    calls = []
+    for name in ("agnostic-checks.yml", "codegen-checks.yml"):
+        for job in _workflow(name)["jobs"].values():
+            for step in job.get("steps", []):
+                for line in step.get("run", "").replace("\\\n", " ").splitlines():
+                    argv = shlex.split(line, comments=True)
+                    if (
+                        argv
+                        and argv[0] in ("python", "python3")
+                        and argv[1:]
+                        == ["scripts/codegen/gen_vendor_confs.py", "--check"]
+                    ):
+                        calls.append(name)
+    assert calls == ["agnostic-checks.yml"]
+
+
+def test_both_entries_still_require_both_shared_cpu_jobs():
+    ci = _workflow("ci.yml")["jobs"]
+    entry = _workflow("flagcicd-entry.yml")["jobs"]
+    assert {"agnostic-checks", "codegen-checks"} <= set(ci["ci-complete"]["needs"])
+    assert {"agnostic", "codegen"} <= set(entry["complete"]["needs"])
+    assert {"agnostic", "codegen"} <= set(entry["platforms"]["needs"])
 
 
 def _workflow(name):

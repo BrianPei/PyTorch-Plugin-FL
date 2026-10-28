@@ -184,6 +184,21 @@ teardown-crash handling remains separate from assertion failures.
 The ordinary gate reads paginated job diagnostics as a JSON array, with a bounded
 API query. Optional diagnostic failures do not replace the required job verdicts.
 
+### Shared CPU check ownership
+
+`agnostic-checks.yml` owns the stdlib-only vendor-conf generator's `--check` and
+`test_gen_vendor_confs.py`. `codegen-checks.yml` owns the remaining platform code
+generators and registration consistency checks that share its CPU-torch setup.
+Both ordinary CI and the external entry retain their required shared-job gates.
+A standalone codegen dispatch has this narrower scope; use full CI for both.
+
+Explicit test files and generator checks must not be listed in both CPU
+workflows. The routing contract tests check unique ownership and preserve the
+required dependencies. This policy does not remove device or installed-wheel
+checks: identical filenames on default/boxing or different vendor environments
+can represent different validation. Reducing those checks requires evidence of
+equivalent environments and behavior, not a filename-based exclusion list.
+
 Platform-agnostic CI runs regression tests for selection, routing, required gate
 results, checkout resolution, comment dispatch, network classification and retry
 budgets. GitHub operations in these tests are simulated; tests do not post real
