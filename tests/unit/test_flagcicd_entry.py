@@ -307,7 +307,6 @@ def entry_jobs(level="L2"):
         for name, expected in {
             "plan": True,
             "lint": True,
-            "preflight": True,
             "agnostic": level != "L0",
             "codegen": level != "L0",
             "platforms": level == "L2",
@@ -485,7 +484,7 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
         assert f"github.event.client_payload.{identity}" in group
     control = workflow["jobs"]["plan"]["steps"][0]
     assert control["with"]["ref"] == "${{ github.workflow_sha }}"
-    for name in ("lint", "preflight", "agnostic", "codegen", "platforms"):
+    for name in ("lint", "agnostic", "codegen", "platforms"):
         inputs = workflow["jobs"][name]["with"]
         assert inputs["checkout_ref"] == "${{ needs.plan.outputs.source_sha }}"
         assert (
@@ -498,6 +497,10 @@ def test_entry_uses_trusted_control_code_and_pins_all_source_consumers():
 def test_plan_cli_preserves_json_identifiers_and_emits_a_real_plan(tmp_path):
     checkout = tmp_path / "source"
     shutil.copytree(ROOT / ".github/configs", checkout / ".github/configs")
+    (checkout / ".github/scripts").mkdir()
+    shutil.copyfile(
+        ROOT / ".github/scripts/set_env.sh", checkout / ".github/scripts/set_env.sh"
+    )
     shutil.copyfile(
         ROOT / ".github/integration-manifest.yml",
         checkout / ".github/integration-manifest.yml",
@@ -676,14 +679,18 @@ def test_passing_pytest_cannot_hide_a_skipped_required_stage(tmp_path, stage):
     assert result["status"] != "passed"
 
 
-def test_l0_runs_the_same_complete_configuration_validator_as_l2():
-    workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/flagcicd-entry.yml").read_text()
+def test_l0_validates_all_configurations_during_planning():
+    jobs = yaml.safe_load((ROOT / ".github/workflows/flagcicd-entry.yml").read_text())[
+        "jobs"
+    ]
+    assert "preflight" not in jobs
+    assert "plan" in jobs["complete"]["needs"]
+    result = PLANNER.build_plan(request(), CONTRACT, ROOT, ["README.md"])
+    assert result["test_level"] == "L0"
+    assert result["validated_platforms"] == PLANNER._load_platforms(
+        ROOT / ".github/configs"
     )
-    preflight = workflow["jobs"]["preflight"]
-    assert preflight["uses"] == "./.github/workflows/load-platform-config.yml"
-    assert "if" not in preflight
-    assert "preflight" in workflow["jobs"]["complete"]["needs"]
+    assert result["expected_shared_checks"] == ["lint", "plan"]
 
 
 def test_summary_artifact_name_agrees_with_the_contract():
@@ -737,7 +744,7 @@ def test_large_diffs_remain_in_artifacts_and_context_can_start_a_process():
 @pytest.mark.parametrize(
     "job,level,status",
     [
-        ("preflight", "L0", "infra_error"),
+        ("plan", "L0", "infra_error"),
         ("lint", "L0", "test_failed"),
         ("agnostic", "L1", "test_failed"),
         ("codegen", "L1", "test_failed"),
@@ -752,9 +759,9 @@ def test_shared_check_failures_keep_their_actual_failure_category(
 
 
 @pytest.mark.parametrize("outcome", ["failure", "skipped", "cancelled"])
-def test_preflight_is_required_even_without_hardware(tmp_path, outcome):
+def test_configuration_plan_is_required_even_without_hardware(tmp_path, outcome):
     results = entry_jobs("L0")
-    results["preflight"]["result"] = outcome
+    results["plan"]["result"] = outcome
     assert (
         REPORTER.aggregate(plan("L0", []), results, tmp_path, 1)["status"] != "passed"
     )

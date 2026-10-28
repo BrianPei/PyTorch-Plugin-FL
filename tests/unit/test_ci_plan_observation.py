@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare observed plans with the existing router and loader command boundary."""
+"""Verify final plans against routing, composition and real execution boundaries."""
 
 import copy
 import importlib.util
@@ -37,6 +37,7 @@ try:
     spec.loader.exec_module(PLANNER)
 finally:
     sys.path.pop(0)
+CONSUMER = sys.modules["platform_config"]
 CONTRACT = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
 
 
@@ -234,9 +235,11 @@ def test_large_execution_plan_stays_out_of_the_dispatch_context():
     assert context["plan_hash"] == plan["plan_hash"]
 
 
-@pytest.mark.parametrize("selected", [[], ["nvidia"]])
-def test_real_observer_cli_records_checkout_identity_and_detects_matrix_drift(
-    tmp_path, selected
+@pytest.mark.parametrize(
+    "labels,selected", [([], []), (["platform:nvidia"], ["nvidia", "nvidia-boxing"])]
+)
+def test_real_plan_cli_records_identity_and_supplies_the_matrix(
+    tmp_path, labels, selected
 ):
     sha = subprocess.check_output(
         ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
@@ -248,8 +251,7 @@ def test_real_observer_cli_records_checkout_identity_and_detects_matrix_drift(
         "EVENT_NAME": "pull_request",
         "BASE_SHA": sha,
         "HEAD_SHA": sha,
-        "PR_LABELS_JSON": "[]",
-        "SELECTED_PLATFORMS": json.dumps(selected),
+        "PR_LABELS_JSON": json.dumps(labels),
         "TEST_PROFILE": "pr",
         "DISPATCH_PLATFORMS": "",
         "GITHUB_RUN_ID": "42",
@@ -270,44 +272,40 @@ def test_real_observer_cli_records_checkout_identity_and_detects_matrix_drift(
         capture_output=True,
         text=True,
     )
-    if selected:
-        assert result.returncode != 0
-        assert "differs from the scheduled CI matrix" in result.stderr
-        assert not output.exists()
-    else:
-        assert result.returncode == 0, result.stderr
-        plan = json.loads(output.read_text())
-        assert plan["source_sha"] == plan["control_sha"] == sha
-        assert plan["observation_only"] is True
-        assert plan["execution_plan"] == []
+    assert result.returncode == 0, result.stderr
+    plan = json.loads(output.read_text())
+    assert plan["source_sha"] == plan["control_sha"] == sha
+    assert not plan.get("observation_only", False)
+    assert [lane["name"] for lane in plan["execution_plan"]] == selected
+    outputs = dict(
+        line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines()
+    )
+    assert json.loads(outputs["platforms"]) == selected
+    assert outputs["artifact_name"] == "flagcicd-plan-1"
 
 
-def test_observer_is_nonblocking_and_does_not_replace_the_matrix_or_gate():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-    jobs = workflow["jobs"]
-    observer = jobs["observe-plan"]
-    steps = observer["steps"]
-    observe = next(
-        s for s in steps if s.get("name") == "Record CI plan (observation only)"
-    )
-    assert observer["continue-on-error"] is True
-    assert "#" not in observe["run"]
+def test_one_required_plan_supplies_the_matrix_and_execution():
+    jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
+    assert "observe-plan" not in jobs
+    steps = jobs["discover-platforms"]["steps"]
+    plan = next(s for s in steps if s.get("id") == "detect")
+    assert "flagcicd_plan.py" in plan["run"]
+    assert "generate_matrix.py" not in plan["run"]
+    assert "SELECTED_PLATFORMS" not in plan["env"]
+    assert "#" not in plan["run"]
+    assert "continue-on-error" not in jobs["discover-platforms"]
+    for consumer in ("platform-pipeline", "ci-complete"):
+        assert "discover-platforms" in jobs[consumer]["needs"]
+    inputs = jobs["platform-pipeline"]["with"]
     assert (
-        observe["env"]["SELECTED_PLATFORMS"]
-        == "${{ needs.discover-platforms.outputs.platforms }}"
+        inputs["execution_plan_artifact"]
+        == "${{ needs.discover-platforms.outputs.plan_artifact || 'missing-required-execution-plan' }}"
     )
     assert (
-        jobs["discover-platforms"]["outputs"]["platforms"]
-        == "${{ steps.detect.outputs.platforms }}"
+        inputs["execution_plan_context"]
+        == "${{ needs.discover-platforms.outputs.context }}"
     )
-    assert "flagcicd_plan" not in jobs["platform-pipeline"]["with"]
-    assert "flagcicd_report.py" not in json.dumps(jobs["ci-complete"])
-    assert "observe-plan" not in jobs["platform-pipeline"]["needs"]
-    assert "observe-plan" not in jobs["ci-complete"]["needs"]
-    assert not any(
-        "flagcicd_plan.py" in s.get("run", "")
-        for s in jobs["discover-platforms"]["steps"]
-    )
+    assert "flagcicd_plan" not in inputs
 
 
 def test_observer_tests_are_conditional_for_older_source_checkouts():
@@ -368,7 +366,6 @@ def test_observer_diffs_the_pr_head_but_records_the_tested_merge_commit(tmp_path
         "BASE_SHA": base,
         "HEAD_SHA": head,
         "PR_LABELS_JSON": "[]",
-        "SELECTED_PLATFORMS": "[]",
         "TEST_PROFILE": "pr",
         "DISPATCH_PLATFORMS": "",
         "GITHUB_RUN_ID": "42",
@@ -417,3 +414,358 @@ def test_ci_nightly_is_full_and_weekly_stays_reserved():
             "workflow_dispatch",
             dispatch="nvidia",
         )
+
+
+def executable_plan(monkeypatch, **updates):
+    monkeypatch.setenv("GITHUB_RUN_ID", "42")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    return PLANNER.build_plan(
+        request(
+            platforms="nvidia",
+            requested_level="L2",
+            run_id="42",
+            run_attempt="1",
+            **updates,
+        ),
+        CONTRACT,
+        ROOT,
+        [],
+    )
+
+
+@pytest.mark.parametrize("profile", ["pr", "nightly"])
+def test_all_snapshot_configuration_outputs_match_platform_data(
+    monkeypatch, tmp_path, profile
+):
+    plan = PLANNER.build_plan(
+        request(profile=profile, run_id="42", run_attempt="1"), CONTRACT, ROOT, None
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", "42")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
+    context = json.loads(PLANNER.report_context(plan))
+    for lane in plan["execution_plan"]:
+        config = yaml.safe_load(
+            (ROOT / f".github/configs/{lane['platform']}.yml").read_text()
+        )
+        boxing = lane["lane"] == "boxing"
+        consumed = CONSUMER.consume_plan(
+            plan, context, lane["name"], profile, plan["source_sha"]
+        )
+        outputs = consumed["configuration"]
+        assert outputs == {
+            "platform": lane["platform"],
+            "boxing_lane": "1" if boxing else "",
+            "display_name": config["display_name"]
+            + (" (CUDA boxing)" if boxing else ""),
+            "setup_script": config["setup_script"],
+            "setup_platform": config["setup_platform"],
+            "setup_stage": config.get("setup_stage", "integration"),
+            "ci_image": config["ci_image"],
+            "runner_labels": config["runner_labels"],
+            "container_volumes": config["container_volumes"],
+            "container_options": config["container_options"],
+            "timeout_minutes": str(config["timeout_minutes"]),
+            "integration_timeout_minutes": str(
+                config.get("integration_timeout_minutes", config["timeout_minutes"])
+            ),
+            "wheel_artifact_name": config["wheel_artifact_name"]
+            + ("-boxing" if boxing else ""),
+            "integration_build_tools": "\n".join(
+                config.get("integration_build_tools", [])
+            ),
+            "integration_test_dependencies": "\n".join(
+                config.get("integration_test_dependencies", [])
+            ),
+        }
+        path = tmp_path / "outputs"
+        path.unlink(missing_ok=True)
+        CONSUMER.emit_outputs(consumed, path)
+        emitted = parse_outputs(path)
+        assert json.loads(emitted["integration_tests"]) == lane["groups"]
+        assert json.loads(emitted["integration_environment"]) == lane["environment"]
+        assert json.loads(emitted["runner_labels"]) == outputs["runner_labels"]
+        assert emitted["integration_build_tools"] == outputs["integration_build_tools"]
+        assert emitted["setup_platform"] == outputs["setup_platform"]
+        standalone = tmp_path / "standalone-outputs"
+        standalone.unlink(missing_ok=True)
+        run = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "platform_config.py"),
+                "--source",
+                str(ROOT),
+                "--lane",
+                lane["name"],
+                "--profile",
+                profile,
+                "--output",
+                str(standalone),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert run.returncode == 0, run.stderr
+        assert parse_outputs(standalone) == emitted
+
+
+def parse_outputs(path):
+    lines = iter(path.read_text().splitlines())
+    values = {}
+    for line in lines:
+        key, delimiter = line.split("<<", 1)
+        value = []
+        for line in lines:
+            if line == delimiter:
+                break
+            value.append(line)
+        values[key] = "\n".join(value)
+    return values
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "command",
+        "order",
+        "environment",
+        "runner",
+        "profile",
+        "sha",
+        "hash",
+        "control",
+        "run",
+        "attempt",
+        "unplanned",
+        "observation",
+        "duplicate",
+    ],
+)
+def test_invalid_plan_never_falls_back_to_composition(monkeypatch, mutation):
+    plan = executable_plan(monkeypatch)
+    context = json.loads(PLANNER.report_context(plan))
+    lane, profile, sha = "nvidia", "pr", plan["source_sha"]
+    if mutation == "command":
+        plan["execution_plan"][0]["groups"][0]["command"] = "exit 0"
+    elif mutation == "order":
+        plan["execution_plan"][0]["groups"].reverse()
+    elif mutation == "environment":
+        plan["execution_plan"][0]["environment"]["MODEL_PATH"] = "/other"
+    elif mutation == "runner":
+        plan["execution_plan"][0]["configuration"]["runner_labels"] = ["other"]
+    elif mutation == "profile":
+        profile = "nightly"
+    elif mutation == "sha":
+        sha = "d" * 40
+    elif mutation == "hash":
+        context["plan_hash"] = "0" * 64
+    elif mutation == "control":
+        context["control_sha"] = "d" * 40
+    elif mutation == "run":
+        monkeypatch.setenv("GITHUB_RUN_ID", "43")
+    elif mutation == "attempt":
+        monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "0")
+    elif mutation == "unplanned":
+        lane = "apple"
+    elif mutation == "observation":
+        plan["observation_only"] = True
+    elif mutation == "duplicate":
+        plan["execution_plan"].append(copy.deepcopy(plan["execution_plan"][0]))
+        plan["plan_hash"] = context["plan_hash"] = PLANNER.plan_hash(plan)
+    monkeypatch.setattr(
+        CONSUMER,
+        "compose",
+        lambda *a, **k: pytest.fail("must not recompose a planned lane"),
+    )
+    with pytest.raises(ValueError):
+        CONSUMER.consume_plan(plan, context, lane, profile, sha)
+
+
+def test_failed_job_rerun_can_consume_the_exact_original_plan(monkeypatch):
+    plan = executable_plan(monkeypatch)
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    context = json.loads(PLANNER.report_context(plan))
+    assert (
+        CONSUMER.consume_plan(plan, context, "nvidia", "pr", plan["source_sha"])
+        == plan["execution_plan"][0]
+    )
+
+
+def test_real_consumer_cli_executes_ordered_groups_without_yaml_or_composition(
+    tmp_path, monkeypatch
+):
+    sha = subprocess.check_output(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+    ).strip()
+    plan = executable_plan(monkeypatch, source_sha=sha, control_sha=sha)
+    lane = plan["execution_plan"][0]
+    lane["environment"] = {"SHARED": "from-plan"}
+    lane["groups"] = [
+        {
+            "name": "first",
+            "manifest_id": "first",
+            "group_id": "first",
+            "command": 'printf "%s:%s\\n" "$SHARED" "$GROUP" >> "$TRACE"',
+            "environment": {"GROUP": "one"},
+        },
+        {
+            "name": "second",
+            "manifest_id": "second",
+            "group_id": "second",
+            "command": 'printf "%s:%s\\n" "$SHARED" "$GROUP" >> "$TRACE"',
+            "environment": {"GROUP": "two"},
+        },
+    ]
+    plan["plan_hash"] = PLANNER.plan_hash(plan)
+    artifact = tmp_path / "plan.json"
+    artifact.write_text(json.dumps(plan))
+    output = tmp_path / "outputs"
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "yaml.py").write_text('raise RuntimeError("consumer must not read YAML")')
+    env = {
+        **os.environ,
+        "PLAN_CONTEXT": PLANNER.report_context(plan),
+        "PYTHONPATH": str(shadow),
+    }
+    command = [
+        sys.executable,
+        str(SCRIPTS / "platform_config.py"),
+        "--source",
+        str(ROOT),
+        "--lane",
+        "nvidia",
+        "--plan",
+        str(artifact),
+        "--output",
+        str(output),
+    ]
+    result = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    values = parse_outputs(output)
+    trace = tmp_path / "trace"
+    run = subprocess.run(
+        [sys.executable, str(SCRIPTS / "run_integration_tests.py")],
+        env={
+            **env,
+            "INTEGRATION_TESTS": values["integration_tests"],
+            "INTEGRATION_ENVIRONMENT": values["integration_environment"],
+            "TRACE": str(trace),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    assert trace.read_text().splitlines() == ["from-plan:one", "from-plan:two"]
+    output.unlink()
+    plan["control_sha"] = "d" * 40
+    plan["plan_hash"] = PLANNER.plan_hash(plan)
+    artifact.write_text(json.dumps(plan))
+    env["PLAN_CONTEXT"] = PLANNER.report_context(plan)
+    wrong_control = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert wrong_control.returncode != 0
+    assert "control_sha differs" in wrong_control.stderr
+    assert not output.exists()
+    artifact.unlink()
+    missing = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert missing.returncode != 0
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("runner_labels", []),
+        ("runner_labels", [42]),
+        ("container_volumes", None),
+        ("integration_build_tools", [42]),
+        ("timeout_minutes", True),
+        ("integration_timeout_minutes", 0),
+        ("setup_stage", "other"),
+        ("setup_script", "missing.sh"),
+        ("integration_tests", []),
+        ("ci_image", None),
+    ],
+)
+def test_l0_configuration_errors_fail_during_planning(tmp_path, key, value):
+    shutil.copytree(ROOT / ".github/configs", tmp_path / ".github/configs")
+    (tmp_path / ".github/scripts").mkdir()
+    shutil.copyfile(
+        ROOT / ".github/scripts/set_env.sh", tmp_path / ".github/scripts/set_env.sh"
+    )
+    shutil.copyfile(
+        ROOT / ".github/integration-manifest.yml",
+        tmp_path / ".github/integration-manifest.yml",
+    )
+    config_path = tmp_path / ".github/configs/nvidia.yml"
+    config = yaml.safe_load(config_path.read_text())
+    config[key] = value
+    config_path.write_text(yaml.safe_dump(config))
+    with pytest.raises((ValueError, SystemExit)):
+        PLANNER.build_plan(request(), CONTRACT, tmp_path, ["README.md"])
+
+
+def test_both_entries_forward_one_plan_to_the_shared_configuration_consumer():
+    entry = yaml.safe_load((ROOT / ".github/workflows/flagcicd-entry.yml").read_text())[
+        "jobs"
+    ]
+    assert "preflight" not in entry
+    inputs = entry["platforms"]["with"]
+    assert (
+        inputs["execution_plan_artifact"]
+        == "${{ needs.plan.outputs.plan_artifact || 'missing-required-execution-plan' }}"
+    )
+    assert inputs["execution_plan_context"] == inputs["flagcicd_plan"]
+    integration = yaml.safe_load(
+        (ROOT / ".github/workflows/integration-tests.yml").read_text()
+    )["jobs"]
+    for key in ("execution_plan_artifact", "execution_plan_context"):
+        assert integration["configuration"]["with"][key] == "${{ inputs." + key + " }}"
+    loader = yaml.safe_load(
+        (ROOT / ".github/workflows/load-platform-config.yml").read_text()
+    )["jobs"]["configuration"]
+    download = next(
+        s for s in loader["steps"] if s.get("name") == "Download execution plan"
+    )
+    assert "continue-on-error" not in download
+    assert download["with"]["name"] == "${{ inputs.execution_plan_artifact }}"
+    script = next(s["run"] for s in loader["steps"] if s.get("id") == "config")
+    assert "platform_config.py" in script
+    assert "yq" not in script and "compose_integration_manifest.py" not in script
+    install = next(
+        s for s in loader["steps"] if s.get("name") == "Install configuration parser"
+    )
+    assert install["if"] == "inputs.execution_plan_artifact == ''"
+
+
+def test_null_optional_configuration_fields_keep_the_loader_defaults(tmp_path):
+    shutil.copytree(ROOT / ".github/configs", tmp_path / ".github/configs")
+    (tmp_path / ".github/scripts").mkdir()
+    shutil.copyfile(
+        ROOT / ".github/scripts/set_env.sh", tmp_path / ".github/scripts/set_env.sh"
+    )
+    shutil.copyfile(
+        ROOT / ".github/integration-manifest.yml",
+        tmp_path / ".github/integration-manifest.yml",
+    )
+    path = tmp_path / ".github/configs/nvidia.yml"
+    config = yaml.safe_load(path.read_text())
+    for key in (
+        "setup_stage",
+        "integration_timeout_minutes",
+        "integration_build_tools",
+        "integration_test_dependencies",
+        "integration_environment",
+    ):
+        config[key] = None
+    path.write_text(yaml.safe_dump(config))
+    plan = PLANNER.build_plan(
+        request(platforms="nvidia", requested_level="L2"), CONTRACT, tmp_path, []
+    )
+    lane = plan["execution_plan"][0]
+    assert lane["environment"] == {}
+    assert lane["configuration"]["setup_stage"] == "integration"
+    assert lane["configuration"]["integration_timeout_minutes"] == str(
+        config["timeout_minutes"]
+    )
+    assert lane["configuration"]["integration_build_tools"] == ""
+    assert lane["configuration"]["integration_test_dependencies"] == ""

@@ -186,12 +186,12 @@ def aggregate(plan, jobs, directory, attempt):
         errors.append("test plan is unavailable")
         plan = {"expected_platforms": []}
     level = plan.get("test_level", "L0")
-    expected_jobs = {"plan", "lint", "preflight"}
+    expected_jobs = {"plan", "lint"}
     if level in ("L1", "L2"):
         expected_jobs.update(("agnostic", "codegen"))
     if level == "L2":
         expected_jobs.add("platforms")
-    for name in ("plan", "lint", "preflight", "agnostic", "codegen", "platforms"):
+    for name in ("plan", "lint", "agnostic", "codegen", "platforms"):
         result = jobs.get(name, {}).get("result", "missing")
         expected = "success" if name in expected_jobs else "skipped"
         if result != expected:
@@ -248,12 +248,12 @@ def aggregate(plan, jobs, directory, attempt):
     ):
         if candidate in statuses:
             status = candidate
-    for name in ("plan", "preflight", "lint", "agnostic", "codegen", "platforms"):
+    for name in ("plan", "lint", "agnostic", "codegen", "platforms"):
         if name not in expected_jobs:
             continue
         result = jobs.get(name, {}).get("result", "missing")
         if result == "failure":
-            if name in ("plan", "preflight"):
+            if name == "plan":
                 status = "infra_error"
             elif name != "platforms":
                 status = "test_failed"

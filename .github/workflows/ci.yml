@@ -134,6 +134,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       platforms: ${{ steps.detect.outputs.platforms }}
+      context: ${{ steps.detect.outputs.context }}
+      plan_artifact: ${{ steps.detect.outputs.artifact_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,14 +144,18 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install matrix parser dependency
-        run: python -m pip install PyYAML
-
-      # Emits `platforms` as a JSON array of config basenames, narrowed to the
-      # platforms a pull request can affect. Labels take precedence over files.
-      - name: Detect configured platforms
+      - name: Checkout trusted plan code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: _ci_control
+          persist-credentials: false
+      - name: Install plan parser
+        run: python -m pip install "PyYAML==6.0.2"
+      - name: Plan selected platforms and execution
         id: detect
         env:
+          SOURCE_REPOSITORY: ${{ needs.resolve-checkout.outputs.repository }}
           PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
           EVENT_NAME: ${{ github.event_name }}
@@ -157,35 +163,19 @@ jobs:
           BASE_REF: ${{ github.base_ref || 'main' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: |
-          set -euo pipefail
-          case "$TEST_PROFILE" in
-            pr) ;;
-            nightly)
-              if [[ -n "$DISPATCH_PLATFORMS" && "$DISPATCH_PLATFORMS" != all ]]; then
-                echo "::error::nightly requires platforms=all"
-                exit 2
-              fi
-              ;;
-            *) echo "::error::weekly is reserved; choose pr or nightly"; exit 2 ;;
-          esac
-          PR_LABELS=""
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            PR_LABELS=$(jq -r 'join(",")' <<<"$PR_LABELS_JSON")
-          fi
-
-          python .github/scripts/ci/generate_matrix.py \
-            --event-name "$EVENT_NAME" \
-            --base-ref "$BASE_REF" \
-            --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA" \
-            --configs-dir .github/configs \
-            --pr-labels "$PR_LABELS" \
-            --dispatch-platforms "$DISPATCH_PLATFORMS" \
-            >> "$GITHUB_OUTPUT"
+        run: >-
+          python _ci_control/.github/scripts/flagcicd_plan.py
+          --ci --source . --output flagcicd-plan.json
+      - name: Retain execution plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.detect.outputs.artifact_name }}
+          path: flagcicd-plan.json
+          if-no-files-found: error
+          retention-days: 14
 
   # One hardware pipeline per configured platform. The reusable workflow reads
-  # runner, image, timeout, and test manifest values from that platform config.
+  # runner, image, timeout, and test groups from the validated plan snapshot.
   #
   # fail-fast is off on purpose. The PR is red whatever the other lanes do, so
   # cancelling them on the first failure saves accelerator time only when the
@@ -212,47 +202,8 @@ jobs:
       test_profile: ${{ github.event_name == 'schedule' && 'nightly' || inputs.profile || 'pr' }}
       checkout_repository: ${{ needs.resolve-checkout.outputs.repository }}
       checkout_ref: ${{ needs.resolve-checkout.outputs.ref }}
-
-  # Transitional observation runs beside hardware, outside its required DAG.
-  observe-plan:
-    name: Observe CI plan
-    needs: [resolve-checkout, discover-platforms]
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.resolve-checkout.outputs.repository }}
-          ref: ${{ needs.resolve-checkout.outputs.ref }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Install plan parser
-        run: python -m pip install "PyYAML==6.0.2"
-      - name: Record CI plan (observation only)
-        timeout-minutes: 1
-        env:
-          SOURCE_REPOSITORY: ${{ needs.resolve-checkout.outputs.repository }}
-          SELECTED_PLATFORMS: ${{ needs.discover-platforms.outputs.platforms }}
-          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          DISPATCH_PLATFORMS: ${{ inputs.platforms || '' }}
-          EVENT_NAME: ${{ github.event_name }}
-          TEST_PROFILE: ${{ github.event_name == 'schedule' && 'nightly' || inputs.profile || 'pr' }}
-          BASE_REF: ${{ github.base_ref || 'main' }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: >-
-          python .github/scripts/flagcicd_plan.py
-          --ci --source . --output flagcicd-plan.json
-      - name: Retain observed CI plan
-        if: always()
-        timeout-minutes: 1
-        uses: actions/upload-artifact@v4
-        with:
-          name: flagcicd-plan-${{ github.run_attempt }}
-          path: flagcicd-plan.json
-          if-no-files-found: warn
-          retention-days: 14
+      execution_plan_artifact: ${{ needs.discover-platforms.outputs.plan_artifact || 'missing-required-execution-plan' }}
+      execution_plan_context: ${{ needs.discover-platforms.outputs.context }}
 
   # Single required-check gate for branch protection.
   ci-complete:
@@ -329,10 +280,6 @@ jobs:
           for job in listed:
               name = job.get("name", "")
               conclusion = job.get("conclusion")
-              if name == "Observe CI plan":
-                  if conclusion in ("failure", "timed_out", "cancelled"):
-                      print(f"::warning::{name}: {conclusion}")
-                  continue
               if conclusion in ("failure", "timed_out"):
                   print(f"::error::{name}: {conclusion}")
               elif conclusion == "cancelled" and name.startswith("Platform pipeline ("):

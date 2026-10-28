@@ -66,6 +66,11 @@ def load_configuration(allow_empty):
     except json.JSONDecodeError as error:
         raise SystemExit(f"Invalid integration configuration JSON: {error}") from error
 
+    return validate_configuration(tests, environment, allow_empty)
+
+
+def validate_configuration(tests, environment, allow_empty=False):
+    """Validate the same command contract in planning and execution."""
     if not isinstance(tests, list):
         raise SystemExit("integration_tests must be an array")
     if not allow_empty and not tests:

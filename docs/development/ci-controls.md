@@ -133,45 +133,55 @@ parallel routing, composition or verdict implementations. New abstractions must
 solve a demonstrated need. Each stage must include behavior checks and cleanup;
 test exclusions or weaker gates must not hide defects.
 
-### Observed execution plans
+### Executable plans
 
-Ordinary CI retains `flagcicd-plan-<attempt>` after platform discovery. The
-observation job runs beside hardware; neither hardware nor the required gate
-depends on it, and its failures remain diagnostic warnings. Its regression tests
-run when present in the tested checkout, so trusted dispatches to older source
-commits do not fail because a newer test file is absent.
+Ordinary CI generates its matrix and final execution plan together in
+`discover-platforms`. FlagCICD Entry generates and validates the same plan shape
+in `plan`. Both retain `flagcicd-plan-<producer-attempt>` and forward its exact
+artifact name and compact identity to `integration-tests.yml`. Plan creation and
+upload must succeed before hardware can start. The transitional observation job
+and the external entry's repeated preflight matrix have been removed; full
+configuration validation now happens in the plan job, including L0/L1 requests.
 
-The existing matrix generator still supplies the hardware matrix, and `CI complete`
-still uses the existing job/result gate. Plan generation and artifact upload are
-non-blocking observation steps: a missing plan is unavailable diagnostic data,
-never proof that tests ran or that a platform passed.
+`platform_config.py` is the shared platform parser. It validates scheduling and
+build fields, invokes the existing manifest composer once per validated lane,
+and snapshots the final runner/image/mount/timeout/setup outputs, shared test
+environment and ordered groups. Standalone single-platform integration and wheel
+builds compile with this same parser. There is no second group catalog or
+executor, and no YAML parser is required in vendor images. `group_id` reuses the
+composer's `manifest_id`; commands, group environments and `min_passed` are
+preserved. Shell variables remain unexpanded and secrets are not copied.
 
-Both CI and FlagCICD Entry use `flagcicd_plan.py` to snapshot the final groups from
-the existing manifest composer. There is no second group catalog or executor.
-Each lane records its shared test environment and ordered groups, including the
-original commands, group environments and `min_passed` requirements. The stable
-`group_id` reuses the composer's `manifest_id`. Boxing plans use the same display
-name and replacement environment expectations as `load-platform-config.yml`.
-Shell variables remain unexpanded; runner environments and secret values are not
-copied into the plan.
+For a planned lane, the CPU configuration job downloads that artifact and only
+consumes its snapshot. It does not read platform YAML or recompose tests. It
+checks the plan hash, source SHA, trusted control SHA, profile, current run and
+requested lane against the producer's compact context. Missing, modified or
+mismatched plans fail before hardware scheduling; they never trigger an implicit
+standalone compilation. Trusted control scripts are checked out at
+`github.workflow_sha`, separately from source data.
 
-The plan records selection reasons and the actual expected shared checks.
-Documentation PRs retain an empty hardware matrix and all three ordinary shared
-checks. External requests keep their existing L0/L1/L2 policy, including the
-explicit L2 empty-selection fallback. Neither policy is substituted for the other.
+A failed-job rerun may reuse the original producer's artifact in the same run;
+the consumer still checks its exact context and hash, and rejects a future
+producer attempt. A rerun that regenerates the plan passes the new artifact name
+to its consumers. No cross-run artifact lookup is used.
 
-`plan_hash` binds the source repository/commit, comparison base and diff head,
-control-code commit, profile, configuration identity and final execution content.
-`source_sha` is the checked-out commit; `diff_head_sha` can instead be a PR head
-when CI tests GitHub's merge commit. Run, attempt, task and parent-run identifiers
-are excluded from this deterministic hash. The compact external report context
-carries the hash, while commands and large routing explanations stay in the plan
-artifact. The current report gate does not yet enforce this new hash.
+The router's selection policy is unchanged. Documentation PRs keep an empty
+hardware matrix and all ordinary shared checks. External requests retain their
+L0/L1/L2 policy and explicit L2 empty-selection fallback. Regression tests run
+conditionally when present in the tested source checkout.
 
-This first stage does not make executors consume plans or add group routing,
-report completeness gates, retries, caches, test skips or new hardware workloads.
-Those changes require separate review and real-runner acceptance. Local plan
-comparisons are not hardware validation.
+`plan_hash` binds source repository/commit, comparison base and diff head,
+control-code commit, profile, configuration identity, selection reasons and final
+execution content. `source_sha` is the checked-out commit; `diff_head_sha` may be
+the PR head when testing a merge commit. Run, attempt, task and parent IDs are
+excluded from the deterministic hash and run identity is checked separately.
+Large commands and explanations stay in the artifact, outside compact contexts.
+
+This stage binds configuration consumers to plans. The report gates remain
+separate and do not yet enforce plan hashes or independently compare every
+expected group with its execution evidence. Unified reporting and gate checks
+are a later stage. Local comparisons and simulated command runs do not replace
+real-runner acceptance.
 
 ### Functional evidence validation
 

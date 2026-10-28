@@ -110,11 +110,9 @@ def test_the_gate_can_call_the_api():
     )
 
 
-@pytest.mark.parametrize(
-    "api_timeout,optional_failure", [(False, False), (True, False), (False, True)]
-)
+@pytest.mark.parametrize("api_timeout", [False, True])
 def test_gate_reads_all_job_pages_and_bounds_optional_diagnostics(
-    monkeypatch, capsys, api_timeout, optional_failure
+    monkeypatch, capsys, api_timeout
 ):
     workflow = yaml.safe_load(CI.read_text())
     gate = workflow["jobs"]["ci-complete"]
@@ -134,7 +132,7 @@ def test_gate_reads_all_job_pages_and_bounds_optional_diagnostics(
     results["discover-platforms"]["outputs"] = {
         "platforms": '["nvidia","nvidia-boxing"]'
     }
-    if not api_timeout and not optional_failure:
+    if not api_timeout:
         results["platform-pipeline"]["result"] = "failure"
     monkeypatch.setenv("RESULTS", json.dumps(results))
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
@@ -146,12 +144,6 @@ def test_gate_reads_all_job_pages_and_bounds_optional_diagnostics(
         assert kwargs["timeout"] == 60
         if api_timeout:
             raise subprocess.TimeoutExpired(argv, 60)
-        if optional_failure:
-            return SimpleNamespace(
-                stdout=json.dumps(
-                    [{"jobs": [{"name": "Observe CI plan", "conclusion": "failure"}]}]
-                )
-            )
         return SimpleNamespace(
             stdout=json.dumps(
                 [
@@ -164,12 +156,7 @@ def test_gate_reads_all_job_pages_and_bounds_optional_diagnostics(
     monkeypatch.setattr(subprocess, "run", api)
     raw = gate["steps"][0]["run"]
     script = textwrap.dedent(raw.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0])
-    if optional_failure:
-        exec(compile(script, "CI complete", "exec"), {})
-        output = capsys.readouterr().out
-        assert "::warning::Observe CI plan: failure" in output
-        assert "::error::" not in output
-    elif api_timeout:
+    if api_timeout:
         exec(compile(script, "CI complete", "exec"), {})
         assert "::warning::could not list job conclusions" in capsys.readouterr().out
     else:

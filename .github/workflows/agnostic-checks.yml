@@ -159,7 +159,7 @@ jobs:
         if: hashFiles('tests/unit/test_flagcicd_entry.py') != ''
         run: python -m pytest tests/unit/test_flagcicd_entry.py -v --tb=short -p no:cacheprovider
 
-      - name: Run observed plan contract tests
+      - name: Run execution plan contract tests
         if: hashFiles('tests/unit/test_ci_plan_observation.py') != ''
         run: python -m pytest tests/unit/test_ci_plan_observation.py -v --tb=short -p no:cacheprovider
 

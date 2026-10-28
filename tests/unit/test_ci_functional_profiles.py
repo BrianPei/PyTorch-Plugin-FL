@@ -138,7 +138,8 @@ def test_profile_is_threaded_through_both_workflow_entries():
     integration = yaml.safe_load((workflows / "integration-tests.yml").read_text())
     assert integration["jobs"]["configuration"]["with"]["test_profile"]
     loader = (workflows / "load-platform-config.yml").read_text()
-    assert '--profile "${{ inputs.test_profile }}"' in loader
+    assert '--profile "$TEST_PROFILE"' in loader
+    assert "TEST_PROFILE: ${{ inputs.test_profile || 'pr' }}" in loader
 
 
 def test_serial_failure_records_unstarted_groups(tmp_path):
@@ -261,7 +262,7 @@ def test_cancellation_kills_the_active_command_group(tmp_path, escape):
             process.communicate()
 
 
-@pytest.mark.parametrize("profile,expected_code", [("nightly", 0), ("weekly", 2)])
+@pytest.mark.parametrize("profile,expected_code", [("nightly", 0), ("weekly", 1)])
 def test_automatic_workflow_profile_selection_before_hardware(
     tmp_path, profile, expected_code
 ):
@@ -283,9 +284,22 @@ def test_automatic_workflow_profile_selection_before_hardware(
         "BASE_SHA": "",
         "HEAD_SHA": "HEAD",
         "GITHUB_OUTPUT": str(output),
+        "SOURCE_REPOSITORY": "owner/repo",
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
     }
+    command = (
+        step["run"]
+        .replace(
+            "_ci_control/.github/scripts/flagcicd_plan.py",
+            str(ROOT / ".github/scripts/flagcicd_plan.py"),
+        )
+        .replace(
+            "--output flagcicd-plan.json", "--output " + str(tmp_path / "plan.json")
+        )
+    )
     done = subprocess.run(
-        ["bash", "-e", "-c", step["run"]],
+        ["bash", "-e", "-c", command],
         env=env,
         cwd=ROOT,
         capture_output=True,
@@ -294,9 +308,11 @@ def test_automatic_workflow_profile_selection_before_hardware(
     assert done.returncode == expected_code, done.stdout + done.stderr
     if expected_code == 0:
         known = _load_platforms(CONFIGS)
-        assert json.loads(output.read_text().split("=", 1)[1]) == _schedule(
-            known, boxing_platforms(CONFIGS, known)
-        )
+        assert json.loads(
+            dict(line.split("=", 1) for line in output.read_text().splitlines())[
+                "platforms"
+            ]
+        ) == _schedule(known, boxing_platforms(CONFIGS, known))
     else:
-        assert "weekly is reserved" in done.stdout
+        assert "weekly is reserved" in done.stderr
         assert not output.exists()

@@ -71,6 +71,16 @@ on:
         required: false
         type: string
         default: ''
+      execution_plan_artifact:
+        description: Immutable execution plan artifact for this workflow run
+        required: false
+        type: string
+        default: ''
+      execution_plan_context:
+        description: Compact execution plan identity
+        required: false
+        type: string
+        default: ''
     secrets:
       FLAGCICD_API_TOKEN:
         description: Optional token for publishing pytest results and Python coverage to FlagCICD
@@ -90,9 +100,11 @@ jobs:
     uses: ./.github/workflows/load-platform-config.yml
     with:
       platform: ${{ inputs.platform }}
-      test_profile: ${{ inputs.test_profile }}
+      test_profile: ${{ inputs.test_profile || 'pr' }}
       checkout_repository: ${{ inputs.checkout_repository }}
       checkout_ref: ${{ inputs.checkout_ref }}
+      execution_plan_artifact: ${{ inputs.execution_plan_artifact }}
+      execution_plan_context: ${{ inputs.execution_plan_context }}
 
   integration-tests:
     name: Build and test (${{ needs.configuration.outputs.display_name }})
