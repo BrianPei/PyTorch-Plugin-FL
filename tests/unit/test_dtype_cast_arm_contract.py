@@ -82,3 +82,32 @@ def test_cmake_defines_the_probe_from_libtorch_cuda():
     assert "torch_cpu_library" in probe_block, (
         "the probe must resolve the directory of the torch it actually links"
     )
+
+
+@pytest.mark.anyplatform
+def test_copy_arm_boxes_instead_of_going_host():
+    """Pin the `copy_` arm in the source, so this runs without a device.
+
+    The regression: the non-boxing arm called `strided_copy_cast_via_cpu`
+    unconditionally, on the premise that the wheel has no native CUDA copy
+    kernel. It has one -- `DeviceBoxingGuard` reaches it, and the boxing
+    kernels are not involved.
+    """
+    src = COPY_OPS.read_text()
+    # The flagos -> flagos branch of _copy_from, told apart from its
+    # device <-> host siblings by the fast-path comment above it.
+    marker = "// Fast path: both contiguous, same shape and dtype"
+    branch = src.find(marker)
+    assert branch != -1, "the same-device copy fast path is gone"
+    start = src.find("// CUDA platform without the boxing kernels", branch)
+    assert start != -1, "the non-boxing copy arm is gone"
+    end = src.find("#endif", start)
+    assert end != -1, "the non-boxing copy arm is unterminated"
+    tail = src[start:end]
+    assert "DeviceBoxingGuard guard(self, dst);" in tail, (
+        "the non-boxing copy_ arm no longer boxes to CUDA, so a "
+        "strided or dtype-changing copy is a host round trip again"
+    )
+    assert "strided_copy_cast_via_cpu(self, dst);" in tail, (
+        "the unsigned-dtype escape hatch is missing from the arm"
+    )

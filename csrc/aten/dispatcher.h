@@ -581,6 +581,7 @@ class Dispatcher {
       case Backend::kIluvatar:      name = "iluvatar"; break;
       case Backend::kTileOps:       name = "tileops"; break;
       case Backend::kApple:         name = "mps"; break;
+      case Backend::kDrobotics:     name = "drobotics"; break;
       case Backend::kNone:          name = "none"; break;
       default:                      name = "unknown"; break;
     }

@@ -62,6 +62,7 @@ LOGGED_AS = {
     "tsingmicro": "tsingmicro",
     "kunlunxin": "kunlunxin",
     "iluvatar": "iluvatar",
+    "drobotics": "drobotics",
     "tileops": "tileops",
     "none": "none",
 }
