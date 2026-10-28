@@ -117,6 +117,7 @@ def build_plan(request, contract, source, changed):
     plan = {
         "schema_version": "flagcicd.plan/v1",
         **request,
+        "entry": "flagcicd",
         "profile": profile,
         "test_level": level,
         "scope": contract["levels"][level]["scope"],
@@ -178,7 +179,13 @@ def build_ci_plan(
             "platforms": selected,
             "expected_platforms": selected,
             "validated_platforms": selected,
-            "expected_shared_checks": ["lint", "agnostic-checks", "codegen-checks"],
+            "expected_shared_checks": [
+                "resolve-checkout",
+                "lint",
+                "agnostic-checks",
+                "codegen-checks",
+                "discover-platforms",
+            ],
             "selection_reasons": reasons,
         },
         contract,

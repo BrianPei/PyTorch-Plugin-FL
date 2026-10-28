@@ -173,7 +173,6 @@ jobs:
       test_profile: ${{ needs.plan.outputs.profile }}
       checkout_repository: ${{ needs.plan.outputs.source_repository }}
       checkout_ref: ${{ needs.plan.outputs.source_sha }}
-      flagcicd_plan: ${{ needs.plan.outputs.context }}
       execution_plan_artifact: ${{ needs.plan.outputs.plan_artifact || 'missing-required-execution-plan' }}
       execution_plan_context: ${{ needs.plan.outputs.context }}
 
@@ -189,6 +188,12 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Download execution plan
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ needs.plan.outputs.plan_artifact || 'missing-required-execution-plan' }}
+          path: execution-plan
       - name: Download platform outcomes
         uses: actions/download-artifact@v4
         continue-on-error: true
@@ -201,6 +206,7 @@ jobs:
           JOB_RESULTS: ${{ toJSON(needs) }}
         run: >-
           python .github/scripts/flagcicd_report.py summary
+          --plan-file execution-plan/flagcicd-plan.json
           --directory platform-reports --output flagcicd-run-summary.json
       - name: Retain run summary
         if: always()

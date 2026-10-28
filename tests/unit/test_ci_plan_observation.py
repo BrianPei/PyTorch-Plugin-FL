@@ -162,9 +162,11 @@ def test_observation_preserves_the_router_matrix(
     assert plan["expected_platforms"] == expected
     assert plan["selection_reasons"][-1]["kind"] == reason
     assert plan["expected_shared_checks"] == [
+        "resolve-checkout",
         "lint",
         "agnostic-checks",
         "codegen-checks",
+        "discover-platforms",
     ]
 
 
@@ -720,7 +722,8 @@ def test_both_entries_forward_one_plan_to_the_shared_configuration_consumer():
         inputs["execution_plan_artifact"]
         == "${{ needs.plan.outputs.plan_artifact || 'missing-required-execution-plan' }}"
     )
-    assert inputs["execution_plan_context"] == inputs["flagcicd_plan"]
+    assert inputs["execution_plan_context"] == "${{ needs.plan.outputs.context }}"
+    assert "flagcicd_plan" not in inputs
     integration = yaml.safe_load(
         (ROOT / ".github/workflows/integration-tests.yml").read_text()
     )["jobs"]

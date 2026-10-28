@@ -32,7 +32,11 @@ SPEC = importlib.util.spec_from_file_location(
     "merge_reports", SCRIPTS / "merge_pytest_reports.py"
 )
 MERGER = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MERGER)
+sys.path.insert(0, str(SCRIPTS))
+try:
+    SPEC.loader.exec_module(MERGER)
+finally:
+    sys.path.pop(0)
 PYTHON = shlex.quote(sys.executable)
 
 

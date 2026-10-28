@@ -14,10 +14,12 @@
 
 """Test real request planning, stage verdicts, missing reports and reruns."""
 
+import copy
 import importlib.util
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +46,7 @@ def load(name):
 PLANNER = load("flagcicd_plan")
 RESOLVER = load("flagcicd_resolve")
 REPORTER = load("flagcicd_report")
+MERGER = load("merge_pytest_reports")
 CONTRACT = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
 SHA = "a" * 40
 
@@ -61,16 +64,61 @@ def request(**overrides):
     }
 
 
+CONTROL_SHA = subprocess.check_output(
+    ["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True
+).strip()
+
+
 def plan(level="L2", platforms=None):
-    return {
+    expected = platforms if platforms is not None else ["nvidia"]
+    result = {
         **request(),
+        "schema_version": "flagcicd.plan/v1",
+        "entry": "flagcicd",
+        "control_sha": CONTROL_SHA,
+        "diff_head_sha": SHA,
+        "profile": "pr",
         "test_level": level,
         "scope": CONTRACT["levels"][level]["scope"],
         "config_hash": "c" * 64,
         "risk_level": "R2",
+        "risk_rule_version": "v1",
         "run_id": "42",
-        "expected_platforms": platforms if platforms is not None else ["nvidia"],
+        "run_attempt": "1",
+        "selection_reasons": [],
+        "platforms": expected,
+        "expected_platforms": expected,
+        "expected_shared_checks": ["plan", "lint"]
+        + ([] if level == "L0" else ["agnostic", "codegen"]),
+        "execution_plan": [
+            {
+                "name": lane,
+                "groups": [
+                    {
+                        "name": "smoke",
+                        "group_id": "smoke",
+                        "manifest_id": "smoke",
+                        "command": "python -m pytest demo.py",
+                        "environment": {},
+                        "min_passed": 0,
+                    }
+                ],
+            }
+            for lane in expected
+        ],
     }
+    for lane in result["execution_plan"]:
+        lane["groups"].append(
+            {
+                "name": "environment",
+                "group_id": "environment",
+                "manifest_id": "environment",
+                "command": "true",
+                "environment": {},
+            }
+        )
+    result["plan_hash"] = PLANNER.plan_hash(result)
+    return result
 
 
 @pytest.mark.parametrize(
@@ -239,9 +287,46 @@ def jobs(result="success", **stages):
     }
 
 
-def raw_reports(tmp_path, source=SHA, complete=True):
+def raw_reports(tmp_path, source=SHA, complete=True, current=None):
     directory = tmp_path / "pytest"
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
+    current = current or plan()
+    group = {
+        **current["execution_plan"][0]["groups"][0],
+        "status": "passed",
+        "returncode": 0,
+        "requires_pytest": True,
+    }
+    execution = {
+        "expected": [g["name"] for g in current["execution_plan"][0]["groups"]],
+        "groups": [
+            group,
+            {
+                **current["execution_plan"][0]["groups"][1],
+                "status": "passed",
+                "returncode": 0,
+                "requires_pytest": False,
+            },
+        ],
+        "context": current,
+        "environment": {},
+        "platform": "nvidia",
+        "run_attempt": 1,
+    }
+    sessions = [
+        {
+            "report": "session.json",
+            "group": "smoke",
+            "group_id": "smoke",
+            "context": current,
+            "platform": "nvidia",
+            "run_attempt": 1,
+            "selected_nodeids": ["demo.py::test_ok"],
+            "observed_nodeids": ["demo.py::test_ok"],
+            "exitcode": 0,
+            "summary": {"total": 1, "passed": 1},
+        }
+    ]
     (directory / "pytest-nvidia.json").write_text(
         json.dumps(
             {
@@ -250,6 +335,8 @@ def raw_reports(tmp_path, source=SHA, complete=True):
                     "source_repository": "flagos-ai/Torch-FL",
                     "source_ref": source,
                     "complete": complete,
+                    "execution": execution,
+                    "sessions": sessions,
                 },
                 "exitcode": 0,
                 "summary": {"total": 1, "passed": 1},
@@ -315,15 +402,10 @@ def entry_jobs(level="L2"):
 
 
 def save_report(tmp_path, status="passed", attempt=1, **changes):
-    report = {
-        "schema_version": REPORTER.SCHEMA,
-        "report_type": "platform",
-        **REPORTER.identity(plan()),
-        "run_attempt": attempt,
-        "platform": {"name": "nvidia"},
-        "status": status,
-        **changes,
-    }
+    raw = tmp_path / f"raw-{attempt}"
+    raw_reports(raw)
+    report = REPORTER.platform_report(plan(), "nvidia", jobs(), raw, attempt)
+    report.update(status=status, **changes)
     path = tmp_path / f"flagcicd-platform-nvidia-{attempt}.json"
     path.write_text(json.dumps(report))
     return path
@@ -455,6 +537,8 @@ def test_coverage_is_per_platform_and_partial_data_is_unavailable(
                 "source_ref": SHA,
                 "platform": "nvidia",
                 "complete": complete,
+                "context": plan(),
+                "run_attempt": 1,
             }
         )
     )
@@ -565,8 +649,11 @@ def test_report_clis_retain_failed_execution_and_summary(tmp_path):
     raw = tmp_path / "raw"
     raw.mkdir()
     output = tmp_path / "flagcicd-platform-cuda.json"
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan()))
     env = {
         **os.environ,
+        "CI_PLAN_FILE": str(plan_path),
         "FLAGCICD_PLAN": json.dumps(plan()),
         "JOB_RESULTS": json.dumps(jobs("failure", build="failure", tests="skipped")),
         "GITHUB_RUN_ID": "42",
@@ -835,8 +922,388 @@ def test_workflow_stage_recorder_and_platform_report_use_the_same_contract(tmp_p
     assert set(json.loads(values["stages"])) == set(REPORTER.REQUIRED_STAGES)
     assert values["run_attempt"] == "3"
     raw_reports(tmp_path)
+    path = tmp_path / "pytest/pytest-nvidia.json"
+    payload = json.loads(path.read_text())
+    payload["flagcicd"]["execution"]["run_attempt"] = 3
+    for session in payload["flagcicd"]["sessions"]:
+        session["run_attempt"] = 3
+    path.write_text(json.dumps(payload))
+
     actual = jobs()
     actual["integration-tests"]["outputs"] = values
     report = REPORTER.platform_report(plan(), "nvidia", actual, tmp_path, 3)
     assert report["status"] == "passed"
     assert report["execution_attempt"] == "3"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "duplicate",
+        "extra",
+        "order",
+        "command",
+        "environment",
+        "min_passed",
+        "requires_pytest",
+        "not_run",
+        "bad_exit",
+        "wrong_sha",
+        "wrong_control",
+        "wrong_plan",
+        "missing_session",
+        "duplicate_session",
+        "extra_session",
+        "wrong_session_plan",
+        "wrong_session_attempt",
+        "missing_session_id",
+        "shared_environment",
+        "missing_inventory",
+        "zero_collection",
+        "bad_counts",
+        "all_skipped",
+    ],
+)
+def test_planned_group_evidence_is_checked_by_platform_and_summary(tmp_path, change):
+    current = plan()
+    raw_reports(tmp_path)
+    good = REPORTER.platform_report(current, "nvidia", jobs(), tmp_path, 1)
+    assert good["status"] == "passed"
+    path = tmp_path / "pytest/pytest-nvidia.json"
+    payload = json.loads(path.read_text())
+    evidence = payload["flagcicd"]
+    execution, sessions = evidence["execution"], evidence["sessions"]
+    group = execution["groups"][0]
+    if change == "missing":
+        execution["groups"].pop()
+    elif change == "duplicate":
+        execution["groups"].append(copy.deepcopy(group))
+    elif change == "extra":
+        execution["groups"].append({**group, "name": "extra", "group_id": "extra"})
+    elif change == "order":
+        execution["groups"].reverse()
+    elif change == "command":
+        group["command"] = "true"
+    elif change == "environment":
+        group["environment"] = {"OTHER": "value"}
+    elif change == "min_passed":
+        group["min_passed"] = 1
+    elif change == "requires_pytest":
+        group["requires_pytest"] = False
+    elif change == "not_run":
+        group["status"] = "not_run"
+    elif change == "bad_exit":
+        group["returncode"] = 7
+    elif change == "wrong_sha":
+        execution["context"]["source_sha"] = "d" * 40
+    elif change == "wrong_control":
+        execution["context"]["control_sha"] = "d" * 40
+    elif change == "wrong_plan":
+        execution["context"]["plan_hash"] = "d" * 64
+    elif change == "missing_session":
+        sessions.clear()
+    elif change == "duplicate_session":
+        sessions.append(copy.deepcopy(sessions[0]))
+    elif change == "extra_session":
+        sessions.append({**sessions[0], "report": "extra.json", "group_id": "unknown"})
+    elif change == "wrong_session_plan":
+        sessions[0]["context"]["plan_hash"] = "d" * 64
+    elif change == "wrong_session_attempt":
+        sessions[0]["run_attempt"] = 2
+    elif change == "missing_session_id":
+        sessions[0].pop("group_id")
+    elif change == "shared_environment":
+        execution["environment"] = {"MODEL_PATH": "/other"}
+    elif change == "missing_inventory":
+        sessions[0].pop("selected_nodeids")
+    elif change == "zero_collection":
+        sessions[0]["selected_nodeids"] = sessions[0]["observed_nodeids"] = []
+    elif change == "bad_counts":
+        sessions[0]["summary"] = {"total": 1, "passed": 0}
+    elif change == "all_skipped":
+        sessions[0]["summary"] = {"total": 1, "skipped": 1}
+    # Keep the self-reported inventory internally consistent; only the plan
+    # supplies the independent expected group list.
+    execution["expected"] = [g["name"] for g in execution["groups"]]
+    path.write_text(json.dumps(payload))
+    result = REPORTER.platform_report(current, "nvidia", jobs(), tmp_path, 1)
+    assert result["status"] == "report_error", result
+    good["evidence"] = {"execution": execution, "sessions": sessions}
+    (tmp_path / "flagcicd-platform-tampered.json").write_text(json.dumps(good))
+    summary = REPORTER.aggregate(current, entry_jobs(), tmp_path, 1)
+    assert summary["status"] != "passed", summary
+
+
+@pytest.mark.parametrize("declared,expected", [("1", "passed"), ("2", "report_error")])
+def test_report_only_rerun_can_reuse_evidence_but_hardware_rerun_cannot(
+    tmp_path, declared, expected
+):
+    raw_reports(tmp_path)
+    results = jobs()
+    results["integration-tests"]["outputs"]["run_attempt"] = declared
+    report = REPORTER.platform_report(plan(), "nvidia", results, tmp_path, 2)
+    assert report["status"] == expected
+
+
+@pytest.mark.parametrize("entry", ["ci", "flagcicd"])
+@pytest.mark.parametrize(
+    "scenario", ["conditional_skip", "required_skip", "all_skipped"]
+)
+def test_real_execution_through_both_workflow_gates(tmp_path, entry, scenario):
+    current = plan()
+    current.update(source_sha=CONTROL_SHA, diff_head_sha=CONTROL_SHA, entry=entry)
+    if entry == "ci":
+        current["expected_shared_checks"] = [
+            "resolve-checkout",
+            "lint",
+            "agnostic-checks",
+            "codegen-checks",
+            "discover-platforms",
+        ]
+        results = {
+            name: {"result": "success"}
+            for name in [*current["expected_shared_checks"], "platform-pipeline"]
+        }
+    else:
+        results = entry_jobs()
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "test_required.py").write_text(
+        "def test_required(): pass\n"
+        if scenario == "conditional_skip"
+        else "import pytest\n@pytest.mark.skip(reason='capability unavailable')\ndef test_required(): pass\n"
+    )
+    (suite / "test_conditional.py").write_text(
+        "import pytest\n@pytest.mark.skip(reason='capability unavailable')\ndef test_conditional(): pass\n"
+    )
+    current["execution_plan"][0]["groups"] = [
+        {
+            "group_id": "required",
+            "manifest_id": "required",
+            "name": "required",
+            "command": shlex.join(
+                [sys.executable, "-m", "pytest", str(suite / "test_required.py"), "-q"]
+            ),
+            "min_passed": 0 if scenario == "all_skipped" else 1,
+        },
+        {
+            "group_id": "conditional",
+            "manifest_id": "conditional",
+            "name": "conditional",
+            "command": shlex.join(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    str(suite / "test_conditional.py"),
+                    "-q",
+                ]
+            ),
+        },
+    ]
+    current["plan_hash"] = PLANNER.plan_hash(current)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(current))
+    raw = tmp_path / "raw"
+    directory = raw / "pytest"
+    env = {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+        "CI_PLAN_CONTEXT": PLANNER.report_context(current),
+        "REPORT_PLATFORM": "nvidia",
+        "FLAGCICD_REPORT_DIR": str(directory),
+        "INTEGRATION_TESTS": json.dumps(current["execution_plan"][0]["groups"]),
+        "INTEGRATION_ENVIRONMENT": "{}",
+        "INTEGRATION_WORKDIR": str(suite),
+        "PYTHONPATH": str(SCRIPTS / "pytest_reporting"),
+        "PYTEST_PLUGINS": "flagcicd_report",
+        "PYTEST_ADDOPTS": "",
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GH_TOKEN": "",
+    }
+    run = subprocess.run(
+        [sys.executable, str(SCRIPTS / "run_integration_tests.py")],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (run.returncode == 0) == (scenario != "required_skip"), (
+        run.stdout + run.stderr
+    )
+    merged = MERGER.merge_reports(
+        directory,
+        "nvidia",
+        "success" if run.returncode == 0 else "failure",
+        current["source_repository"],
+        current["source_sha"],
+        True,
+    )
+    (directory / "pytest-nvidia.json").write_text(json.dumps(merged))
+    platform_jobs = jobs() if run.returncode == 0 else jobs("failure", tests="failure")
+    report = REPORTER.platform_report(current, "nvidia", platform_jobs, raw, 1)
+    assert (report["status"] == "passed") == (scenario == "conditional_skip"), report
+    if scenario == "conditional_skip":
+        assert report["groups"][1]["summary"]["skipped"] == 1
+        assert report["groups"][0]["summary"]["passed"] == 1
+    elif scenario == "required_skip":
+        assert [group["status"] for group in report["groups"]] == ["failed", "not_run"]
+        results["platform-pipeline" if entry == "ci" else "platforms"]["result"] = (
+            "failure"
+        )
+    else:
+        results["platform-pipeline" if entry == "ci" else "platforms"]["result"] = (
+            "failure"
+        )
+    reports = tmp_path / "platform-reports"
+    reports.mkdir()
+    (reports / "flagcicd-platform-nvidia.json").write_text(json.dumps(report))
+    workflow = yaml.safe_load(
+        (
+            ROOT
+            / ".github/workflows"
+            / ("ci.yml" if entry == "ci" else "flagcicd-entry.yml")
+        ).read_text()
+    )
+    gate = workflow["jobs"]["ci-complete" if entry == "ci" else "complete"]
+    command = next(
+        s["run"]
+        for s in gate["steps"]
+        if "flagcicd_report.py summary" in s.get("run", "")
+    )
+    summary_path = tmp_path / "summary.json"
+    command = (
+        command.replace(
+            "--plan-file execution-plan/flagcicd-plan.json",
+            "--plan-file " + shlex.quote(str(plan_path)),
+        )
+        .replace(
+            "--directory platform-reports", "--directory " + shlex.quote(str(reports))
+        )
+        .replace(
+            "--output flagcicd-run-summary.json",
+            "--output " + shlex.quote(str(summary_path)),
+        )
+    )
+    env.update(
+        FLAGCICD_PLAN=PLANNER.report_context(current), JOB_RESULTS=json.dumps(results)
+    )
+    gate_run = subprocess.run(
+        ["bash", "-e", "-c", command],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert (gate_run.returncode == 0) == (scenario == "conditional_skip"), (
+        gate_run.stdout + gate_run.stderr
+    )
+    summary = json.loads(summary_path.read_text())
+    assert summary["plan_hash"] == current["plan_hash"]
+    assert summary["control_sha"] == current["control_sha"]
+    assert (
+        summary["children"][0]["evidence"]["execution"]["groups"][0]["group_id"]
+        == "required"
+    )
+
+
+@pytest.mark.parametrize(
+    "allowed,code,expected",
+    [
+        (True, 139, "passed"),
+        (False, 139, "report_error"),
+        (True, 7, "report_error"),
+        (True, 0, "passed"),
+    ],
+)
+def test_group_evidence_preserves_only_explicit_teardown_tolerance(
+    tmp_path, allowed, code, expected
+):
+    current = plan()
+    if allowed:
+        current["execution_plan"][0]["groups"][0]["environment"] = {
+            "INTEGRATION_ALLOW_TEARDOWN_CRASH": "1"
+        }
+    current["plan_hash"] = PLANNER.plan_hash(current)
+    raw_reports(tmp_path, current=current)
+    path = tmp_path / "pytest/pytest-nvidia.json"
+    payload = json.loads(path.read_text())
+    group = payload["flagcicd"]["execution"]["groups"][0]
+    group.update(returncode=code, teardown_tolerated=code != 0)
+    path.write_text(json.dumps(payload))
+    report = REPORTER.platform_report(current, "nvidia", jobs(), tmp_path, 1)
+    assert report["status"] == expected, report
+
+
+def test_boxing_cannot_borrow_the_default_lanes_evidence(tmp_path):
+    current = plan(platforms=["nvidia", "nvidia-boxing"])
+    raw_reports(tmp_path, current=current)
+    path = tmp_path / "pytest/pytest-nvidia.json"
+    payload = json.loads(path.read_text())
+    payload["flagcicd"]["platform"] = "nvidia-boxing"
+    (path.parent / "pytest-nvidia-boxing.json").write_text(json.dumps(payload))
+    report = REPORTER.platform_report(current, "nvidia-boxing", jobs(), tmp_path, 1)
+    assert report["status"] == "report_error"
+    assert any("lane" in error for error in report["errors"])
+
+
+def test_passing_label_cannot_hide_report_errors(tmp_path):
+    path = save_report(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["errors"] = ["functional evidence is incomplete"]
+    path.write_text(json.dumps(payload))
+    assert (
+        REPORTER.aggregate(plan(), entry_jobs(), tmp_path, 1)["status"]
+        == "report_error"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value", [("execution", []), ("sessions", [None]), ("sessions", {})]
+)
+def test_malformed_evidence_retains_a_failing_platform_outcome(tmp_path, field, value):
+    raw_reports(tmp_path)
+    path = tmp_path / "pytest/pytest-nvidia.json"
+    payload = json.loads(path.read_text())
+    payload["flagcicd"][field] = value
+    path.write_text(json.dumps(payload))
+    report = REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 1)
+    assert report["status"] == "report_error"
+    assert report["errors"]
+
+
+def test_stale_coverage_is_optional_and_does_not_replace_functional_evidence(tmp_path):
+    raw_reports(tmp_path)
+    coverage = tmp_path / "coverage"
+    coverage.mkdir()
+    (coverage / "coverage-nvidia.json").write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "covered_lines": 1,
+                    "num_statements": 2,
+                    "percent_covered": 50.0,
+                }
+            }
+        )
+    )
+    (coverage / "metadata.json").write_text(
+        json.dumps(
+            {
+                "source_repository": plan()["source_repository"],
+                "source_ref": SHA,
+                "platform": "nvidia",
+                "context": plan(),
+                "complete": True,
+                "run_attempt": 2,
+            }
+        )
+    )
+    report = REPORTER.platform_report(plan(), "nvidia", jobs(), tmp_path, 2)
+    assert report["status"] == "passed"
+    assert report["metrics"]["coverage"]["available"] is False
+    assert report["coverage_warnings"]

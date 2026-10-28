@@ -160,6 +160,7 @@ def plan_hash(plan):
     """Hash deterministic identity and final content, excluding run/task IDs."""
     fields = (
         "schema_version",
+        "entry",
         "source_repository",
         "source_sha",
         "control_sha",
@@ -180,8 +181,10 @@ def plan_hash(plan):
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def consume_plan(plan, context, lane, profile, source_sha):
-    """Never recompose a planned lane or fall back after invalid evidence."""
+def verify_plan(plan, context):
+    """Bind an artifact to its producer context and the current workflow run."""
+    if not isinstance(plan, dict) or not isinstance(context, dict):
+        raise ValueError("plan and context must be objects")
     if plan.get("schema_version") != "flagcicd.plan/v1" or plan.get("observation_only"):
         raise ValueError("an executable plan is required")
     if plan_hash(plan) != plan.get("plan_hash"):
@@ -197,12 +200,19 @@ def consume_plan(plan, context, lane, profile, source_sha):
     ):
         if not context.get(key) or str(context[key]) != str(plan.get(key)):
             raise ValueError(f"plan context mismatch: {key}")
-    if profile != plan["profile"] or source_sha != plan["source_sha"]:
-        raise ValueError("plan profile or checked-out source SHA differs")
+    if any(key not in plan or value != plan[key] for key, value in context.items()):
+        raise ValueError("plan context content differs from the artifact")
     if str(plan["run_id"]) != os.environ.get("GITHUB_RUN_ID"):
         raise ValueError("plan does not belong to current GITHUB_RUN_ID")
     if not 1 <= int(plan["run_attempt"]) <= int(os.environ["GITHUB_RUN_ATTEMPT"]):
         raise ValueError("plan attempt is not available in this run")
+
+
+def consume_plan(plan, context, lane, profile, source_sha):
+    """Never recompose a planned lane or fall back after invalid evidence."""
+    verify_plan(plan, context)
+    if profile != plan["profile"] or source_sha != plan["source_sha"]:
+        raise ValueError("plan profile or checked-out source SHA differs")
     lanes = plan["execution_plan"]
     names = [item["name"] for item in lanes]
     if names != plan["expected_platforms"] or len(names) != len(set(names)):

@@ -15,7 +15,6 @@
 """Keep matrix routing, checkout source and the required gate in agreement."""
 
 import json
-import os
 import shlex
 import subprocess
 import sys
@@ -32,6 +31,36 @@ PLATFORMS = sorted(
     for path in CONFIGS.glob("*.yml")
     if path.stem not in {"template", "image_sources", "platforms"}
 )
+
+
+sys.path.insert(0, str(ROOT / ".github/scripts"))
+try:
+    import flagcicd_plan as PLANNER
+    import flagcicd_report as REPORTER
+finally:
+    sys.path.pop(0)
+
+
+def gate_plan(selected=False):
+    request = {
+        "source_repository": "owner/fork",
+        "source_sha": "a" * 40,
+        "control_sha": "c" * 40,
+        "base_sha": "b" * 40,
+        "task_id": "",
+        "parent_run_id": "",
+        "run_id": "42",
+        "run_attempt": "1",
+    }
+    contract = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
+    return PLANNER.build_ci_plan(
+        request,
+        contract,
+        ROOT,
+        ["README.md"],
+        "workflow_dispatch" if selected else "pull_request",
+        dispatch=PLATFORMS[0] if selected else "",
+    )
 
 
 def _shared_test_files(workflow):
@@ -172,24 +201,18 @@ def test_dispatch_can_select_each_platform(platform):
 
 @pytest.mark.parametrize("selected", [True, False])
 @pytest.mark.parametrize("result", ["success", "skipped", "failure", "cancelled"])
-def test_required_gate_checks_platform_result(selected, result):
+def test_required_gate_checks_platform_result(tmp_path, selected, result):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
     results = {name: {"result": "success"} for name in gate["needs"]}
-    results["discover-platforms"]["outputs"] = {
-        "platforms": json.dumps(PLATFORMS[:1] if selected else [])
-    }
     results["platform-pipeline"]["result"] = result
-    process = subprocess.run(
-        ["bash", "-e", "-c", gate["steps"][0]["run"]],
-        env={**os.environ, "RESULTS": json.dumps(results)},
-        capture_output=True,
-        text=True,
+    report = REPORTER.aggregate(gate_plan(selected), results, tmp_path, 1)
+    assert (report["status"] == "passed") == (
+        not selected and result in ("success", "skipped")
     )
-    assert (process.returncode == 0) == (
-        result == "success" or (not selected and result == "skipped")
-    )
-    if process.returncode:
-        assert f"platform-pipeline: {result}" in process.stdout
+    if selected and result == "success":
+        assert any("missing platform report" in e for e in report["errors"])
+    elif result not in ("success", "skipped") or (selected and result == "skipped"):
+        assert any("platform-pipeline:" in e for e in report["errors"])
 
 
 @pytest.mark.parametrize(
@@ -202,19 +225,13 @@ def test_required_gate_checks_platform_result(selected, result):
         "discover-platforms",
     ],
 )
-def test_required_gate_rejects_skipped_shared_checks(name):
+def test_required_gate_rejects_skipped_shared_checks(tmp_path, name):
     gate = _workflow("ci.yml")["jobs"]["ci-complete"]
     results = {job: {"result": "success"} for job in gate["needs"]}
-    results["discover-platforms"]["outputs"] = {"platforms": "[]"}
     results[name]["result"] = "skipped"
-    process = subprocess.run(
-        ["bash", "-e", "-c", gate["steps"][0]["run"]],
-        env={**os.environ, "RESULTS": json.dumps(results)},
-        capture_output=True,
-        text=True,
-    )
-    assert process.returncode == 1
-    assert f"{name}: skipped" in process.stdout
+    report = REPORTER.aggregate(gate_plan(), results, tmp_path, 1)
+    assert report["status"] != "passed"
+    assert any(name + ":" in e and "skipped" in e for e in report["errors"])
 
 
 def _container_expression(name):

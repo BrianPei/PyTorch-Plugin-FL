@@ -330,6 +330,13 @@ def run_command(command, test_environment, workdir):
     return (124 if timed_out.is_set() else returncode), "".join(lines)
 
 
+def requires_pytest(command):
+    return any(
+        Path(word).name in ("pytest", "run_unit_tests.py")
+        for word in shlex.split(command)
+    )
+
+
 def main():
     args = parse_args()
     tests, environment = load_configuration(args.allow_empty)
@@ -347,22 +354,38 @@ def main():
             "name": test["name"],
             "command": test["command"],
             "status": "not_run",
-            "requires_pytest": any(
-                Path(word).name in ("pytest", "run_unit_tests.py")
-                for word in shlex.split(test["command"])
-            ),
+            "group_id": test.get("group_id", test.get("manifest_id", test["name"])),
+            "environment": test.get("environment", {}),
+            "requires_pytest": requires_pytest(test["command"]),
             "min_passed": test.get("min_passed", 0),
         }
         for test in tests
     ]
     report_dir = command_environment.get("FLAGCICD_REPORT_DIR")
+    context = json.loads(os.environ.get("CI_PLAN_CONTEXT") or "{}")
+    if context:
+        source = Path(__file__).resolve().parents[2]
+        sha = subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+        ).strip()
+        if sha != context["source_sha"] or context["run_id"] != os.environ.get(
+            "GITHUB_RUN_ID"
+        ):
+            raise SystemExit("execution source or run differs from the plan")
 
     def save_execution():
         if report_dir:
             Path(report_dir).mkdir(parents=True, exist_ok=True)
             Path(report_dir, "groups.json").write_text(
                 json.dumps(
-                    {"expected": [r["name"] for r in records], "groups": records}
+                    {
+                        "expected": [r["name"] for r in records],
+                        "groups": records,
+                        "context": context,
+                        "environment": environment,
+                        "platform": os.environ.get("REPORT_PLATFORM", ""),
+                        "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
+                    }
                 )
             )
 
@@ -377,6 +400,7 @@ def main():
             test_environment[key] = os.path.expandvars(value)
         if test_environment.get("FLAGCICD_REPORT_DIR"):
             test_environment["FLAGCICD_TEST_GROUP"] = test["name"]
+            test_environment["FLAGCICD_GROUP_ID"] = records[index - 1]["group_id"]
         record = records[index - 1]
         record.update(status="running", started_at=time.time())
         save_execution()
@@ -419,6 +443,7 @@ def main():
         record.update(
             status="passed" if ok else "failed",
             returncode=returncode,
+            teardown_tolerated=bool(tolerated and ok),
             finished_at=time.time(),
         )
         save_execution()

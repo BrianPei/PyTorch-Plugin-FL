@@ -199,7 +199,15 @@ def test_incomplete_or_empty_evidence_cannot_pass(tmp_path, missing):
     (tmp_path / "session.json").write_text(json.dumps(report))
     groups = {
         "expected": ["smoke"],
-        "groups": [{"name": "smoke", "status": "passed", "requires_pytest": True}],
+        "groups": [
+            {
+                "name": "smoke",
+                "command": "python -m pytest demo.py",
+                "status": "passed",
+                "returncode": 0,
+                "requires_pytest": True,
+            }
+        ],
     }
     (tmp_path / "groups.json").write_text(json.dumps(groups))
     assert merge_reports(tmp_path, "mthreads", "success", "repo", "sha", True)[

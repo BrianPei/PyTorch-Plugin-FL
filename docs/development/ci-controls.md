@@ -186,22 +186,65 @@ the PR head when testing a merge commit. Run, attempt, task and parent IDs are
 excluded from the deterministic hash and run identity is checked separately.
 Large commands and explanations stay in the artifact, outside compact contexts.
 
-This stage binds configuration consumers to plans. The report gates remain
-separate and do not yet enforce plan hashes or independently compare every
-expected group with its execution evidence. Unified reporting and gate checks
-are a later stage. Local comparisons and simulated command runs do not replace
-real-runner acceptance.
+### Planned evidence and one gate
 
-### Functional evidence validation
+Both entries pass one `execution_plan_context` to the shared integration
+workflow. The executor records stable group IDs, configured shared/group
+environments, commands, outcomes and the producer's context in `groups.json`.
+The pytest plugin records the same group, lane and context for each session;
+it removes these reporting settings from the pytest process environment so
+nested fixtures cannot pollute the parent lane's evidence.
 
-The pytest merger, the ordinary hardware evidence check and the external platform
-reporter share `validate_pytest_result`. Successful outer commands cannot hide a
-nonzero pytest session exit code or failed/error counts. Conditional skipped
-sessions remain valid when other functional tests passed; existing explicit
-teardown-crash handling remains separate from assertion failures.
+The existing merger retains selected and observed node inventories. Its shared
+`validate_execution` validator checks exact group IDs and order, commands,
+environments, pytest requirements, command outcomes, session identities and
+counts. The CPU platform reporter supplies the independently generated planned
+group list to that same validator. A self-consistent execution inventory cannot
+hide a group omitted from the plan's required execution.
 
-The ordinary gate reads paginated job diagnostics as a JSON array, with a bounded
-API query. Optional diagnostic failures do not replace the required job verdicts.
+`flagcicd_report.py` now handles both `CI complete` and `FlagCICD complete`.
+Each gate downloads the exact full plan and platform outcomes, validates the
+artifact against its compact context/current run/trusted control commit, then
+checks the plan's `expected_shared_checks` and expected lanes. Report identities
+include `plan_hash`, `control_sha`, source SHA, run, profile and configuration
+hash. The summary rechecks each passing child's group/session evidence instead
+of trusting its `passed` label. Missing, duplicate or extra lanes/groups,
+modified commands/environments, missing sessions, zero collection, contradictory
+counts and wrong identities cannot pass. Failed and unstarted groups remain in
+the layered outcome alongside their raw execution evidence.
+
+A report-only rerun may reference an earlier successful hardware attempt. The
+execution attempt must equal the hardware job's recorded output, while the
+report attempt can be newer. A rerun of the hardware job cannot borrow old
+execution evidence. The summary retains the latest matching report per lane,
+allowing unaffected lanes from earlier attempts of the same plan to remain
+valid. Stale reports from another plan never supply missing current lanes.
+
+### Functional evidence and conditional skips
+
+Successful wrappers cannot hide failed pytest sessions or failed/error counts.
+The existing manifest `min_passed` is enforced per group. Groups without a
+positive minimum retain their existing test-level capability/route skip rules:
+a nonempty, fully accounted-for skipped session can be valid when another group
+passed functional tests. Missing sessions and zero collection are not skips;
+an entirely skipped lane cannot pass. No blanket per-group minimum, new skip
+exemptions or workload exclusions are introduced. Existing explicit vendor
+teardown tolerance still requires clean pytest evidence and a permitted fatal
+signal; assertion failures cannot use it.
+
+Coverage remains optional, per platform, and bound to the same plan context.
+Incomplete or mismatched coverage is unavailable with a warning. Backend upload
+failures do not replace the functional result; missing functional proof does.
+The ordinary entry retains bounded paginated job diagnostics in the shared
+reporter; failure to fetch optional diagnostics cannot change the gate verdict.
+
+Standalone integration dispatches without a plan keep their existing local
+functional evidence check. Planned runs use the shared CPU reporter and gate;
+the superseded ordinary inline verdict and duplicate context input are removed.
+Older execution artifacts without stable IDs and plan identity cannot be treated
+as passing evidence by the new gate. Real-runner rollout must test a source
+commit containing this reporting protocol; no compatibility success is inferred.
+Local simulations do not replace real-runner acceptance.
 
 ### Shared CPU check ownership
 
