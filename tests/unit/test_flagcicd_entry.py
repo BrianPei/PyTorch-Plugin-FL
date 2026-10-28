@@ -1307,3 +1307,87 @@ def test_stale_coverage_is_optional_and_does_not_replace_functional_evidence(tmp
     assert report["status"] == "passed"
     assert report["metrics"]["coverage"]["available"] is False
     assert report["coverage_warnings"]
+
+
+@pytest.mark.parametrize(
+    "name,status,expected",
+    [
+        ("lint", "failure", "test_failed"),
+        ("agnostic-checks", "failure", "test_failed"),
+        ("codegen-checks", "failure", "test_failed"),
+        ("lint", "cancelled", "cancelled"),
+        ("resolve-checkout", "failure", "infra_error"),
+        ("discover-platforms", "failure", "infra_error"),
+    ],
+)
+def test_pre_plan_failure_keeps_its_cause_without_inventing_planned_skips(
+    tmp_path, name, status, expected
+):
+    results = {
+        job: {"result": "skipped"}
+        for job in (
+            "resolve-checkout",
+            "lint",
+            "agnostic-checks",
+            "codegen-checks",
+            "discover-platforms",
+            "platform-pipeline",
+        )
+    }
+    if name != "resolve-checkout":
+        results["resolve-checkout"]["result"] = "success"
+    if name not in ("resolve-checkout", "lint"):
+        for job in ("lint", "agnostic-checks", "codegen-checks"):
+            results[job]["result"] = "success"
+    results[name]["result"] = status
+    summary = REPORTER.aggregate(None, results, tmp_path, 1, "ci")
+    assert summary["status"] == expected
+    assert "test plan is unavailable" in summary["errors"]
+    assert f"{name}: {status}" in summary["errors"]
+    assert not any(
+        "expected skipped, received success" in error for error in summary["errors"]
+    )
+    assert "plan does not require its producer job" not in summary["errors"]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_platform_groups_are_summarized_once_on_success_and_failure(
+    tmp_path, monkeypatch, failed
+):
+    raw_reports(tmp_path)
+    if failed:
+        path = tmp_path / "pytest/pytest-nvidia.json"
+        payload = json.loads(path.read_text())
+        payload["flagcicd"]["complete"] = False
+        payload["flagcicd"]["execution"]["groups"][0]["status"] = "failed"
+        path.write_text(json.dumps(payload))
+    calls = {"diagnostic": 0, "validated": 0}
+    diagnostic = REPORTER.summarize_groups
+    validated = REPORTER.validate_execution.__globals__["summarize_groups"]
+
+    def describe(*args, **kwargs):
+        calls["diagnostic"] += 1
+        return diagnostic(*args, **kwargs)
+
+    def describe_validated(*args, **kwargs):
+        calls["validated"] += 1
+        return validated(*args, **kwargs)
+
+    monkeypatch.setattr(REPORTER, "summarize_groups", describe)
+    monkeypatch.setitem(
+        REPORTER.validate_execution.__globals__, "summarize_groups", describe_validated
+    )
+    result = REPORTER.platform_report(
+        plan(),
+        "nvidia",
+        jobs("failure", tests="failure") if failed else jobs(),
+        tmp_path,
+        1,
+    )
+    assert result["status"] == ("test_failed" if failed else "passed")
+    assert calls == (
+        {"diagnostic": 1, "validated": 0}
+        if failed
+        else {"diagnostic": 0, "validated": 1}
+    )
+    assert result["groups"][0]["status"] == ("failed" if failed else "passed")

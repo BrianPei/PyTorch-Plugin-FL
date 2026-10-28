@@ -437,9 +437,15 @@ def main():
             save_execution()
             raise
         ok, tolerated = classify_command_result(returncode, output, allow_crash)
+        evidence_error = ""
         if ok and test.get("min_passed", 0):
-            passed = sum(int(n) for n in re.findall(r"\b(\d+) passed\b", output))
-            ok = passed >= test["min_passed"]
+            from merge_pytest_reports import check_group_minimum
+
+            try:
+                check_group_minimum(report_dir, test)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                ok, evidence_error = False, str(error)
+                record["error"] = evidence_error
         record.update(
             status="passed" if ok else "failed",
             returncode=returncode,
@@ -458,10 +464,12 @@ def main():
             )
             continue
         if not ok:
-            print(
-                f"Integration test '{test['name']}' failed with exit code {returncode}",
-                flush=True,
+            reason = (
+                "evidence check failed: " + evidence_error
+                if evidence_error
+                else f"failed with exit code {returncode}"
             )
+            print(f"Integration test '{test['name']}' {reason}", flush=True)
             raise SystemExit(returncode or 1)
     return 0
 

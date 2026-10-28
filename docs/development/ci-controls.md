@@ -223,7 +223,10 @@ valid. Stale reports from another plan never supply missing current lanes.
 ### Functional evidence and conditional skips
 
 Successful wrappers cannot hide failed pytest sessions or failed/error counts.
-The existing manifest `min_passed` is enforced per group. Groups without a
+The existing manifest `min_passed` is enforced per group. The executor's early
+minimum check and final gate read the same native pytest sessions and share the
+inventory/count and minimum validators; console verbosity cannot change the
+result. A minimum without structured session evidence fails closed. Groups without a
 positive minimum retain their existing test-level capability/route skip rules:
 a nonempty, fully accounted-for skipped session can be valid when another group
 passed functional tests. Missing sessions and zero collection are not skips;
@@ -237,6 +240,12 @@ Incomplete or mismatched coverage is unavailable with a warning. Backend upload
 failures do not replace the functional result; missing functional proof does.
 The ordinary entry retains bounded paginated job diagnostics in the shared
 reporter; failure to fetch optional diagnostics cannot change the gate verdict.
+
+When an upstream shared check prevents ordinary CI from generating a plan, the
+summary retains that check's failure/cancellation category. A missing plan is
+still an error, but does not imply that successful upstream checks should have
+been skipped. Successful platform reports reuse the shared validator's group
+summary; diagnostic summaries are generated only for unsuccessful evidence.
 
 Standalone integration dispatches without a plan keep their existing local
 functional evidence check. Planned runs use the shared CPU reporter and gate;

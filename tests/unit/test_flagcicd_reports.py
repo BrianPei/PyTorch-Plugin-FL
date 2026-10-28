@@ -516,3 +516,59 @@ def test_missing_token_skips_upload_without_logging_credentials(
     assert result.returncode == 0, result.stderr
     assert output.read_text() == expected
     assert not token or token not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "case,expected",
+    [("quiet", 0), ("skipped", 1), ("fake_stdout", 1), ("earlier_pass", 1)],
+)
+def test_early_minimum_uses_group_json_and_never_console_counts(
+    tmp_path, case, expected
+):
+    workdir = tmp_path / "wheel-only"
+    workdir.mkdir()
+    (workdir / "test_pass.py").write_text("def test_ok(): pass\n")
+    (workdir / "test_skip.py").write_text(
+        "import pytest\n@pytest.mark.skip(reason='capability unavailable')\ndef test_skip(): pass\n"
+    )
+    marker = tmp_path / "must-not-run"
+    if case == "fake_stdout":
+        command = "printf '100 passed in 1.0s\\n'"
+    else:
+        command = f"{PYTHON} -m pytest {'test_pass.py' if case == 'quiet' else 'test_skip.py'} -qq"
+    groups = [
+        {"name": "minimum", "group_id": "minimum", "command": command, "min_passed": 1}
+    ]
+    if case == "earlier_pass":
+        groups.insert(
+            0,
+            {
+                "name": "earlier",
+                "group_id": "earlier",
+                "command": f"{PYTHON} -m pytest test_pass.py -qq",
+            },
+        )
+    if expected:
+        groups.append(
+            {
+                "name": "later",
+                "group_id": "later",
+                "command": "touch " + shlex.quote(str(marker)),
+            }
+        )
+    run, reports = _integration(tmp_path, groups)
+    assert run.returncode == expected, run.stdout + run.stderr
+    execution = json.loads((reports / "groups.json").read_text())
+    current = next(
+        group for group in execution["groups"] if group["group_id"] == "minimum"
+    )
+    assert current["status"] == ("passed" if expected == 0 else "failed")
+    if expected:
+        assert current["error"]
+        assert "evidence check failed" in run.stdout
+        assert not marker.exists()
+        assert execution["groups"][-1]["status"] == "not_run"
+    if case == "quiet":
+        merged = _merge(reports)
+        assert merged["summary"]["passed"] == 1
+        assert merged["flagcicd"]["complete"] is True

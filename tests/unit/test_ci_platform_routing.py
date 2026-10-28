@@ -14,7 +14,9 @@
 
 """Keep matrix routing, checkout source and the required gate in agreement."""
 
+import importlib.util
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -36,7 +38,12 @@ PLATFORMS = sorted(
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 try:
     import flagcicd_plan as PLANNER
-    import flagcicd_report as REPORTER
+
+    spec = importlib.util.spec_from_file_location(
+        "routing_ci_gate", ROOT / ".github/scripts/flagcicd_report.py"
+    )
+    REPORTER = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(REPORTER)
 finally:
     sys.path.pop(0)
 
@@ -342,3 +349,43 @@ def test_the_apple_lane_is_locked_to_the_standard_hosted_apple_silicon_runner():
     assert config["runner_labels"] == ["macos-15"]
     assert config["ci_image"] == ""
     assert config["environment_check"]["flagos_devices"] == {"at_least": 1}
+
+
+def test_gate_import_remains_isolated_when_hardware_reporting_plugin_is_loaded(
+    tmp_path,
+):
+    env = os.environ.copy()
+    for key in (
+        "CI_PLAN_CONTEXT",
+        "FLAGCICD_TEST_GROUP",
+        "FLAGCICD_GROUP_ID",
+        "FLAGCICD_COVERAGE_DIR",
+        "PYTEST_ADDOPTS",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+    ):
+        env.pop(key, None)
+    env.update(
+        PYTHONPATH=str(ROOT / ".github/scripts/pytest_reporting"),
+        PYTEST_PLUGINS="flagcicd_report",
+        FLAGCICD_REPORT_DIR=str(tmp_path / "reports"),
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__)),
+            "-k",
+            "required_gate_rejects_skipped_shared_checks",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "5 passed" in result.stdout

@@ -158,7 +158,6 @@ def platform_report(plan, platform, jobs, raw, attempt):
             "execution": metadata["execution"],
             "sessions": metadata["sessions"],
         }
-        group_results = summarize_groups(evidence["execution"], evidence["sessions"])
         validate_pytest_result(
             pytest,
             require_success=status == "passed",
@@ -183,8 +182,19 @@ def platform_report(plan, platform, jobs, raw, attempt):
                 counts.update(session["summary"])
             if dict(counts) != pytest["summary"]:
                 raise ValueError("pytest totals differ from group session evidence")
+        else:
+            group_results = summarize_groups(
+                evidence["execution"], evidence["sessions"]
+            )
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         errors.append(str(error))
+        if evidence and not group_results:
+            try:
+                group_results = summarize_groups(
+                    evidence["execution"], evidence["sessions"]
+                )
+            except (ValueError, TypeError, KeyError, AttributeError):
+                pass
         if status == "passed":
             status = "report_error"
     coverage_errors = []
@@ -247,7 +257,8 @@ def platform_report(plan, platform, jobs, raw, attempt):
 
 def aggregate(plan, jobs, directory, attempt, entry="flagcicd"):
     errors, latest, seen, duplicates, ignored = [], {}, set(), set(), []
-    if plan is None:
+    has_plan = plan is not None
+    if not has_plan:
         errors.append("test plan is unavailable")
         plan = {"expected_platforms": [], "entry": entry, "expected_shared_checks": []}
     else:
@@ -267,13 +278,17 @@ def aggregate(plan, jobs, directory, attempt, entry="flagcicd"):
         else ("plan", "platforms")
     )
     expected_jobs = set(plan["expected_shared_checks"])
-    if producer not in expected_jobs:
+    if has_plan and producer not in expected_jobs:
         errors.append("plan does not require its producer job")
     expected_jobs.add(producer)
     if plan["expected_platforms"]:
         expected_jobs.add(matrix)
     for name in sorted(expected_jobs | set(jobs)):
         result = jobs.get(name, {}).get("result", "missing")
+        if not has_plan:
+            if result in ("failure", "cancelled"):
+                errors.append(f"{name}: {result}")
+            continue
         expected = "success" if name in expected_jobs else "skipped"
         if (
             name == matrix
@@ -365,10 +380,10 @@ def aggregate(plan, jobs, directory, attempt, entry="flagcicd"):
     ):
         if candidate in statuses:
             status = candidate
-    for name in sorted(expected_jobs):
+    for name in sorted(expected_jobs if has_plan else set(jobs)):
         result = jobs.get(name, {}).get("result", "missing")
         if result == "failure":
-            if name == producer:
+            if name in (producer, "resolve-checkout"):
                 status = "infra_error"
             elif name != matrix:
                 status = "test_failed"
@@ -381,7 +396,7 @@ def aggregate(plan, jobs, directory, attempt, entry="flagcicd"):
                 status = "infra_error"
         elif result == "cancelled" and status == "passed":
             status = "cancelled"
-        elif result in ("missing", "skipped") and status == "passed":
+        elif has_plan and result in ("missing", "skipped") and status == "passed":
             status = "infra_error"
     if errors and status == "passed":
         status = (
