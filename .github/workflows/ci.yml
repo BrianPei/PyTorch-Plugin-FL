@@ -137,19 +137,20 @@ jobs:
       context: ${{ steps.detect.outputs.context }}
       plan_artifact: ${{ steps.detect.outputs.artifact_name }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.resolve-checkout.outputs.repository }}
-          ref: ${{ needs.resolve-checkout.outputs.ref }}
-          persist-credentials: false
-          fetch-depth: 0
-
       - name: Checkout trusted plan code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
-          path: _ci_control
+          path: control
           persist-credentials: false
+      - name: Checkout source data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve-checkout.outputs.repository }}
+          ref: ${{ needs.resolve-checkout.outputs.ref }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 0
       - name: Install plan parser
         run: python -m pip install "PyYAML==6.0.2"
       - name: Plan selected platforms and execution
@@ -164,8 +165,8 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: >-
-          python _ci_control/.github/scripts/flagcicd_plan.py
-          --ci --source . --output flagcicd-plan.json
+          python control/.github/scripts/flagcicd_plan.py
+          --ci --source source --output flagcicd-plan.json
       - name: Retain execution plan
         uses: actions/upload-artifact@v4
         with:

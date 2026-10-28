@@ -26,13 +26,13 @@ import yaml
 
 from ci.generate_matrix import (
     _changed_files,
-    _load_platforms,
+    _load_platforms as _load_platforms,
     _platforms_from_dispatch,
     _platforms_from_files,
     boxing_platforms,
     select_platforms,
 )
-from platform_config import compile_platform, plan_hash
+from platform_config import compile_platform, load_platform_data, plan_hash
 
 
 LEVELS = {"L0": 0, "L1": 1, "L2": 2}
@@ -70,7 +70,8 @@ def build_plan(request, contract, source, changed):
     if requested not in ("auto", *LEVELS):
         raise ValueError("unsupported test level")
     configs = source / ".github/configs"
-    known = _load_platforms(configs)
+    platform_configs, raw_configs = load_platform_data(source)
+    known = list(platform_configs)
     if not known:
         raise ValueError("no platform configurations found")
     selection = request["platforms"]
@@ -89,12 +90,14 @@ def build_plan(request, contract, source, changed):
         raise ValueError("weekly is reserved; supported profiles are pr and nightly")
     if profile == "nightly" and selection.strip() != "all":
         raise ValueError("nightly requires platforms=all")
-    boxing = boxing_platforms(configs, known)
+    boxing = boxing_platforms(configs, known, platform_configs)
     reasons = [{"kind": "dispatch", "requested": selection}]
     selected = _platforms_from_dispatch(selection, known, boxing)
     if profile == "pr" and selection.strip() == "all" and changed is not None:
         reasons = []
-        selected = _platforms_from_files(changed, known, configs, boxing, reasons)
+        selected = _platforms_from_files(
+            changed, known, configs, boxing, reasons, platform_configs
+        )
     elif changed is None and profile == "pr" and selection.strip() == "all":
         reasons = [{"kind": "diff_unavailable"}]
     if profile == "nightly":
@@ -129,7 +132,7 @@ def build_plan(request, contract, source, changed):
         + ([] if level == "L0" else ["agnostic", "codegen"]),
         "selection_reasons": reasons,
     }
-    return complete_plan(plan, contract, source)
+    return complete_plan(plan, contract, source, platform_configs, raw_configs, boxing)
 
 
 def build_ci_plan(
@@ -141,8 +144,17 @@ def build_ci_plan(
         raise ValueError("weekly is reserved; supported profiles are pr and nightly")
     if profile == "nightly" and dispatch not in ("", "all"):
         raise ValueError("nightly requires platforms=all")
+    platform_configs, raw_configs = load_platform_data(source)
     selected, reasons = select_platforms(
-        event_name, source / ".github/configs", changed, labels, dispatch
+        event_name,
+        source / ".github/configs",
+        changed,
+        labels,
+        dispatch,
+        platform_configs=platform_configs,
+    )
+    boxing = boxing_platforms(
+        source / ".github/configs", list(platform_configs), platform_configs
     )
     _inferred, risk, matched, diff_status = infer_level(changed, contract)
     # Ordinary CI always runs all three shared checks, including documentation
@@ -171,25 +183,25 @@ def build_ci_plan(
         },
         contract,
         source,
+        platform_configs,
+        raw_configs,
+        boxing,
     )
 
 
-def complete_plan(plan, contract, source):
+def complete_plan(plan, contract, source, platform_configs, raw_configs, boxing):
     """Validate configuration and snapshot final executable lanes once."""
-    configs = source / ".github/configs"
-    known = _load_platforms(configs)
-    boxing = boxing_platforms(configs, known)
-    manifest_path = source / ".github/integration-manifest.yml"
-    manifest = yaml.safe_load(manifest_path.read_text())
-    fingerprint = hashlib.sha256(manifest_path.read_bytes())
+    manifest_bytes = (source / ".github/integration-manifest.yml").read_bytes()
+    manifest = yaml.safe_load(manifest_bytes)
+    fingerprint = hashlib.sha256(manifest_bytes)
     execution = []
     for lane in plan["validated_platforms"]:
         compiled = compile_platform(
-            source, lane, plan["profile"], manifest, known, boxing
+            source, lane, plan["profile"], manifest, platform_configs, boxing
         )
         platform = compiled["platform"]
         fingerprint.update(lane.encode())
-        fingerprint.update((configs / f"{platform}.yml").read_bytes())
+        fingerprint.update(raw_configs[platform])
         if lane in plan["expected_platforms"]:
             execution.append(compiled)
     fingerprint.update(json.dumps(contract, sort_keys=True).encode())
@@ -300,9 +312,6 @@ def main():
         output.write(f"test_level={plan['test_level']}\n")
         output.write(f"profile={plan['profile']}\n")
         output.write("platforms=" + json.dumps(plan["expected_platforms"]) + "\n")
-        output.write(
-            "validated_platforms=" + json.dumps(plan["validated_platforms"]) + "\n"
-        )
     print(
         f"Plan: {plan['test_level']} ({plan['risk_level']}), platforms={plan['expected_platforms']}"
     )

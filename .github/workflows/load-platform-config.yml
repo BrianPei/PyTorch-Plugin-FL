@@ -132,17 +132,18 @@ jobs:
       integration_build_tools: ${{ steps.config.outputs.integration_build_tools }}
       integration_test_dependencies: ${{ steps.config.outputs.integration_test_dependencies }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.checkout_repository || github.repository }}
-          ref: ${{ inputs.checkout_ref || github.ref }}
-          persist-credentials: false
-
       - name: Checkout trusted configuration code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.workflow_sha }}
-          path: _ci_control
+          path: control
+          persist-credentials: false
+      - name: Checkout source data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.checkout_repository || github.repository }}
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          path: source
           persist-credentials: false
       - name: Install configuration parser
         if: inputs.execution_plan_artifact == ''
@@ -169,5 +170,5 @@ jobs:
             echo "::error::plan context requires an execution plan artifact"
             exit 1
           fi
-          python _ci_control/.github/scripts/platform_config.py \
-            --source . --lane "$PLATFORM" --profile "$TEST_PROFILE" "${args[@]}"
+          python control/.github/scripts/platform_config.py \
+            --source source --lane "$PLATFORM" --profile "$TEST_PROFILE" "${args[@]}"

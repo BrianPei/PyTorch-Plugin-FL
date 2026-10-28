@@ -67,8 +67,13 @@ def _load_platforms(configs_dir: pathlib.Path) -> list[str]:
     )
 
 
-def _platform_config(configs_dir: pathlib.Path, platform: str) -> dict:
+def _platform_config(
+    configs_dir: pathlib.Path, platform: str, platform_configs=None
+) -> dict:
     """One platform's config, or {} when it cannot be read."""
+    if platform_configs is not None:
+        cfg = platform_configs[platform]
+        return cfg if isinstance(cfg, dict) else {}
     try:
         cfg = yaml.safe_load((configs_dir / f"{platform}.yml").read_text())
     except (OSError, yaml.YAMLError):
@@ -76,7 +81,9 @@ def _platform_config(configs_dir: pathlib.Path, platform: str) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def boxing_platforms(configs_dir: pathlib.Path, platforms: list[str]) -> list[str]:
+def boxing_platforms(
+    configs_dir: pathlib.Path, platforms: list[str], platform_configs=None
+) -> list[str]:
     """The platforms whose config opts into a second, CUDA-boxing lane.
 
     Read from ``boxing_lane: true`` in the platform's own config rather than
@@ -86,7 +93,8 @@ def boxing_platforms(configs_dir: pathlib.Path, platforms: list[str]) -> list[st
     return [
         platform
         for platform in platforms
-        if _platform_config(configs_dir, platform).get("boxing_lane") is True
+        if _platform_config(configs_dir, platform, platform_configs).get("boxing_lane")
+        is True
     ]
 
 
@@ -146,11 +154,14 @@ def _platforms_from_files(
     configs_dir: pathlib.Path,
     boxing: list[str] | None = None,
     reasons: list[dict] | None = None,
+    platform_configs=None,
 ) -> list[str]:
     """The lanes a pull request's changed files select."""
-    platforms = _platforms_from_files_bare(changed, all_platforms, configs_dir, reasons)
+    platforms = _platforms_from_files_bare(
+        changed, all_platforms, configs_dir, reasons, platform_configs
+    )
     if boxing is None:
-        boxing = boxing_platforms(configs_dir, all_platforms)
+        boxing = boxing_platforms(configs_dir, all_platforms, platform_configs)
     return _schedule(platforms, boxing)
 
 
@@ -159,6 +170,7 @@ def _platforms_from_files_bare(
     all_platforms: list[str],
     configs_dir: pathlib.Path,
     reasons: list[dict] | None = None,
+    platform_configs=None,
 ) -> list[str]:
     def explain(kind, **details):
         if reasons is not None:
@@ -178,7 +190,11 @@ def _platforms_from_files_bare(
     watches = {}
     for platform in all_platforms:
         try:
-            cfg = yaml.safe_load((configs_dir / f"{platform}.yml").read_text())
+            cfg = (
+                platform_configs[platform]
+                if platform_configs is not None
+                else yaml.safe_load((configs_dir / f"{platform}.yml").read_text())
+            )
             watch = cfg.get("paths_watch")
             if (
                 not isinstance(watch, list)
@@ -273,13 +289,23 @@ def _platforms_from_dispatch(
 
 
 def select_platforms(
-    event_name, configs_dir, changed=None, labels=(), dispatch_platforms=""
+    event_name,
+    configs_dir,
+    changed=None,
+    labels=(),
+    dispatch_platforms="",
+    *,
+    platform_configs=None,
 ):
     """Use the existing routing rules, retaining their selection explanation."""
-    known = _load_platforms(configs_dir)
+    known = (
+        sorted(platform_configs)
+        if platform_configs is not None
+        else _load_platforms(configs_dir)
+    )
     if not known:
         raise ValueError(f"No platform configs found in {configs_dir}")
-    boxing = boxing_platforms(configs_dir, known)
+    boxing = boxing_platforms(configs_dir, known, platform_configs)
     reasons = []
     if event_name == "workflow_dispatch":
         selected = _platforms_from_dispatch(dispatch_platforms, known, boxing)
@@ -300,7 +326,7 @@ def select_platforms(
                 reasons[-1]["fallback"] = "unknown_platform_label"
         else:
             selected = _platforms_from_files(
-                changed, known, configs_dir, boxing, reasons
+                changed, known, configs_dir, boxing, reasons, platform_configs
             )
     return selected, reasons
 

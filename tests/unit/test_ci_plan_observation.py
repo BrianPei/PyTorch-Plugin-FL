@@ -15,6 +15,7 @@
 """Verify final plans against routing, composition and real execution boundaries."""
 
 import copy
+from collections import Counter
 import importlib.util
 import json
 import os
@@ -282,6 +283,7 @@ def test_real_plan_cli_records_identity_and_supplies_the_matrix(
     )
     assert json.loads(outputs["platforms"]) == selected
     assert outputs["artifact_name"] == "flagcicd-plan-1"
+    assert "validated_platforms" not in outputs
 
 
 def test_one_required_plan_supplies_the_matrix_and_execution():
@@ -676,6 +678,9 @@ def test_real_consumer_cli_executes_ordered_groups_without_yaml_or_composition(
     [
         ("runner_labels", []),
         ("runner_labels", [42]),
+        ("runner_labels", [""]),
+        ("runner_labels", [" \t"]),
+        ("runner_labels", ["torch-fl-nv", ""]),
         ("container_volumes", None),
         ("integration_build_tools", [42]),
         ("timeout_minutes", True),
@@ -709,6 +714,7 @@ def test_both_entries_forward_one_plan_to_the_shared_configuration_consumer():
         "jobs"
     ]
     assert "preflight" not in entry
+    assert "validated_platforms" not in entry["plan"]["outputs"]
     inputs = entry["platforms"]["with"]
     assert (
         inputs["execution_plan_artifact"]
@@ -769,3 +775,191 @@ def test_null_optional_configuration_fields_keep_the_loader_defaults(tmp_path):
     )
     assert lane["configuration"]["integration_build_tools"] == ""
     assert lane["configuration"]["integration_test_dependencies"] == ""
+
+
+@pytest.mark.parametrize(
+    "entry,event,changed",
+    [
+        ("ci", "push", None),
+        ("ci", "pull_request", ["csrc/aten/backends/mthreads/mudnn_copy.cc"]),
+        ("ci", "pull_request", ["README.md"]),
+        ("external", "", ["csrc/aten/backends/mthreads/mudnn_copy.cc"]),
+    ],
+)
+def test_each_platform_file_is_read_once_per_plan(monkeypatch, entry, event, changed):
+    counts = Counter()
+    original = Path.open
+
+    def counted(path, *args, **kwargs):
+        if path.parent == ROOT / ".github/configs" and path.suffix == ".yml":
+            counts[path.name] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted)
+    if entry == "ci":
+        PLANNER.build_ci_plan(request(), CONTRACT, ROOT, changed, event)
+    else:
+        PLANNER.build_plan(request(), CONTRACT, ROOT, changed)
+    assert counts == {
+        name + ".yml": 1 for name in PLANNER._load_platforms(ROOT / ".github/configs")
+    }
+
+
+@pytest.mark.parametrize(
+    "name,job_name",
+    [
+        ("ci.yml", "discover-platforms"),
+        ("load-platform-config.yml", "configuration"),
+        ("flagcicd-entry.yml", "plan"),
+    ],
+)
+def test_control_checkout_precedes_source_in_separate_sibling_directories(
+    name, job_name
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
+    steps = workflow["jobs"][job_name]["steps"]
+    checkouts = [
+        s["with"] for s in steps if s.get("uses", "").startswith("actions/checkout@")
+    ]
+    assert len(checkouts) == 2
+    control, source = checkouts
+    assert control["ref"] == "${{ github.workflow_sha }}"
+    assert source["ref"] != control["ref"]
+    control_path, source_path = Path(control["path"]), Path(source["path"])
+    assert not control_path.is_absolute() and not source_path.is_absolute()
+    assert control_path.parent == source_path.parent == Path(".")
+    assert control_path != source_path
+    assert control_path.name not in (".", "..") and source_path.name not in (".", "..")
+    assert all(c["persist-credentials"] is False for c in checkouts)
+
+
+@pytest.mark.parametrize("planned", [True, False])
+def test_real_workflow_commands_keep_control_isolated_from_source_symlinks(
+    tmp_path, planned
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    control, source = workspace / "control", workspace / "source"
+    shutil.copytree(
+        SCRIPTS,
+        control / ".github/scripts",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (control / ".flagcicd").mkdir()
+    shutil.copyfile(ROOT / ".flagcicd/project.yaml", control / ".flagcicd/project.yaml")
+    shutil.copytree(ROOT / ".github/configs", source / ".github/configs")
+    (source / ".github/scripts").mkdir()
+    shutil.copyfile(
+        ROOT / ".github/scripts/set_env.sh", source / ".github/scripts/set_env.sh"
+    )
+    shutil.copyfile(
+        ROOT / ".github/integration-manifest.yml",
+        source / ".github/integration-manifest.yml",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("untouched")
+    (source / "_ci_control").symlink_to(outside, target_is_directory=True)
+    (source / "control").symlink_to(control, target_is_directory=True)
+
+    def git(directory, *args):
+        return subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(directory),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                *args,
+            ],
+            text=True,
+            stderr=subprocess.PIPE,
+        ).strip()
+
+    for directory in (control, source):
+        git(directory, "init", "-q")
+        git(directory, "add", ".")
+        git(directory, "commit", "-qm", "fixture")
+    source_sha, control_sha = (
+        git(source, "rev-parse", "HEAD"),
+        git(control, "rev-parse", "HEAD"),
+    )
+    assert source_sha != control_sha
+    temporary = tmp_path / "runner-temp"
+    temporary.mkdir()
+    env = {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+        "SOURCE_REPOSITORY": "owner/fork",
+        "EVENT_NAME": "push",
+        "TEST_PROFILE": "pr",
+        "BASE_SHA": source_sha,
+        "HEAD_SHA": source_sha,
+        "DISPATCH_PLATFORMS": "",
+        "PR_LABELS_JSON": "[]",
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(tmp_path / "plan-outputs"),
+        "RUNNER_TEMP": str(temporary),
+        "PLATFORM": "nvidia",
+        "PLAN_ARTIFACT": "",
+        "PLAN_CONTEXT": "",
+    }
+    if planned:
+        jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
+        command = next(
+            s["run"]
+            for s in jobs["discover-platforms"]["steps"]
+            if s.get("id") == "detect"
+        )
+        producer = subprocess.run(
+            ["bash", "-e", "-c", command],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert producer.returncode == 0, producer.stderr
+        plan = json.loads((workspace / "flagcicd-plan.json").read_text())
+        assert plan["source_sha"] == source_sha
+        assert plan["control_sha"] == control_sha
+        outputs = dict(
+            line.split("=", 1)
+            for line in (tmp_path / "plan-outputs").read_text().splitlines()
+        )
+        env.update(
+            PLAN_ARTIFACT=outputs["artifact_name"], PLAN_CONTEXT=outputs["context"]
+        )
+        artifact_dir = temporary / "ci-execution-plan"
+        artifact_dir.mkdir()
+        shutil.copyfile(
+            workspace / "flagcicd-plan.json", artifact_dir / "flagcicd-plan.json"
+        )
+    env["GITHUB_OUTPUT"] = str(tmp_path / "configuration-outputs")
+    loader = yaml.safe_load(
+        (ROOT / ".github/workflows/load-platform-config.yml").read_text()
+    )
+    command = next(
+        s["run"]
+        for s in loader["jobs"]["configuration"]["steps"]
+        if s.get("id") == "config"
+    )
+    consumer = subprocess.run(
+        ["bash", "-e", "-c", command],
+        cwd=workspace,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert consumer.returncode == 0, consumer.stderr
+    outputs = parse_outputs(tmp_path / "configuration-outputs")
+    assert outputs["platform"] == "nvidia"
+    assert outputs["runner_labels"] == '["torch-fl-nv"]'
+    assert git(source, "rev-parse", "HEAD") == source_sha
+    assert git(control, "rev-parse", "HEAD") == control_sha
+    assert sentinel.read_text() == "untouched"
+    assert not git(control, "status", "--porcelain")
+    assert not git(source, "status", "--porcelain")

@@ -136,7 +136,7 @@ def test_platform_tests_and_manifest_use_the_resolved_source():
     config_checkout = next(
         step
         for step in config_workflow["jobs"]["configuration"]["steps"]
-        if step.get("uses", "").startswith("actions/checkout@")
+        if step.get("name") == "Checkout source data"
     )["with"]
     assert config_checkout["repository"] == (
         "${{ inputs.checkout_repository || github.repository }}"

@@ -291,11 +291,13 @@ def test_automatic_workflow_profile_selection_before_hardware(
     command = (
         step["run"]
         .replace(
-            "_ci_control/.github/scripts/flagcicd_plan.py",
-            str(ROOT / ".github/scripts/flagcicd_plan.py"),
+            "control/.github/scripts/flagcicd_plan.py",
+            shlex.quote(str(ROOT / ".github/scripts/flagcicd_plan.py")),
         )
+        .replace("--source source", "--source " + shlex.quote(str(ROOT)))
         .replace(
-            "--output flagcicd-plan.json", "--output " + str(tmp_path / "plan.json")
+            "--output flagcicd-plan.json",
+            "--output " + shlex.quote(str(tmp_path / "plan.json")),
         )
     )
     done = subprocess.run(

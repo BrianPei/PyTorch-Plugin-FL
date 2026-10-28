@@ -85,7 +85,6 @@ jobs:
       test_level: ${{ steps.plan.outputs.test_level }}
       profile: ${{ steps.plan.outputs.profile }}
       platforms: ${{ steps.plan.outputs.platforms }}
-      validated_platforms: ${{ steps.plan.outputs.validated_platforms }}
       source_repository: ${{ steps.resolve.outputs.source_repository }}
       source_sha: ${{ steps.resolve.outputs.source_sha }}
     steps:

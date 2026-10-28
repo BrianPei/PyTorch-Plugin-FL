@@ -15,6 +15,7 @@
 """Compile platform data once, or consume its immutable planned snapshot."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -27,15 +28,30 @@ from compose_integration_manifest import compose
 from run_integration_tests import validate_configuration
 
 
-def compile_platform(source, lane, profile, manifest, known, boxing):
-    """Use one parser for planning and standalone integration/wheel jobs."""
+def load_platform_data(source):
+    """Read each platform once for routing, compilation and fingerprinting."""
     import yaml
 
+    from ci.generate_matrix import _load_platforms
+
+    configs, raw = {}, {}
+    for platform in _load_platforms(source / ".github/configs"):
+        try:
+            raw[platform] = (source / f".github/configs/{platform}.yml").read_bytes()
+            configs[platform] = yaml.safe_load(raw[platform])
+        except (OSError, yaml.YAMLError):
+            configs[platform] = None
+    return configs, raw
+
+
+def compile_platform(source, lane, profile, manifest, platform_configs, boxing):
+    """Compile a lane from the same data used by routing and hashing."""
+    known = list(platform_configs)
     platform = lane.removesuffix("-boxing")
     is_boxing = lane != platform
     if platform not in known or (is_boxing and platform not in boxing):
         raise ValueError(f"unsupported platform lane: {lane}")
-    config = yaml.safe_load((source / f".github/configs/{platform}.yml").read_text())
+    config = copy.deepcopy(platform_configs[platform])
     if not isinstance(config, dict):
         raise ValueError(f"{platform} configuration must be an object")
     if config.get("integration_tests") is not None:
@@ -62,7 +78,7 @@ def compile_platform(source, lane, profile, manifest, known, boxing):
         if (
             not isinstance(value, list)
             or not all(isinstance(v, str) and "\0" not in v for v in value)
-            or (nonempty and not value)
+            or (nonempty and (not value or any(not v.strip() for v in value)))
         ):
             raise ValueError(
                 f"{key} must be a {'non-empty ' if nonempty else ''}list of strings"
@@ -255,16 +271,16 @@ def main():
     else:
         import yaml
 
-        from ci.generate_matrix import _load_platforms, boxing_platforms
+        from ci.generate_matrix import boxing_platforms
 
-        known = _load_platforms(source / ".github/configs")
+        configs, _raw = load_platform_data(source)
         lane = compile_platform(
             source,
             args.lane,
             args.profile,
             yaml.safe_load((source / ".github/integration-manifest.yml").read_text()),
-            known,
-            boxing_platforms(source / ".github/configs", known),
+            configs,
+            boxing_platforms(source / ".github/configs", list(configs), configs),
         )
     emit_outputs(lane, args.output)
 

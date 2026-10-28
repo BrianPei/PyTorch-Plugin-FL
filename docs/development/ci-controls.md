@@ -158,7 +158,16 @@ checks the plan hash, source SHA, trusted control SHA, profile, current run and
 requested lane against the producer's compact context. Missing, modified or
 mismatched plans fail before hardware scheduling; they never trigger an implicit
 standalone compilation. Trusted control scripts are checked out at
-`github.workflow_sha`, separately from source data.
+`github.workflow_sha` before source data is checked out. CPU planning and
+configuration jobs use sibling `control/` and `source/` directories; a path or
+symlink submitted inside the source tree cannot redirect the trusted checkout.
+Configuration outputs remain relative to the hardware job's source checkout.
+
+One planning call reads each platform file once. Routing, boxing selection,
+compilation and configuration fingerprinting reuse that call's parsed data and
+original bytes, without a process-global cache. Each lane receives its own copy
+so default and boxing expectations cannot mutate one another. Runner labels must
+be nonempty strings, including after whitespace is stripped.
 
 A failed-job rerun may reuse the original producer's artifact in the same run;
 the consumer still checks its exact context and hash, and rejects a future
