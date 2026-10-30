@@ -421,12 +421,19 @@ faster_cpu_torch_index() {
 # index was 10-100x faster. Either way the install is retried and either way an
 # unreachable index now fails in seconds rather than in five retry rounds.
 install_cpu_torch() {
-  local mirror="${TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL:-${CPU_TORCH_MIRROR_INDEX_URL_DEFAULT:-}}"
+  local mirror="${TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL-${CPU_TORCH_MIRROR_INDEX_URL_DEFAULT:-}}"
   local index="$CPU_TORCH_INDEX_URL"
   if [[ -n "$mirror" && "$mirror" != "$CPU_TORCH_INDEX_URL" ]]; then
     index="$(faster_cpu_torch_index "$CPU_TORCH_INDEX_URL" "$mirror")"
   fi
-  pip_retry --index-url "$index" "$@" "torch==${CPU_TORCH_VERSION}"
+  if pip_retry --index-url "$index" "$@" "torch==${CPU_TORCH_VERSION}"; then
+    return 0
+  fi
+  if [[ "$index" == "$CPU_TORCH_INDEX_URL" ]]; then
+    return 1
+  fi
+  echo "::warning::CPU torch mirror installation failed; retrying the pinned primary index"
+  pip_retry --index-url "$CPU_TORCH_INDEX_URL" "$@" "torch==${CPU_TORCH_VERSION}"
 }
 
 # Install the published FlagTree wheel for this platform (its Triton build).
