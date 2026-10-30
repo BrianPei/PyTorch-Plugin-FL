@@ -687,19 +687,23 @@ steps:
     platforms: [mthreads]
     command: python -m pytest tests/integration/ops/test_musa_dispatch.py -m musa -v -s --tb=short
 
-  # tests/unit is a source-tree suite: seven of its files read scripts/, csrc/,
+  # tests/unit is a source-tree suite: its source checks read scripts/, csrc/,
   # .github/workflows/ and the rest of torch_fl/ relative to the repository root,
   # so it runs in the checkout rather than in the wheel-only workspace the other
   # groups use -- the `cd` is what makes that true, and
   # tests/unit/test_integration_workdir.py holds both ends of the arrangement.
   # UNIT_TESTS_ALLOW_TEARDOWN_CRASH forgives a fatal signal after a clean summary,
   # the same reading INTEGRATION_ALLOW_TEARDOWN_CRASH asks for above.
+  # Shared CPU workflows own their full-file checks. These two files also
+  # contain installed-wheel checks, so retain their hardware variants here.
   - id: unit_tests_per_file
     name: Run unit tests (per file)
     platforms: [hygon]
     command: >-
       cd "$GITHUB_WORKSPACE" && UNIT_TESTS_ALLOW_TEARDOWN_CRASH=1
-      python .github/scripts/run_unit_tests.py --timeout 300
+      python .github/scripts/run_unit_tests.py --timeout 300 --exclude-shared-cpu
+      --retain tests/unit/test_startup_subprocess.py
+      --retain tests/unit/test_vendor_libtorch_overlay.py
 
   - id: runtime_conformance
     name: Runtime conformance (hardware-agnostic)

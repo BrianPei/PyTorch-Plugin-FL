@@ -23,6 +23,19 @@ is still checked in the functional groups. Runtime platform
 guards retain build-table ids such as `cuda`; CI config names use vendor names
 such as `nvidia`. Source-only contracts run in the agnostic/codegen checks.
 
+The Hygon per-file unit runner reads those workflows' explicit, unfiltered
+pytest file lists with `--exclude-shared-cpu`, so CPU-owned checks are not
+repeated on hardware. The manifest retains `test_startup_subprocess.py` and
+`test_vendor_libtorch_overlay.py`: they also contain installed-wheel checks
+that the CPU environment cannot execute. Filtered pytest selections do not
+claim a whole file. Test directories and device-dependent unit files stay in
+place; direct invocations without the option still run every matching file.
+
+CPU Torch installation may choose a faster mirror. If that installation fails,
+the existing retry helper falls back to the pinned primary index with the same
+version and options. An explicitly empty `TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL`
+disables mirror selection; a failed primary install remains a failure.
+
 Groups run serially within a platform; separate platform jobs remain parallel.
 Commands have a 30-minute default deadline, overridable with
 `FLAGCICD_CASE_TIMEOUT`. Timeout and cancellation kill the command's process
