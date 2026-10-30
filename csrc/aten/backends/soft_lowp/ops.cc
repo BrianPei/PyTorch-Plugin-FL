@@ -4,6 +4,7 @@
 
 #include "ops.h"
 
+#include "../../common.h"
 #include "../../generated/ops.h"
 #include "convert.h"
 #include "format.h"
@@ -54,12 +55,23 @@ namespace {
 at::Tensor DecodeFp4Nibbles(const at::Tensor& raw) {
   // Decode FP4 nibbles using arithmetic operations.
   // FP4 format: seem (sign, 2-bit exponent, 1-bit mantissa)
-  auto decode = [](const at::Tensor& nibble) {
+  // The shift amount is a tensor, not a Scalar: `bitwise_right_shift`'s
+  // `Tensor_Scalar` overload is `none` in every default conf (only NVIDIA's
+  // routes it, and soft-lowp is not compiled there), while `Tensor` is the
+  // spelling FlagGems ships and the confs route. A Scalar here sent a Python
+  // int into the FlagGems bridge's tensor slot and raised
+  // "Element at index 1 is incorrect. Expected True, but got False" out of
+  // pointwise_dynamic's check_tensor_attributes -- measured on the MetaX lane
+  // (run 40817979024) as every FP4 case of bmm, addmm and addmm_.
+  auto shift_by = [](const at::Tensor& nibble, int64_t bits) {
+    return at::bitwise_right_shift(
+        nibble, c10::scalar_to_tensor(bits).to(nibble.options()));
+  };
+
+  auto decode = [&shift_by](const at::Tensor& nibble) {
     // Extract fields as bfloat16 for computation
-    auto exponent = at::bitwise_and(
-                        at::bitwise_right_shift(nibble, at::Scalar(1)),
-                        at::Scalar(3))
-                        .to(c10::kBFloat16);
+    auto exponent =
+        at::bitwise_and(shift_by(nibble, 1), at::Scalar(3)).to(c10::kBFloat16);
     auto mantissa = at::bitwise_and(nibble, at::Scalar(1)).to(c10::kBFloat16);
 
     // Normal values: 2^(e-1) * (1 + m*0.5)
@@ -76,9 +88,11 @@ at::Tensor DecodeFp4Nibbles(const at::Tensor& raw) {
     return at::where(negative, -magnitude, magnitude);
   };
 
-  // Extract low and high nibbles
+  // Extract low and high nibbles. `bitwise_and` keeps its Scalar overload:
+  // `bitwise_and.Scalar` is routed where this decoder runs (metax, dcu), unlike
+  // `bitwise_right_shift.Tensor_Scalar`.
   auto low = at::bitwise_and(raw, at::Scalar(0x0F));
-  auto high = at::bitwise_right_shift(raw, at::Scalar(4));
+  auto high = shift_by(raw, 4);
 
   // Decode both and stack along last dimension
   auto decoded_low = decode(low);
@@ -212,6 +226,62 @@ void CheckMatrixInputs(const at::Tensor& self, const at::Tensor& mat2) {
   CheckDevice(mat2, "matrix operation");
   TORCH_CHECK(self.is_contiguous() && mat2.is_contiguous(),
               "soft-lowp matrix kernel requires contiguous inputs");
+}
+
+// The contracted axis of a decoded operand: the columns of the left side, the
+// rows of the right one, at either rank.
+int64_t ContractDim(const at::Tensor& operand, bool is_rhs) {
+  return is_rhs ? operand.size(-2) : operand.size(-1);
+}
+
+// Widen the contracted axis to `target` with zeros.
+//
+// Exact for a matmul: the added lanes are 0 on both sides and contribute
+// 0 * 0 = 0 to every element of the sum, so the product is unchanged. Only the
+// contracted axis is touched, so M and N -- and therefore the output shape --
+// are the same, which is what lets the `.out` forms take this unchanged.
+//
+// Built with empty + zero_ + narrow().copy_() rather than at::constant_pad_nd:
+// that op is routed to FlagGems on both platforms that compile this decode,
+// and FlagGems' triton is the thing being worked around here. empty and copy_
+// carry no conf key, so this cannot bounce off a route.
+at::Tensor PadContractDim(const at::Tensor& operand, bool is_rhs, int64_t target) {
+  auto shape = operand.sizes().vec();
+  const auto axis = is_rhs ? shape.size() - 2 : shape.size() - 1;
+  const auto extent = shape[axis];
+  shape[axis] = target;
+  auto padded = at::empty(shape, operand.options());
+  padded.zero_();
+  padded.narrow(static_cast<int64_t>(axis), 0, extent).copy_(operand);
+  return padded;
+}
+
+// Both decoded operands, widened together when the platform's dot intrinsic
+// will not compile their contracted extent. See TritonMinDotContractExtent in
+// csrc/aten/common.h for the floor and the measurement behind it.
+//
+// The two sides share one contracted extent by construction (a matmul would
+// not typecheck otherwise), so this reads the left side's and pads both to the
+// same target.
+void PadPairForDot(at::Tensor& lhs, at::Tensor& rhs) {
+  const auto floor = TritonMinDotContractExtent();
+  if (floor <= 0) {
+    return;
+  }
+  // Early out on the path that matters: a real FP8/FP4 GEMM has a contracted
+  // extent in the hundreds or thousands and pays one integer compare here.
+  const auto extent = ContractDim(lhs, false);
+  if (extent >= floor || extent == 0) {
+    return;
+  }
+  if (ContractDim(rhs, true) != extent) {
+    // Mismatched operands are the caller's error, and the GEMM below reports
+    // it with the shapes in the message. Padding them to a common target here
+    // would turn that into a wrong answer.
+    return;
+  }
+  lhs = PadContractDim(lhs, false, floor);
+  rhs = PadContractDim(rhs, true, floor);
 }
 
 at::Tensor DecodeIfNeeded(const at::Tensor& input, bool packed_dim0 = false) {
@@ -784,6 +854,11 @@ TensorPair DecodeForRoute(
                          : DecodeIfNeeded(self, false);
   auto rhs = entry.batch ? DecodeBatchIfNeeded(mat2, true)
                          : DecodeIfNeeded(mat2, true);
+  // One chokepoint for every matrix form: the pair every route, every `.out`
+  // spelling and the packed-FP4 path that cannot route at all is built from.
+  // The bias is deliberately not passed -- it is (M, N) and carries no
+  // contracted axis, so widening K leaves `beta * bias` untouched.
+  PadPairForDot(lhs, rhs);
   auto pair = TensorPair{variant, rank, lhs, rhs, at::Tensor()};
   if (bias != nullptr) {
     pair.bias = IsLowPrecision(bias->scalar_type()) ? DecodeIfNeeded(*bias)
