@@ -45,6 +45,68 @@ CONTRACT = yaml.safe_load((ROOT / ".flagcicd/project.yaml").read_text())
 CONFIGS = ROOT / ".github/configs"
 
 
+def process_stopped(pid):
+    """A disappearing /proc entry is an exited process, including ESRCH on read."""
+    pid = int(pid)
+    if pid <= 0:
+        raise ValueError("expected a positive process ID")
+    try:
+        status = (Path("/proc") / str(pid) / "status").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return "State:\tZ" in status
+
+
+def wait_for_pid(path, deadline):
+    """Wait for the PID bytes, not only creation of the fixture's marker file."""
+    while time.monotonic() < deadline:
+        try:
+            pid = int(path.read_text())
+            if pid > 0:
+                return pid
+        except (FileNotFoundError, ValueError):
+            pass
+        time.sleep(0.02)
+    pytest.fail(f"no complete PID was written to {path}")
+
+
+def test_pid_wait_handles_creation_before_the_write(monkeypatch, tmp_path):
+    values = iter([FileNotFoundError(), "", "12345"])
+
+    def read(*args, **kwargs):
+        value = next(values)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert wait_for_pid(tmp_path / "pid", time.monotonic() + 1) == 12345
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, ProcessLookupError])
+def test_process_exit_during_status_read_is_stopped(monkeypatch, error):
+    def vanished(*args, **kwargs):
+        raise error("process was reaped during the read")
+
+    monkeypatch.setattr(Path, "read_text", vanished)
+    assert process_stopped(12345)
+
+
+@pytest.mark.parametrize("state,stopped", [("Z", True), ("S", False)])
+def test_process_status_distinguishes_running_from_zombie(monkeypatch, state, stopped):
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: f"State:\t{state}\n")
+    assert process_stopped(12345) is stopped
+
+
+def test_process_status_permission_errors_are_not_hidden(monkeypatch):
+    def denied(*args, **kwargs):
+        raise PermissionError("cannot inspect the process")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(PermissionError):
+        process_stopped(12345)
+
+
 def request(profile="pr", platforms="all"):
     return {
         "source_repository": "flagos-ai/Torch-FL",
@@ -182,8 +244,7 @@ def test_command_timeout_kills_descendants(tmp_path, escape):
         command, {**os.environ, "FLAGCICD_CASE_TIMEOUT": "1"}, str(tmp_path)
     )
     assert result == 124
-    status = Path("/proc") / pid_file.read_text() / "status"
-    assert not status.exists() or "State:\tZ" in status.read_text()
+    assert process_stopped(pid_file.read_text())
 
 
 @pytest.mark.parametrize("missing", ["result", "group", "selection", "all_skipped"])
@@ -265,23 +326,19 @@ def test_cancellation_kills_the_active_command_group(tmp_path, escape, launcher_
     )
     try:
         deadline = time.monotonic() + 10
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert pid_file.exists()
+        active_pid = wait_for_pid(pid_file, deadline)
         if launcher_exits:
+            launcher = wait_for_pid(launcher_pid, deadline)
             while time.monotonic() < deadline:
-                if launcher_pid.exists():
-                    status = Path("/proc") / launcher_pid.read_text() / "status"
-                    if not status.exists() or "State:\tZ" in status.read_text():
-                        break
+                if process_stopped(launcher):
+                    break
                 time.sleep(0.02)
             else:
                 pytest.fail("the launcher did not exit before cancellation")
         process.send_signal(signal.SIGTERM)
         process.communicate(timeout=10)
         assert process.returncode != 0
-        status = Path("/proc") / pid_file.read_text() / "status"
-        assert not status.exists() or "State:\tZ" in status.read_text()
+        assert process_stopped(active_pid)
         assert (
             json.loads((tmp_path / "groups.json").read_text())["groups"][0]["status"]
             == "cancelled"
@@ -347,6 +404,30 @@ def test_source_contracts_have_one_shared_cpu_owner():
         "tests/unit/test_dtype_cast_arm_contract.py",
     ):
         assert sum(command.count(target) for command in commands) == 1, target
+
+
+def test_integration_callers_require_the_shared_cpu_owners():
+    workflows = ROOT / ".github/workflows"
+    for name in ("ci.yml", "flagcicd-entry.yml"):
+        jobs = yaml.safe_load((workflows / name).read_text())["jobs"]
+        cpu = {
+            key
+            for key, job in jobs.items()
+            if job.get("uses", "").endswith(
+                ("agnostic-checks.yml", "codegen-checks.yml")
+            )
+        }
+        assert len(cpu) == 2
+
+        def ancestors(name):
+            needs = jobs[name].get("needs", [])
+            if isinstance(needs, str):
+                needs = [needs]
+            return set(needs).union(*(ancestors(parent) for parent in needs))
+
+        for key, job in jobs.items():
+            if job.get("uses", "").endswith("integration-tests.yml"):
+                assert cpu <= ancestors(key), (name, key)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux orphan adoption contract")
