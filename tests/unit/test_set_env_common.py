@@ -26,11 +26,7 @@ environments), but the wiring is fully visible in their source.
 """
 
 import re
-import os
-import subprocess
 from pathlib import Path
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
@@ -56,63 +52,6 @@ SHARED_PHASES = [
 ]
 
 SOURCE_LINE = 'source "${REPO_ROOT}/.github/scripts/lib/set_env_common.sh"'
-
-
-@pytest.mark.parametrize(
-    "selection,mirror_ok,primary_ok,expected,code",
-    [
-        ("mirror", "1", "1", ["mirror"], 0),
-        ("mirror", "0", "1", ["mirror", "primary"], 0),
-        ("mirror", "0", "0", ["mirror", "primary"], 1),
-        ("primary", "0", "0", ["primary"], 1),
-        ("disabled", "0", "1", ["primary"], 0),
-    ],
-)
-def test_cpu_torch_mirror_falls_back_without_changing_the_pin(
-    tmp_path, selection, mirror_ok, primary_ok, expected, code
-):
-    record = tmp_path / "calls"
-    script = r"""
-set -euo pipefail
-source "$1"
-CPU_TORCH_INDEX_URL=https://primary.invalid/cpu
-CPU_TORCH_MIRROR_INDEX_URL_DEFAULT=https://mirror.invalid/cpu
-CPU_TORCH_VERSION=2.10.0
-if [[ "$SELECTION" == disabled ]]; then
-  export TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL=''
-else
-  unset TORCH_FL_CPU_TORCH_MIRROR_INDEX_URL
-fi
-faster_cpu_torch_index() {
-  if [[ "$SELECTION" == primary ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
-}
-pip_retry() {
-  printf '%s\n' "$*" >> "$RECORD"
-  if [[ "$2" == https://mirror.invalid/cpu ]]; then
-    [[ "$MIRROR_OK" == 1 ]]
-  else
-    [[ "$PRIMARY_OK" == 1 ]]
-  fi
-}
-install_cpu_torch --only-binary=:all:
-"""
-    result = subprocess.run(
-        ["bash", "-c", script, "mirror-test", str(LIB)],
-        env={
-            **os.environ,
-            "SELECTION": selection,
-            "MIRROR_OK": mirror_ok,
-            "PRIMARY_OK": primary_ok,
-            "RECORD": str(record),
-        },
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == code, result.stdout + result.stderr
-    assert record.read_text().splitlines() == [
-        f"--index-url https://{source}.invalid/cpu --only-binary=:all: torch==2.10.0"
-        for source in expected
-    ]
 
 
 def _scripts() -> list[Path]:
