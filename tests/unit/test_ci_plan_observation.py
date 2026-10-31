@@ -883,6 +883,7 @@ def test_real_workflow_commands_keep_control_isolated_from_source_symlinks(
         ).strip()
 
     for directory in (control, source):
+        shutil.copyfile(ROOT / ".gitignore", directory / ".gitignore")
         git(directory, "init", "-q")
         git(directory, "add", ".")
         git(directory, "commit", "-qm", "fixture")
@@ -911,6 +912,10 @@ def test_real_workflow_commands_keep_control_isolated_from_source_symlinks(
         "PLAN_ARTIFACT": "",
         "PLAN_CONTEXT": "",
     }
+    # Exercise the normal CI interpreter, even when the outer test run disables
+    # bytecode writes or redirects its cache. The fixture uses the real ignores.
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    env.pop("PYTHONPYCACHEPREFIX", None)
     if planned:
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
         command = next(
@@ -964,5 +969,6 @@ def test_real_workflow_commands_keep_control_isolated_from_source_symlinks(
     assert git(source, "rev-parse", "HEAD") == source_sha
     assert git(control, "rev-parse", "HEAD") == control_sha
     assert sentinel.read_text() == "untouched"
+    assert list((control / ".github/scripts").rglob("*.pyc"))
     assert not git(control, "status", "--porcelain")
     assert not git(source, "status", "--porcelain")
