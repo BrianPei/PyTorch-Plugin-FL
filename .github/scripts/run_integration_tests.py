@@ -439,8 +439,19 @@ def main():
     context = json.loads(os.environ.get("CI_PLAN_CONTEXT") or "{}")
     if context:
         source = Path(__file__).resolve().parents[2]
+        # Vendor containers can run as a different user from the checkout owner.
+        # Trust only this checkout for this read, without persisting Git config.
         sha = subprocess.check_output(
-            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            [
+                "git",
+                "-c",
+                f"safe.directory={source}",
+                "-C",
+                str(source),
+                "rev-parse",
+                "HEAD",
+            ],
+            text=True,
         ).strip()
         if sha != context["source_sha"] or context["run_id"] != os.environ.get(
             "GITHUB_RUN_ID"
